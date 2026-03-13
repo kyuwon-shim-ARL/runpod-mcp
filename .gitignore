@@ -1,3 +1,9 @@
 node_modules/
-dist/
 *.tsbuildinfo
+
+# Only keep the esbuild bundle (dist/runpod-mcp.mjs)
+# Ignore tsc intermediate outputs
+dist/*.js
+dist/*.js.map
+dist/*.d.ts
+dist/*.d.ts.map

@@ -2,7 +2,13 @@
   "name": "runpod-tools-mcp",
   "version": "0.1.0",
   "description": "MCP server for RunPod GPU pod management - full lifecycle, SSH, file transfer, GPU stock checking",
-  "keywords": ["mcp", "runpod", "gpu", "claude-code", "ai"],
+  "keywords": [
+    "mcp",
+    "runpod",
+    "gpu",
+    "claude-code",
+    "ai"
+  ],
   "license": "MIT",
   "author": "Kyuwon Shim",
   "type": "module",
@@ -18,7 +24,8 @@
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "lint": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/runpod-mcp.mjs",
+    "prepublishOnly": "npm run build && npm run bundle"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
@@ -26,6 +33,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "esbuild": "^0.27.4",
     "typescript": "^5.7.0"
   },
   "engines": {

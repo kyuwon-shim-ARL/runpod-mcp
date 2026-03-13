@@ -1,0 +1,14 @@
+{
+  "name": "runpod-mcp",
+  "version": "0.1.0",
+  "description": "RunPod GPU pod management - full lifecycle, SSH execution, file transfer, and intelligent GPU selection",
+  "author": {
+    "name": "Kyuwon Shim",
+    "url": "https://github.com/kyuwon-shim-ARL"
+  },
+  "repository": "https://github.com/kyuwon-shim-ARL/runpod-mcp",
+  "homepage": "https://github.com/kyuwon-shim-ARL/runpod-mcp",
+  "license": "MIT",
+  "keywords": ["runpod", "gpu", "mcp", "ssh", "cloud-gpu", "machine-learning"],
+  "mcpServers": "./.mcp.json"
+}
