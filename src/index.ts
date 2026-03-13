@@ -6,17 +6,30 @@ import { RunPodClient } from "./api.js";
 import type { Pod } from "./types.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
-if (!API_KEY) {
-  process.stderr.write("Error: RUNPOD_API_KEY environment variable is required\n");
-  process.exit(1);
+
+const SETUP_MSG =
+  "RUNPOD_API_KEY is not configured. To set up:\n\n" +
+  "1. Get your API key from https://www.runpod.io/console/user/settings\n" +
+  "2. Add to your shell profile (~/.bashrc or ~/.zshrc):\n" +
+  "   export RUNPOD_API_KEY=rp_xxxxxx\n" +
+  "3. (Optional) For SSH/rsync features:\n" +
+  "   export SSH_KEY_PATH=~/.ssh/id_ed25519\n" +
+  "4. Restart Claude Code for changes to take effect.";
+
+let client: RunPodClient | null = null;
+if (API_KEY) {
+  client = new RunPodClient({
+    apiKey: API_KEY,
+    restBaseUrl: "https://rest.runpod.io/v1",
+    graphqlUrl: "https://api.runpod.io/graphql",
+    sshKeyPath: process.env.SSH_KEY_PATH,
+  });
 }
 
-const client = new RunPodClient({
-  apiKey: API_KEY,
-  restBaseUrl: "https://rest.runpod.io/v1",
-  graphqlUrl: "https://api.runpod.io/graphql",
-  sshKeyPath: process.env.SSH_KEY_PATH,
-});
+function requireClient(): RunPodClient {
+  if (!client) throw new Error(SETUP_MSG);
+  return client;
+}
 
 const server = new McpServer({
   name: "runpod-tools",
@@ -30,7 +43,8 @@ function text(s: string) {
 }
 
 function podSummary(pod: Pod): string {
-  const ssh = client.getSshCommandString(pod);
+  const c = requireClient();
+  const ssh = c.getSshCommandString(pod);
   return [
     `ID: ${pod.id}`,
     `Name: ${pod.name}`,
@@ -56,7 +70,7 @@ function isAuthError(e: unknown): boolean {
 
 // ── list_pods ──
 server.tool("list_pods", "List all RunPod pods with status and SSH info", {}, async () => {
-  const pods = await client.listPods();
+  const pods = await requireClient().listPods();
   if (!pods.length) return text("No pods found.");
   return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
 });
@@ -66,7 +80,7 @@ server.tool(
   "get_pod",
   "Get detailed info about a specific pod",
   { podId: z.string().describe("Pod ID") },
-  async ({ podId }) => text(podSummary(await client.getPod(podId)))
+  async ({ podId }) => text(podSummary(await requireClient().getPod(podId)))
 );
 
 // ── create_pod ──
@@ -107,11 +121,11 @@ server.tool(
     };
 
     if (args.spot && args.bidPerGpu) {
-      const result = await client.createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
+      const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
       return text(`Spot pod created!\nID: ${result.id}\n\nUse wait_for_pod to monitor until ready.`);
     }
 
-    const pod = await client.createPod(opts);
+    const pod = await requireClient().createPod(opts);
     return text(`Pod created!\n${podSummary(pod)}\n\nUse wait_for_pod to monitor until ready.`);
   }
 );
@@ -136,7 +150,7 @@ server.tool(
     env: z.record(z.string()).optional(),
   },
   async (args) => {
-    const gpuTypes = await client.listGpuTypes();
+    const gpuTypes = await requireClient().listGpuTypes();
     const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
     const errors: string[] = [];
 
@@ -166,7 +180,7 @@ server.tool(
         };
 
         if (args.spot && bidPrice) {
-          const result = await client.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+          const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: bidPrice });
           return text(
             `Auto-selected GPU: ${gpu.displayName} (stock: ${gpu.lowestPrice.stockStatus})\n` +
               `Spot bid: $${bidPrice}/hr\n` +
@@ -174,7 +188,7 @@ server.tool(
           );
         }
 
-        const pod = await client.createPod(opts);
+        const pod = await requireClient().createPod(opts);
         return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${gpu.lowestPrice.stockStatus})\n${podSummary(pod)}`);
       } catch (e) {
         if (isAuthError(e)) throw e; // Re-throw auth/quota errors immediately
@@ -203,7 +217,7 @@ server.tool(
   "Stop a running pod (preserves volume data, stops billing for compute)",
   { podId: z.string() },
   async ({ podId }) => {
-    await client.stopPod(podId);
+    await requireClient().stopPod(podId);
     return text(`Pod ${podId} stop requested.`);
   }
 );
@@ -214,7 +228,7 @@ server.tool(
   "Start a stopped pod",
   { podId: z.string() },
   async ({ podId }) => {
-    await client.startPod(podId);
+    await requireClient().startPod(podId);
     return text(`Pod ${podId} start requested. Use wait_for_pod to monitor.`);
   }
 );
@@ -225,7 +239,7 @@ server.tool(
   "Restart a running pod",
   { podId: z.string() },
   async ({ podId }) => {
-    await client.restartPod(podId);
+    await requireClient().restartPod(podId);
     return text(`Pod ${podId} restart requested.`);
   }
 );
@@ -236,7 +250,7 @@ server.tool(
   "Permanently delete a pod (WARNING: destroys all data not on network volumes)",
   { podId: z.string() },
   async ({ podId }) => {
-    await client.deletePod(podId);
+    await requireClient().deletePod(podId);
     return text(`Pod ${podId} deleted.`);
   }
 );
@@ -251,7 +265,7 @@ server.tool(
     intervalSeconds: z.number().default(10).describe("Poll interval in seconds"),
   },
   async ({ podId, timeoutSeconds, intervalSeconds }) => {
-    const pod = await client.waitForPod(podId, timeoutSeconds * 1000, intervalSeconds * 1000);
+    const pod = await requireClient().waitForPod(podId, timeoutSeconds * 1000, intervalSeconds * 1000);
     return text(`Pod is ready!\n\n${podSummary(pod)}`);
   }
 );
@@ -265,7 +279,7 @@ server.tool(
     inStockOnly: z.boolean().default(false).describe("Only show GPUs with High/Medium stock"),
   },
   async ({ minVram, inStockOnly }) => {
-    let gpus = await client.listGpuTypes();
+    let gpus = await requireClient().listGpuTypes();
     if (minVram > 0) gpus = gpus.filter((g) => g.memoryInGb >= minVram);
     if (inStockOnly) gpus = gpus.filter((g) => g.lowestPrice.stockStatus === "High" || g.lowestPrice.stockStatus === "Medium");
     gpus.sort((a, b) => a.lowestPrice.minimumBidPrice - b.lowestPrice.minimumBidPrice);
@@ -288,8 +302,9 @@ server.tool(
   "Get the SSH command for connecting to a running pod",
   { podId: z.string() },
   async ({ podId }) => {
-    const pod = await client.getPod(podId);
-    const cmd = client.getSshCommandString(pod);
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const cmd = c.getSshCommandString(pod);
     if (!cmd) return text("Pod is not ready (no public IP or SSH port). Try wait_for_pod first.");
     return text(cmd);
   }
@@ -305,8 +320,9 @@ server.tool(
     timeoutSeconds: z.number().default(120).describe("Command timeout"),
   },
   async ({ podId, command, timeoutSeconds }) => {
-    const pod = await client.getPod(podId);
-    const sshArgs = client.getSshArgs(pod);
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH.");
 
     const { spawnSync } = await import("node:child_process");
@@ -335,8 +351,9 @@ server.tool(
     dryRun: z.boolean().default(false).describe("Show command without executing"),
   },
   async ({ podId, localPath, remotePath, dryRun }) => {
-    const pod = await client.getPod(podId);
-    const args = client.getRsyncArgs(pod, localPath, remotePath, "upload");
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const args = c.getRsyncArgs(pod, localPath, remotePath, "upload");
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):\n${args.join(" ")}`);
 
@@ -364,8 +381,9 @@ server.tool(
     dryRun: z.boolean().default(false),
   },
   async ({ podId, remotePath, localPath, dryRun }) => {
-    const pod = await client.getPod(podId);
-    const args = client.getRsyncArgs(pod, localPath, remotePath, "download");
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const args = c.getRsyncArgs(pod, localPath, remotePath, "download");
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):\n${args.join(" ")}`);
 
