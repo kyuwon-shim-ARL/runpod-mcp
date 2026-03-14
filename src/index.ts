@@ -158,10 +158,12 @@ server.tool(
       const gpu = gpuMap.get(gpuId);
       if (!gpu) continue;
       if (gpu.memoryInGb < args.minVram) continue;
-      if (gpu.lowestPrice.stockStatus === "Low" || gpu.lowestPrice.stockStatus === "Out of Stock") continue;
+      const stock = gpu.lowestPrice?.stockStatus;
+      if (stock === "Low" || stock === "Out of Stock") continue;
 
+      const ondemandPrice = gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? 1.0;
       const bidPrice = args.spot
-        ? Math.min(args.maxBidPerGpu, gpu.lowestPrice.uninterruptablePrice * 0.8)
+        ? Math.min(args.maxBidPerGpu, ondemandPrice * 0.8)
         : undefined;
 
       try {
@@ -182,14 +184,14 @@ server.tool(
         if (args.spot && bidPrice) {
           const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: bidPrice });
           return text(
-            `Auto-selected GPU: ${gpu.displayName} (stock: ${gpu.lowestPrice.stockStatus})\n` +
+            `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n` +
               `Spot bid: $${bidPrice}/hr\n` +
               `Pod ID: ${result.id}\n\nUse wait_for_pod to monitor.`
           );
         }
 
         const pod = await requireClient().createPod(opts);
-        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${gpu.lowestPrice.stockStatus})\n${podSummary(pod)}`);
+        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n${podSummary(pod)}`);
       } catch (e) {
         if (isAuthError(e)) throw e; // Re-throw auth/quota errors immediately
         errors.push(`${gpu.displayName}: ${(e as Error).message}`);
@@ -198,14 +200,22 @@ server.tool(
     }
 
     const available = gpuTypes
-      .filter((g) => g.memoryInGb >= args.minVram && g.lowestPrice.stockStatus !== "Out of Stock")
-      .sort((a, b) => a.lowestPrice.minimumBidPrice - b.lowestPrice.minimumBidPrice)
+      .filter((g) => g.memoryInGb >= args.minVram && g.lowestPrice?.stockStatus !== "Out of Stock")
+      .sort((a, b) => {
+        const ap = a.lowestPrice?.minimumBidPrice ?? a.communitySpotPrice ?? Infinity;
+        const bp = b.lowestPrice?.minimumBidPrice ?? b.communitySpotPrice ?? Infinity;
+        return ap - bp;
+      })
       .slice(0, 10);
 
     const errMsg = errors.length ? `\n\nErrors encountered:\n${errors.join("\n")}` : "";
     return text(
       "No preferred GPU available. Cheapest alternatives:\n\n" +
-        available.map((g) => `${g.displayName} (${g.memoryInGb}GB) - $${g.lowestPrice.minimumBidPrice}/hr [${g.lowestPrice.stockStatus}]`).join("\n") +
+        available.map((g) => {
+          const price = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
+          const st = g.lowestPrice?.stockStatus ?? "unknown";
+          return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
+        }).join("\n") +
         errMsg
     );
   }
@@ -281,17 +291,26 @@ server.tool(
   async ({ minVram, inStockOnly }) => {
     let gpus = await requireClient().listGpuTypes();
     if (minVram > 0) gpus = gpus.filter((g) => g.memoryInGb >= minVram);
-    if (inStockOnly) gpus = gpus.filter((g) => g.lowestPrice.stockStatus === "High" || g.lowestPrice.stockStatus === "Medium");
-    gpus.sort((a, b) => a.lowestPrice.minimumBidPrice - b.lowestPrice.minimumBidPrice);
+    if (inStockOnly) gpus = gpus.filter((g) => {
+      const status = g.lowestPrice?.stockStatus;
+      return status === "High" || status === "Medium";
+    });
+    gpus.sort((a, b) => {
+      const aPrice = a.lowestPrice?.minimumBidPrice ?? a.communitySpotPrice ?? Infinity;
+      const bPrice = b.lowestPrice?.minimumBidPrice ?? b.communitySpotPrice ?? Infinity;
+      return aPrice - bPrice;
+    });
 
     if (!gpus.length) return text("No GPUs match the criteria.");
 
     const header = "GPU Type | VRAM | Spot Price | On-Demand | Stock";
     const sep = "---|---|---|---|---";
-    const rows = gpus.map(
-      (g) =>
-        `${g.displayName} | ${g.memoryInGb}GB | $${g.lowestPrice.minimumBidPrice}/hr | $${g.lowestPrice.uninterruptablePrice}/hr | ${g.lowestPrice.stockStatus}`
-    );
+    const rows = gpus.map((g) => {
+      const spot = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
+      const ondemand = g.lowestPrice?.uninterruptablePrice ?? g.communityPrice ?? null;
+      const stock = g.lowestPrice?.stockStatus ?? (g.communityCloud ? "available" : "n/a");
+      return `${g.displayName} | ${g.memoryInGb}GB | ${spot != null ? `$${spot}/hr` : "n/a"} | ${ondemand != null ? `$${ondemand}/hr` : "n/a"} | ${stock}`;
+    });
     return text([header, sep, ...rows].join("\n"));
   }
 );

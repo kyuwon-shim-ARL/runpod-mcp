@@ -28,11 +28,17 @@ export interface GpuType {
   id: string;
   displayName: string;
   memoryInGb: number;
-  lowestPrice: {
+  communityCloud?: boolean;
+  secureCloud?: boolean;
+  communityPrice?: number;
+  communitySpotPrice?: number;
+  securePrice?: number;
+  secureSpotPrice?: number;
+  lowestPrice?: {
     minimumBidPrice: number;
     uninterruptablePrice: number;
     stockStatus: string; // "High" | "Medium" | "Low" | "Out of Stock"
-  };
+  } | null;
 }
 
 export interface CreatePodOptions {

@@ -164,7 +164,13 @@ export class RunPodClient {
           id
           displayName
           memoryInGb
-          lowestPrice(gpuCount: 1, totalCount: 100) {
+          communityCloud
+          secureCloud
+          communityPrice
+          communitySpotPrice
+          securePrice
+          secureSpotPrice
+          lowestPrice(input: { gpuCount: 1 }) {
             minimumBidPrice
             uninterruptablePrice
             stockStatus
@@ -173,7 +179,7 @@ export class RunPodClient {
       }
     `;
     const data = await this.graphqlRequest<{ gpuTypes: GpuType[] }>(query);
-    return data.gpuTypes.filter((g) => g.lowestPrice?.stockStatus);
+    return data.gpuTypes;
   }
 
   // ── SSH Helpers (return args arrays for spawn, not shell strings) ──
