@@ -23,6 +23,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
+    "test": "vitest run",
     "lint": "tsc --noEmit",
     "bundle": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/runpod-mcp.mjs",
     "prepublishOnly": "npm run build && npm run bundle"
@@ -34,7 +35,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "esbuild": "^0.27.4",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.0"
   },
   "engines": {
     "node": ">=20"

@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { RunPodClient } from "./api.js";
 import type { Pod } from "./types.js";
+import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv } from "./gpu-utils.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -102,8 +103,14 @@ server.tool(
     ports: z.array(z.string()).default(["22/tcp"]),
     env: z.record(z.string()).optional().describe("Environment variables"),
     dockerArgs: z.string().optional(),
+    optimizePytorch: z
+      .boolean()
+      .default(false)
+      .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
   },
   async (args) => {
+    const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
+
     const opts = {
       name: args.name,
       imageName: args.imageName,
@@ -116,7 +123,7 @@ server.tool(
       networkVolumeId: args.networkVolumeId,
       sshPublicKey: args.sshPublicKey,
       ports: args.ports,
-      env: args.env,
+      env: podEnv,
       dockerArgs: args.dockerArgs,
     };
 
@@ -148,6 +155,10 @@ server.tool(
     volumeInGb: z.number().default(20),
     sshPublicKey: z.string().optional(),
     env: z.record(z.string()).optional(),
+    optimizePytorch: z
+      .boolean()
+      .default(false)
+      .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
   },
   async (args) => {
     const gpuTypes = await requireClient().listGpuTypes();
@@ -162,11 +173,25 @@ server.tool(
       if (stock === "Low" || stock === "Out of Stock") continue;
 
       const ondemandPrice = gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? 1.0;
+      const minBid = gpu.lowestPrice?.minimumBidPrice ?? 0;
       const bidPrice = args.spot
         ? Math.min(args.maxBidPerGpu, ondemandPrice * 0.8)
         : undefined;
 
+      // Skip if bid price is below minimum bid
+      if (args.spot && bidPrice != null && minBid > 0 && bidPrice < minBid) {
+        errors.push(`${gpu.displayName}: Bid $${bidPrice.toFixed(3)}/hr below minimum $${minBid}/hr, skipped`);
+        continue;
+      }
+
+      const overprovisionWarning = isOverprovisioned(gpu.memoryInGb, args.minVram)
+        ? `\nOverprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you requested ${args.minVram}GB minimum.\n` +
+          `  Consider a smaller GPU to save cost, or increase your workload to utilize the extra VRAM.\n`
+        : "";
+
       try {
+        const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
+
         const opts = {
           name: args.name,
           imageName: args.imageName,
@@ -178,7 +203,7 @@ server.tool(
           volumeMountPath: "/workspace",
           sshPublicKey: args.sshPublicKey,
           ports: ["22/tcp"] as string[],
-          env: args.env,
+          env: podEnv,
         };
 
         if (args.spot && bidPrice) {
@@ -186,12 +211,12 @@ server.tool(
           return text(
             `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n` +
               `Spot bid: $${bidPrice}/hr\n` +
-              `Pod ID: ${result.id}\n\nUse wait_for_pod to monitor.`
+              `Pod ID: ${result.id}${overprovisionWarning}\n\nUse wait_for_pod to monitor.`
           );
         }
 
         const pod = await requireClient().createPod(opts);
-        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n${podSummary(pod)}`);
+        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}\n${podSummary(pod)}`);
       } catch (e) {
         if (isAuthError(e)) throw e; // Re-throw auth/quota errors immediately
         errors.push(`${gpu.displayName}: ${(e as Error).message}`);
@@ -416,6 +441,265 @@ server.tool(
     if (result.error) return text(`Download error: ${result.error.message}`);
     if (result.status !== 0) return text(`Download failed (exit ${result.status}):\n${result.stderr}`);
     return text(`Download complete.\n\n${result.stdout}`);
+  }
+);
+
+// ── gpu_health_check ──
+server.tool(
+  "gpu_health_check",
+  "Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation.",
+  {
+    podId: z.string().describe("Pod ID"),
+    perSampleMb: z
+      .number()
+      .optional()
+      .describe(
+        "Memory per sample in MiB (measure with: peak_memory / batch_size after a few batches). When provided, calculates recommended batch size for ~82% VRAM utilization."
+      ),
+    timeoutSeconds: z.number().default(30).describe("SSH timeout"),
+  },
+  async ({ podId, perSampleMb, timeoutSeconds }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text("Pod is not ready for SSH. Use wait_for_pod first.");
+
+    const { spawnSync } = await import("node:child_process");
+
+    // Query per-GPU metrics
+    const gpuCmd =
+      "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits 2>&1";
+    const gpuResult = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", gpuCmd], {
+      timeout: timeoutSeconds * 1000,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    if (gpuResult.error) return text(`SSH error: ${gpuResult.error.message}`);
+
+    const output = (gpuResult.stdout ?? "").trim();
+    if (!output || output.includes("command not found") || output.includes("not found")) {
+      return text(
+        "nvidia-smi not found on this pod. GPU health check requires an NVIDIA GPU with drivers installed.\n" +
+          "Most RunPod GPU images include nvidia-smi by default."
+      );
+    }
+    if (gpuResult.status !== 0) {
+      return text(`nvidia-smi failed (exit ${gpuResult.status}):\n${output}\n${gpuResult.stderr ?? ""}`);
+    }
+
+    // Query per-process GPU memory
+    const procCmd =
+      "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true";
+    const procResult = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", procCmd], {
+      timeout: timeoutSeconds * 1000,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    // Parse GPU metrics using extracted utility
+    const gpus = parseNvidiaSmiOutput(output);
+
+    if (!gpus.length) return text("No GPU data returned from nvidia-smi.");
+
+    // Format output
+    const sections: string[] = ["## GPU Health Check\n"];
+
+    for (const gpu of gpus) {
+      sections.push(
+        `### GPU ${gpu.index}: ${gpu.name}`,
+        `- VRAM: ${gpu.usedMb} / ${gpu.totalMb} MiB (${gpu.usedPct}%) — **${gpu.label}**`,
+        `- GPU Utilization: ${gpu.gpuUtil}%`,
+        `- Memory Bandwidth: ${gpu.memUtil}%`,
+        `- Temperature: ${gpu.temp}°C`,
+        ""
+      );
+    }
+
+    // Aggregate for multi-GPU
+    if (gpus.length > 1) {
+      const totalVram = gpus.reduce((s, g) => s + g.totalMb, 0);
+      const usedVram = gpus.reduce((s, g) => s + g.usedMb, 0);
+      const avgUtil = Math.round(gpus.reduce((s, g) => s + g.gpuUtil, 0) / gpus.length);
+      sections.push(
+        `### Aggregate (${gpus.length} GPUs)`,
+        `- Total VRAM: ${usedVram} / ${totalVram} MiB (${Math.round((usedVram / totalVram) * 100)}%)`,
+        `- Avg GPU Utilization: ${avgUtil}%`,
+        ""
+      );
+    }
+
+    // Per-process info
+    const procOutput = (procResult?.stdout ?? "").trim();
+    if (procOutput) {
+      const procLines = procOutput.split("\n").filter((l) => l.trim() && !l.includes("No running"));
+      if (procLines.length > 0) {
+        sections.push("### Active GPU Processes");
+        for (const pl of procLines) {
+          const [, pid, pname, pmem] = pl.split(",").map((s) => s.trim());
+          sections.push(`- PID ${pid}: ${pname} (${pmem} MiB)`);
+        }
+        sections.push("");
+      }
+    }
+
+    // Recommendations
+    const recs: string[] = [];
+    const primaryGpu = gpus[0];
+
+    if (primaryGpu.label === "IDLE" || primaryGpu.label === "UNDERUTILIZED") {
+      recs.push(
+        `- **Low VRAM usage (${primaryGpu.usedPct}%)**: You are using ${primaryGpu.usedMb} MiB of ${primaryGpu.totalMb} MiB.`,
+        "  Consider increasing batch size, using larger model variants, or switching to a cheaper GPU."
+      );
+    }
+    if (primaryGpu.gpuUtil < 30 && primaryGpu.usedPct > 10) {
+      recs.push(
+        `- **Low GPU compute utilization (${primaryGpu.gpuUtil}%)**: GPU may be waiting for data.`,
+        "  Check data loading pipeline: increase num_workers, enable pin_memory, or use prefetching."
+      );
+    }
+    if (primaryGpu.label === "NEAR_OOM") {
+      recs.push(
+        `- **Near OOM (${primaryGpu.usedPct}%)**: Consider reducing batch size, enabling gradient checkpointing, or using mixed precision (fp16/bf16).`
+      );
+    }
+
+    // Batch size advisor (e004)
+    if (perSampleMb != null && perSampleMb > 0) {
+      const suggestedBs = calcSuggestedBatchSize(primaryGpu.totalMb, perSampleMb);
+      const currentEstBs = primaryGpu.usedMb > 0 ? Math.round(primaryGpu.usedMb / perSampleMb) : null;
+
+      sections.push("### Batch Size Advisor");
+      sections.push(`- Per-sample memory: ${perSampleMb} MiB`);
+      sections.push(`- Target VRAM utilization: 82%`);
+      if (suggestedBs <= 0) {
+        sections.push("- **Per-sample memory exceeds available VRAM target.** Reduce sequence length, enable gradient checkpointing, or use mixed precision.");
+      } else {
+        sections.push(`- **Recommended batch size: ${suggestedBs}**`);
+      }
+      if (currentEstBs != null && currentEstBs > 0) {
+        const ratio = suggestedBs / currentEstBs;
+        sections.push(`- Current estimated batch size: ~${currentEstBs} (${ratio > 1 ? `${ratio.toFixed(1)}x increase possible` : "already near optimal"})`);
+      }
+      if (gpus.length > 1) {
+        sections.push(`- **Multi-GPU note**: Recommendation is per-GPU. For DataParallel, effective batch = ${suggestedBs} x ${gpus.length} = ${suggestedBs * gpus.length}.`);
+      }
+      sections.push(
+        "",
+        "> **Note**: For transformer/attention models, memory scales O(n^2) with sequence length.",
+        "> Increase batch size gradually and monitor for OOM errors."
+      );
+    }
+
+    if (recs.length > 0) {
+      sections.push("### Recommendations", ...recs);
+    }
+
+    // Cost context
+    if (pod.costPerHr != null) {
+      sections.push("", `**Current cost**: $${pod.costPerHr}/hr`);
+      if (primaryGpu.label === "IDLE") {
+        sections.push("Consider using `gpu_cost_compare` to find a cheaper GPU that matches your actual usage.");
+      }
+    }
+
+    return text(sections.join("\n"));
+  }
+);
+
+// ── gpu_cost_compare ──
+server.tool(
+  "gpu_cost_compare",
+  "Compare current pod GPU cost against catalog alternatives. Finds cheaper GPUs with similar or sufficient VRAM.",
+  {
+    podId: z.string().describe("Pod ID to compare"),
+    requiredVramGb: z.number().optional().describe("Minimum VRAM needed in GB (defaults to pod's current GPU VRAM)"),
+  },
+  async ({ podId, requiredVramGb }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+
+    if (!pod.gpu) return text("This pod has no GPU information. Cannot compare costs.");
+
+    const currentCost = pod.costPerHr ?? pod.adjustedCostPerHr;
+    const gpuTypes = await c.listGpuTypes();
+    const currentGpu = gpuTypes.find((g) => g.id === pod.gpu!.id || g.displayName === pod.gpu!.displayName);
+    const currentVram = currentGpu?.memoryInGb ?? 0;
+    const minVram = requiredVramGb ?? (currentVram > 0 ? currentVram : null);
+
+    if (minVram == null) {
+      return text(
+        `Could not determine VRAM for ${pod.gpu.displayName} from catalog.\n` +
+          `Please specify requiredVramGb explicitly.`
+      );
+    }
+
+    if (!currentCost && !currentGpu) {
+      return text(`Could not determine current GPU cost for ${pod.gpu.displayName}.`);
+    }
+
+    // Determine pricing mode: compare like-for-like
+    const isSpot = pod.adjustedCostPerHr != null && pod.adjustedCostPerHr !== pod.costPerHr;
+    const currentPrice = currentCost ?? currentGpu?.lowestPrice?.minimumBidPrice ?? currentGpu?.communitySpotPrice ?? 0;
+
+    // Find alternatives: same or higher VRAM, in stock
+    const alternatives = gpuTypes
+      .filter((g) => {
+        if (g.id === currentGpu?.id) return false;
+        if (g.memoryInGb < minVram) return false;
+        const stock = g.lowestPrice?.stockStatus;
+        if (stock === "Out of Stock") return false;
+        return true;
+      })
+      .map((g) => {
+        const spotPrice = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
+        const ondemandPrice = g.lowestPrice?.uninterruptablePrice ?? g.communityPrice ?? null;
+        // Compare like-for-like: use spot price if current pod is spot, else on-demand
+        const comparePrice = isSpot ? (spotPrice ?? ondemandPrice) : (ondemandPrice ?? spotPrice);
+        return { ...g, spotPrice, ondemandPrice, comparePrice: comparePrice ?? Infinity };
+      })
+      .filter((g) => g.comparePrice < Infinity)
+      .sort((a, b) => a.comparePrice - b.comparePrice)
+      .slice(0, 10);
+
+    const pricingLabel = isSpot ? "spot" : "on-demand";
+    const sections: string[] = [
+      "## GPU Cost Comparison\n",
+      `### Current GPU: ${pod.gpu.displayName} x${pod.gpu.count}`,
+      `- VRAM: ${currentVram > 0 ? `${currentVram}GB` : "unknown"}`,
+      `- Cost: $${currentPrice}/hr ${pricingLabel} ($${(currentPrice * 24 * 30).toFixed(0)}/month estimated)`,
+      "",
+    ];
+
+    const cheaper = alternatives.filter((a) => a.comparePrice < currentPrice);
+    const similar = alternatives.filter((a) => a.comparePrice >= currentPrice);
+
+    if (cheaper.length === 0) {
+      sections.push(`**Already on the cheapest available GPU for your VRAM requirement (${pricingLabel} pricing).**\n`);
+    } else {
+      sections.push(`### Cheaper Alternatives (${pricingLabel} pricing)\n`);
+      sections.push("| GPU | VRAM | Spot | On-Demand | Stock | Monthly Savings |");
+      sections.push("|-----|------|------|-----------|-------|-----------------|");
+      for (const g of cheaper) {
+        const savings = (currentPrice - g.comparePrice) * 24 * 30;
+        const stock = g.lowestPrice?.stockStatus ?? "unknown";
+        sections.push(
+          `| ${g.displayName} | ${g.memoryInGb}GB | ${g.spotPrice != null ? `$${g.spotPrice}/hr` : "n/a"} | ${g.ondemandPrice != null ? `$${g.ondemandPrice}/hr` : "n/a"} | ${stock} | ~$${savings.toFixed(0)} |`
+        );
+      }
+      sections.push("");
+    }
+
+    if (similar.length > 0 && cheaper.length < 5) {
+      sections.push("### Other Options (same or higher price)\n");
+      for (const g of similar.slice(0, 5)) {
+        const stock = g.lowestPrice?.stockStatus ?? "unknown";
+        sections.push(`- ${g.displayName} (${g.memoryInGb}GB) - $${g.comparePrice}/hr [${stock}]`);
+      }
+    }
+
+    return text(sections.join("\n"));
   }
 );
 

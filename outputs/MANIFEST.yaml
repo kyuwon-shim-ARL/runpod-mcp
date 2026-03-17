@@ -1,0 +1,45 @@
+version: 3
+updated: "2026-03-17T02:50:00Z"
+scan_paths:
+  - outputs/
+foundations: {}
+milestone:
+  name: "GPU Optimization v1"
+  description: "GPU 메모리 사용량 최적화 도구 추가"
+  status: active
+experiments:
+  e001:
+    title: "gpu_health_check MVP"
+    issue: 1
+    status: done
+    branch: master
+    dependencies: []
+    description: "nvidia-smi 기반 GPU 활용률 진단 도구"
+  e002:
+    title: "create_pod_auto 오버프로비저닝 경고"
+    issue: 2
+    status: done
+    branch: master
+    dependencies: []
+    description: "선택 GPU가 요청 VRAM 2배 초과 시 경고"
+  e003:
+    title: "PyTorch 최적화 환경변수 opt-in"
+    issue: 3
+    status: done
+    branch: master
+    dependencies: []
+    description: "PYTORCH_CUDA_ALLOC_CONF 자동 주입 (opt-in)"
+  e004:
+    title: "gpu_health_check 배치 크기 어드바이저"
+    issue: 4
+    status: done
+    branch: master
+    dependencies: [e001]
+    description: "perSampleMb 기반 배치 크기 추천"
+  e005:
+    title: "gpu_cost_compare 비용 비교 도구"
+    issue: 5
+    status: done
+    branch: master
+    dependencies: []
+    description: "현재 GPU vs 카탈로그 대안 비용 비교"

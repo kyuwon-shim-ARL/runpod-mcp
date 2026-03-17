@@ -7,3 +7,11 @@ dist/*.js
 dist/*.js.map
 dist/*.d.ts
 dist/*.d.ts.map
+
+# OMC Experiment Workflow
+outputs/**/*.csv
+outputs/**/*.png
+outputs/**/*.pkl
+outputs/**/*.html
+!outputs/MANIFEST.yaml
+.omc-config.sh
