@@ -17,7 +17,10 @@
   },
   "main": "dist/index.js",
   "files": [
-    "dist/"
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "!dist/__tests__/",
+    "!dist/runpod-mcp.mjs"
   ],
   "scripts": {
     "build": "tsc",
@@ -26,7 +29,7 @@
     "test": "vitest run",
     "lint": "tsc --noEmit",
     "bundle": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/runpod-mcp.mjs",
-    "prepublishOnly": "npm run build && npm run bundle"
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

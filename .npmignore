@@ -1,0 +1,9 @@
+dist/runpod-mcp.mjs
+dist/__tests__/
+dist/**/*.test.*
+dist/**/*.map
+src/
+tsconfig.json
+vitest.config.ts
+.github/
+.omc/

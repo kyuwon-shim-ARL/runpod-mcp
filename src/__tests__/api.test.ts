@@ -1,0 +1,270 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { RunPodClient } from "../api.js";
+
+// Mock global fetch
+const mockFetch = vi.fn();
+vi.stubGlobal("fetch", mockFetch);
+
+function makeClient() {
+  return new RunPodClient({
+    apiKey: "rp_test123",
+    restBaseUrl: "https://rest.runpod.io/v1",
+    graphqlUrl: "https://api.runpod.io/graphql",
+    sshKeyPath: "/tmp/test_key",
+  });
+}
+
+function jsonResponse(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function errorResponse(status: number, body: string) {
+  return new Response(body, { status });
+}
+
+beforeEach(() => {
+  mockFetch.mockReset();
+});
+
+// ── REST API ──
+
+describe("restRequest", () => {
+  it("listPods returns normalized pods", async () => {
+    const pods = [
+      { id: "pod1", name: "test", desiredStatus: "RUNNING", portMappings: { "22/tcp": 10022 } },
+    ];
+    mockFetch.mockResolvedValueOnce(jsonResponse(pods));
+
+    const client = makeClient();
+    const result = await client.listPods();
+
+    expect(result).toHaveLength(1);
+    expect(result[0].portMappings).toEqual({ "22": 10022 });
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({
+          Authorization: "Bearer rp_test123",
+        }),
+      })
+    );
+  });
+
+  it("getPod returns a single normalized pod", async () => {
+    const pod = { id: "pod1", name: "test", desiredStatus: "RUNNING", portMappings: { "22/tcp": 10022 } };
+    mockFetch.mockResolvedValueOnce(jsonResponse(pod));
+
+    const client = makeClient();
+    const result = await client.getPod("pod1");
+
+    expect(result.id).toBe("pod1");
+    expect(result.portMappings).toEqual({ "22": 10022 });
+  });
+
+  it("throws on HTTP error with status and body", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(401, "Unauthorized"));
+
+    const client = makeClient();
+    await expect(client.listPods()).rejects.toThrow("RunPod REST API GET /pods: 401 Unauthorized");
+  });
+
+  it("throws on 500 server error", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(500, "Internal Server Error"));
+
+    const client = makeClient();
+    await expect(client.getPod("pod1")).rejects.toThrow("RunPod REST API GET /pods/pod1: 500 Internal Server Error");
+  });
+
+  it("createPod sends correct body", async () => {
+    const createdPod = { id: "new-pod", name: "my-pod", desiredStatus: "CREATED" };
+    mockFetch.mockResolvedValueOnce(jsonResponse(createdPod));
+
+    const client = makeClient();
+    const result = await client.createPod({
+      name: "my-pod",
+      imageName: "runpod/pytorch:2.1.0",
+      gpuTypeIds: ["NVIDIA GeForce RTX 3090"],
+      gpuCount: 1,
+    });
+
+    expect(result.id).toBe("new-pod");
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.name).toBe("my-pod");
+    expect(callBody.gpuTypeIds).toEqual(["NVIDIA GeForce RTX 3090"]);
+  });
+
+  it("deletePod sends DELETE request", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+
+    const client = makeClient();
+    await client.deletePod("pod1");
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods/pod1",
+      expect.objectContaining({ method: "DELETE" })
+    );
+  });
+
+  it("stopPod sends POST to stop endpoint", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+
+    const client = makeClient();
+    await client.stopPod("pod1");
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods/pod1/stop",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+});
+
+// ── GraphQL API ──
+
+describe("graphqlRequest", () => {
+  it("listGpuTypes parses GPU data", async () => {
+    const data = {
+      data: {
+        gpuTypes: [
+          {
+            id: "NVIDIA GeForce RTX 3090",
+            displayName: "RTX 3090",
+            memoryInGb: 24,
+            communityCloud: true,
+            secureCloud: false,
+            communityPrice: 0.44,
+            communitySpotPrice: 0.2,
+            securePrice: null,
+            secureSpotPrice: null,
+            lowestPrice: { minimumBidPrice: 0.2, uninterruptablePrice: 0.44, stockStatus: "High" },
+          },
+        ],
+      },
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(data));
+
+    const client = makeClient();
+    const gpus = await client.listGpuTypes();
+
+    expect(gpus).toHaveLength(1);
+    expect(gpus[0].displayName).toBe("RTX 3090");
+    expect(gpus[0].memoryInGb).toBe(24);
+    expect(gpus[0].lowestPrice?.stockStatus).toBe("High");
+  });
+
+  it("throws on GraphQL errors", async () => {
+    const data = {
+      data: null,
+      errors: [{ message: "Invalid query" }, { message: "Field not found" }],
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(data));
+
+    const client = makeClient();
+    await expect(client.listGpuTypes()).rejects.toThrow("RunPod GraphQL: Invalid query, Field not found");
+  });
+
+  it("throws on HTTP error for GraphQL", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(403, "Forbidden"));
+
+    const client = makeClient();
+    await expect(client.listGpuTypes()).rejects.toThrow("RunPod GraphQL API: 403 Forbidden");
+  });
+
+  it("createSpotPod sends mutation with variables", async () => {
+    const data = { data: { podRentInterruptable: { id: "spot-pod-1", imageName: "test", machineId: "m1" } } };
+    mockFetch.mockResolvedValueOnce(jsonResponse(data));
+
+    const client = makeClient();
+    const result = await client.createSpotPod({
+      name: "spot-test",
+      imageName: "runpod/pytorch:2.1.0",
+      gpuTypeIds: ["NVIDIA GeForce RTX 3090"],
+      gpuCount: 1,
+      bidPerGpu: 0.25,
+    });
+
+    expect(result.id).toBe("spot-pod-1");
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.variables.input.bidPerGpu).toBe(0.25);
+    expect(callBody.variables.input.name).toBe("spot-test");
+  });
+});
+
+// ── SSH Helpers ──
+
+describe("getSshArgs", () => {
+  it("returns SSH args with key path", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getSshArgs(pod);
+
+    expect(args).toEqual([
+      "ssh", "-o", "StrictHostKeyChecking=no", "-p", "10022",
+      "-i", "/tmp/test_key", "root@1.2.3.4",
+    ]);
+  });
+
+  it("returns null when pod has no public IP", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: null, portMappings: { "22": 10022 } } as any;
+    expect(client.getSshArgs(pod)).toBeNull();
+  });
+
+  it("returns null when pod has no SSH port", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: {} } as any;
+    expect(client.getSshArgs(pod)).toBeNull();
+  });
+
+  it("getSshCommandString returns joined string", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const cmd = client.getSshCommandString(pod);
+    expect(cmd).toBe("ssh -o StrictHostKeyChecking=no -p 10022 -i /tmp/test_key root@1.2.3.4");
+  });
+});
+
+// ── Rsync Helpers ──
+
+describe("getRsyncArgs", () => {
+  it("returns upload rsync args", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
+
+    expect(args).not.toBeNull();
+    expect(args![0]).toBe("rsync");
+    expect(args).toContain("/local/data");
+    expect(args!.at(-1)).toBe("root@1.2.3.4:/workspace/data");
+  });
+
+  it("returns download rsync args", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/out", "/workspace/results", "download");
+
+    expect(args).not.toBeNull();
+    expect(args!.at(-1)).toBe("/local/out");
+    expect(args).toContain("root@1.2.3.4:/workspace/results");
+  });
+
+  it("returns null when pod not ready", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: null } as any;
+    expect(client.getRsyncArgs(pod, "/a", "/b", "upload")).toBeNull();
+  });
+});
+
+// ── Network error simulation ──
+
+describe("network errors", () => {
+  it("handles fetch rejection (network timeout)", async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
+
+    const client = makeClient();
+    await expect(client.listPods()).rejects.toThrow("fetch failed");
+  });
+});

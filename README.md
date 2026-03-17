@@ -42,7 +42,7 @@ claude mcp add runpod --scope user \
   -- node /path/to/runpod-mcp/dist/index.js
 ```
 
-## Tools (14)
+## Tools (16)
 
 | Tool | Description |
 |------|-------------|
@@ -60,6 +60,8 @@ claude mcp add runpod --scope user \
 | `execute_ssh_command` | Run command on pod via SSH |
 | `upload_files` | Upload files via rsync |
 | `download_files` | Download files via rsync |
+| `gpu_health_check` | Check GPU utilization with batch size advisor |
+| `gpu_cost_compare` | Compare GPU costs against cheaper alternatives |
 
 ## Environment Variables
 
