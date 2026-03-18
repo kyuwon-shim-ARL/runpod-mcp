@@ -21282,6 +21282,19 @@ var server = new McpServer({
 function text(s) {
   return { content: [{ type: "text", text: s }] };
 }
+function errorResult(e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+}
+function safeTool(handler) {
+  return async (args) => {
+    try {
+      return await handler(args);
+    } catch (e) {
+      return errorResult(e);
+    }
+  };
+}
 function podSummary(pod) {
   const c = requireClient();
   const ssh = c.getSshCommandString(pod);
@@ -21300,16 +21313,16 @@ function isAuthError(e) {
   const msg = String(e?.message ?? "");
   return /\b(401|403|unauthorized|forbidden|authentication)\b/i.test(msg);
 }
-server.tool("list_pods", "List all RunPod pods with status and SSH info", {}, async () => {
+server.tool("list_pods", "List all RunPod pods with status and SSH info", {}, safeTool(async () => {
   const pods = await requireClient().listPods();
   if (!pods.length) return text("No pods found.");
   return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
-});
+}));
 server.tool(
   "get_pod",
   "Get detailed info about a specific pod",
   { podId: external_exports.string().describe("Pod ID") },
-  async ({ podId }) => text(podSummary(await requireClient().getPod(podId)))
+  safeTool(async ({ podId }) => text(podSummary(await requireClient().getPod(podId))))
 );
 server.tool(
   "create_pod",
@@ -21331,7 +21344,7 @@ server.tool(
     dockerArgs: external_exports.string().optional(),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0.")
   },
-  async (args) => {
+  safeTool(async (args) => {
     const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
     const opts = {
       name: args.name,
@@ -21360,11 +21373,11 @@ Use wait_for_pod to monitor until ready.`);
 ${podSummary(pod)}
 
 Use wait_for_pod to monitor until ready.`);
-  }
+  })
 );
 server.tool(
   "create_pod_auto",
-  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, skipping those with Low/no stock.",
+  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, skipping those with Low/no stock. Prefer over create_pod when no specific GPU model is required.",
   {
     name: external_exports.string().describe("Pod name"),
     imageName: external_exports.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"),
@@ -21378,7 +21391,7 @@ server.tool(
     env: external_exports.record(external_exports.string()).optional(),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0.")
   },
-  async (args) => {
+  safeTool(async (args) => {
     const gpuTypes = await requireClient().listGpuTypes();
     const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
     const errors = [];
@@ -21428,7 +21441,7 @@ Use wait_for_pod to monitor.`
         return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}
 ${podSummary(pod)}`);
       } catch (e) {
-        if (isAuthError(e)) throw e;
+        if (isAuthError(e)) return errorResult(e);
         errors.push(`${gpu.displayName}: ${e.message}`);
         continue;
       }
@@ -21449,58 +21462,58 @@ ${errors.join("\n")}` : "";
         return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
       }).join("\n") + errMsg
     );
-  }
+  })
 );
 server.tool(
   "stop_pod",
   "Stop a running pod (preserves volume data, stops billing for compute)",
   { podId: external_exports.string() },
-  async ({ podId }) => {
+  safeTool(async ({ podId }) => {
     await requireClient().stopPod(podId);
     return text(`Pod ${podId} stop requested.`);
-  }
+  })
 );
 server.tool(
   "start_pod",
   "Start a stopped pod",
   { podId: external_exports.string() },
-  async ({ podId }) => {
+  safeTool(async ({ podId }) => {
     await requireClient().startPod(podId);
     return text(`Pod ${podId} start requested. Use wait_for_pod to monitor.`);
-  }
+  })
 );
 server.tool(
   "restart_pod",
   "Restart a running pod",
   { podId: external_exports.string() },
-  async ({ podId }) => {
+  safeTool(async ({ podId }) => {
     await requireClient().restartPod(podId);
     return text(`Pod ${podId} restart requested.`);
-  }
+  })
 );
 server.tool(
   "delete_pod",
   "Permanently delete a pod (WARNING: destroys all data not on network volumes)",
   { podId: external_exports.string() },
-  async ({ podId }) => {
+  safeTool(async ({ podId }) => {
     await requireClient().deletePod(podId);
     return text(`Pod ${podId} deleted.`);
-  }
+  })
 );
 server.tool(
   "wait_for_pod",
-  "Poll until a pod is RUNNING with a public IP and SSH port available (includes TCP probe). Returns SSH command when ready.",
+  "Poll until a pod is RUNNING with a public IP and SSH port available (includes TCP probe). Returns SSH command when ready. Always call after create_pod/create_pod_auto before any SSH operations.",
   {
     podId: external_exports.string(),
     timeoutSeconds: external_exports.number().default(300).describe("Max wait time in seconds"),
     intervalSeconds: external_exports.number().default(10).describe("Poll interval in seconds")
   },
-  async ({ podId, timeoutSeconds, intervalSeconds }) => {
+  safeTool(async ({ podId, timeoutSeconds, intervalSeconds }) => {
     const pod = await requireClient().waitForPod(podId, timeoutSeconds * 1e3, intervalSeconds * 1e3);
     return text(`Pod is ready!
 
 ${podSummary(pod)}`);
-  }
+  })
 );
 server.tool(
   "list_gpu_types",
@@ -21509,7 +21522,7 @@ server.tool(
     minVram: external_exports.number().default(0).describe("Filter by minimum VRAM in GB"),
     inStockOnly: external_exports.boolean().default(false).describe("Only show GPUs with High/Medium stock")
   },
-  async ({ minVram, inStockOnly }) => {
+  safeTool(async ({ minVram, inStockOnly }) => {
     let gpus = await requireClient().listGpuTypes();
     if (minVram > 0) gpus = gpus.filter((g) => g.memoryInGb >= minVram);
     if (inStockOnly) gpus = gpus.filter((g) => {
@@ -21531,29 +21544,29 @@ server.tool(
       return `${g.displayName} | ${g.memoryInGb}GB | ${spot != null ? `$${spot}/hr` : "n/a"} | ${ondemand != null ? `$${ondemand}/hr` : "n/a"} | ${stock}`;
     });
     return text([header, sep, ...rows].join("\n"));
-  }
+  })
 );
 server.tool(
   "get_ssh_command",
   "Get the SSH command for connecting to a running pod",
   { podId: external_exports.string() },
-  async ({ podId }) => {
+  safeTool(async ({ podId }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const cmd = c.getSshCommandString(pod);
     if (!cmd) return text("Pod is not ready (no public IP or SSH port). Try wait_for_pod first.");
     return text(cmd);
-  }
+  })
 );
 server.tool(
   "execute_ssh_command",
-  "Execute a command on a running pod via SSH. Returns stdout/stderr.",
+  "Execute a command on a running pod via SSH. Returns stdout/stderr. Requires wait_for_pod first; background long jobs with nohup.",
   {
     podId: external_exports.string(),
     command: external_exports.string().describe("Shell command to execute on the pod"),
     timeoutSeconds: external_exports.number().default(120).describe("Command timeout")
   },
-  async ({ podId, command, timeoutSeconds }) => {
+  safeTool(async ({ podId, command, timeoutSeconds }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const sshArgs = c.getSshArgs(pod);
@@ -21575,7 +21588,7 @@ Stdout:
 ${result.stdout}`);
     }
     return text(result.stdout || "(no output)");
-  }
+  })
 );
 server.tool(
   "upload_files",
@@ -21586,7 +21599,7 @@ server.tool(
     remotePath: external_exports.string().default("/workspace").describe("Destination path on pod"),
     dryRun: external_exports.boolean().default(false).describe("Show command without executing")
   },
-  async ({ podId, localPath, remotePath, dryRun }) => {
+  safeTool(async ({ podId, localPath, remotePath, dryRun }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const args = c.getRsyncArgs(pod, localPath, remotePath, "upload");
@@ -21605,7 +21618,7 @@ ${result.stderr}`);
     return text(`Upload complete.
 
 ${result.stdout}`);
-  }
+  })
 );
 server.tool(
   "download_files",
@@ -21616,7 +21629,7 @@ server.tool(
     localPath: external_exports.string().describe("Local destination path"),
     dryRun: external_exports.boolean().default(false)
   },
-  async ({ podId, remotePath, localPath, dryRun }) => {
+  safeTool(async ({ podId, remotePath, localPath, dryRun }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const args = c.getRsyncArgs(pod, localPath, remotePath, "download");
@@ -21635,11 +21648,11 @@ ${result.stderr}`);
     return text(`Download complete.
 
 ${result.stdout}`);
-  }
+  })
 );
 server.tool(
   "gpu_health_check",
-  "Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation.",
+  "Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation. Best called 1-2 min after training starts to measure actual GPU utilization.",
   {
     podId: external_exports.string().describe("Pod ID"),
     perSampleMb: external_exports.number().optional().describe(
@@ -21647,7 +21660,7 @@ server.tool(
     ),
     timeoutSeconds: external_exports.number().default(30).describe("SSH timeout")
   },
-  async ({ podId, perSampleMb, timeoutSeconds }) => {
+  safeTool(async ({ podId, perSampleMb, timeoutSeconds }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const sshArgs = c.getSshArgs(pod);
@@ -21766,16 +21779,16 @@ ${gpuResult.stderr ?? ""}`);
       }
     }
     return text(sections.join("\n"));
-  }
+  })
 );
 server.tool(
   "gpu_cost_compare",
-  "Compare current pod GPU cost against catalog alternatives. Finds cheaper GPUs with similar or sufficient VRAM.",
+  "Compare current pod GPU cost against catalog alternatives. Finds cheaper GPUs with similar or sufficient VRAM. Call after gpu_health_check reveals underutilization to find cheaper alternatives.",
   {
     podId: external_exports.string().describe("Pod ID to compare"),
     requiredVramGb: external_exports.number().optional().describe("Minimum VRAM needed in GB (defaults to pod's current GPU VRAM)")
   },
-  async ({ podId, requiredVramGb }) => {
+  safeTool(async ({ podId, requiredVramGb }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     if (!pod.gpu) return text("This pod has no GPU information. Cannot compare costs.");
@@ -21842,7 +21855,7 @@ Please specify requiredVramGb explicitly.`
       }
     }
     return text(sections.join("\n"));
-  }
+  })
 );
 var transport = new StdioServerTransport();
 await server.connect(transport);
