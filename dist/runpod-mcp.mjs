@@ -21292,6 +21292,23 @@ function calcSuggestedBatchSize(totalMb, perSampleMb) {
 function isOverprovisioned(gpuVramGb, minVramGb) {
   return gpuVramGb >= minVramGb * 2;
 }
+function summarizeTrend(samples) {
+  if (!samples.length) return { verdict: "CONSISTENTLY_IDLE", avgVramPct: 0, avgGpuUtil: 0, minVramPct: 0, maxVramPct: 0 };
+  const vramPcts = samples.map((s) => s.usedPct);
+  const gpuUtils = samples.map((s) => s.gpuUtil);
+  const avgVramPct = Math.round(vramPcts.reduce((a, b) => a + b, 0) / vramPcts.length * 10) / 10;
+  const avgGpuUtil = Math.round(gpuUtils.reduce((a, b) => a + b, 0) / gpuUtils.length);
+  const minVramPct = Math.min(...vramPcts);
+  const maxVramPct = Math.max(...vramPcts);
+  if (samples.every((s) => s.label === "IDLE")) return { verdict: "CONSISTENTLY_IDLE", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+  if (maxVramPct - minVramPct > 20) return { verdict: "VOLATILE", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+  const mid = Math.floor(samples.length / 2);
+  const firstHalfAvg = vramPcts.slice(0, mid || 1).reduce((a, b) => a + b, 0) / (mid || 1);
+  const secondHalfAvg = vramPcts.slice(mid).reduce((a, b) => a + b, 0) / (samples.length - mid);
+  if (secondHalfAvg > firstHalfAvg + 5) return { verdict: "IMPROVING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+  if (secondHalfAvg < firstHalfAvg - 5) return { verdict: "DEGRADING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+  return { verdict: "STABLE_OPTIMAL", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+}
 function injectPytorchEnv(env, optimize) {
   const result = { ...env };
   if (optimize && !result.PYTORCH_CUDA_ALLOC_CONF) {
@@ -21907,6 +21924,83 @@ Please specify requiredVramGb explicitly.`
         const stock = g.lowestPrice?.stockStatus ?? "unknown";
         sections.push(`- ${g.displayName} (${g.memoryInGb}GB) - $${g.comparePrice}/hr [${stock}]`);
       }
+    }
+    return text(sections.join("\n"));
+  })
+);
+server.tool(
+  "gpu_sample_burst",
+  "Take multiple rapid GPU utilization snapshots (3-5 samples, 3-5s apart) to detect trends. Returns per-sample metrics plus a trend verdict: STABLE_OPTIMAL, IMPROVING, DEGRADING, CONSISTENTLY_IDLE, or VOLATILE. Use during training to verify GPU stays utilized over time.",
+  {
+    podId: external_exports.string().describe("Pod ID"),
+    samples: external_exports.number().min(2).max(10).default(5).describe("Number of samples to take"),
+    intervalSeconds: external_exports.number().min(2).max(10).default(3).describe("Seconds between samples"),
+    timeoutSeconds: external_exports.number().default(120).describe("Total SSH timeout")
+  },
+  safeTool(async ({ podId, samples, intervalSeconds, timeoutSeconds }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text("Pod is not ready for SSH. Use wait_for_pod first.");
+    const smiCmd = "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits";
+    const loopParts = [];
+    for (let i = 0; i < samples; i++) {
+      if (i > 0) loopParts.push(`sleep ${intervalSeconds}`);
+      loopParts.push(`echo "---SAMPLE_${i}---"`);
+      loopParts.push(smiCmd);
+    }
+    const fullCmd = loopParts.join(" && ");
+    const { spawnSync } = await import("node:child_process");
+    const result = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", fullCmd], {
+      timeout: timeoutSeconds * 1e3,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024
+    });
+    if (result.error) return text(`SSH error: ${result.error.message}`);
+    if (result.status !== 0) return text(`nvidia-smi failed (exit ${result.status}):
+${result.stderr}
+${result.stdout}`);
+    const output = result.stdout ?? "";
+    const sampleBlocks = output.split(/---SAMPLE_\d+---/).filter((b) => b.trim());
+    const allSamples = sampleBlocks.map((block) => parseNvidiaSmiOutput(block.trim()));
+    const primarySamples = allSamples.map((gpus) => gpus[0]).filter(Boolean);
+    if (!primarySamples.length) return text("No GPU data returned from nvidia-smi.");
+    const trend = summarizeTrend(primarySamples);
+    const sections = [
+      `## GPU Sample Burst (${primarySamples.length} samples, ${intervalSeconds}s apart)
+`,
+      `### Trend: **${trend.verdict}**`,
+      `- Avg VRAM: ${trend.avgVramPct}% | Avg GPU Util: ${trend.avgGpuUtil}%`,
+      `- VRAM Range: ${trend.minVramPct}% \u2014 ${trend.maxVramPct}%`,
+      "",
+      "### Samples",
+      "| # | VRAM Used | VRAM % | GPU Util | Label |",
+      "|---|-----------|--------|----------|-------|"
+    ];
+    for (let i = 0; i < primarySamples.length; i++) {
+      const s = primarySamples[i];
+      sections.push(`| ${i + 1} | ${s.usedMb}/${s.totalMb} MiB | ${s.usedPct}% | ${s.gpuUtil}% | ${s.label} |`);
+    }
+    sections.push("");
+    switch (trend.verdict) {
+      case "CONSISTENTLY_IDLE":
+        sections.push("**Action needed**: GPU is consistently idle. Check if training actually started. Consider stopping the pod to avoid cost waste.");
+        break;
+      case "DEGRADING":
+        sections.push("**Warning**: GPU utilization is declining. Possible causes: data pipeline exhausted, training finished, or memory leak causing swapping.");
+        break;
+      case "VOLATILE":
+        sections.push("**Note**: Large VRAM fluctuations detected. This may indicate dynamic batching, gradient accumulation, or periodic evaluation phases.");
+        break;
+      case "IMPROVING":
+        sections.push("**Good**: GPU utilization is ramping up. Training is warming up \u2014 re-check in a few minutes to confirm stabilization.");
+        break;
+      case "STABLE_OPTIMAL":
+        sections.push("**Excellent**: GPU utilization is stable. No action needed.");
+        break;
+    }
+    if (pod.costPerHr != null) {
+      sections.push("", `**Current cost**: $${pod.costPerHr}/hr`);
     }
     return text(sections.join("\n"));
   })

@@ -104,6 +104,45 @@ export function isOverprovisioned(gpuVramGb: number, minVramGb: number): boolean
  * Returns a new object — does not mutate the input.
  * If PYTORCH_CUDA_ALLOC_CONF is already set, preserves the user's value.
  */
+export type TrendVerdict = "STABLE_OPTIMAL" | "IMPROVING" | "DEGRADING" | "CONSISTENTLY_IDLE" | "VOLATILE";
+
+/**
+ * Summarize a series of GPU metric snapshots into a trend verdict.
+ * Each sample is the primary GPU's metrics from one nvidia-smi call.
+ */
+export function summarizeTrend(samples: GpuMetrics[]): {
+  verdict: TrendVerdict;
+  avgVramPct: number;
+  avgGpuUtil: number;
+  minVramPct: number;
+  maxVramPct: number;
+} {
+  if (!samples.length) return { verdict: "CONSISTENTLY_IDLE", avgVramPct: 0, avgGpuUtil: 0, minVramPct: 0, maxVramPct: 0 };
+
+  const vramPcts = samples.map((s) => s.usedPct);
+  const gpuUtils = samples.map((s) => s.gpuUtil);
+  const avgVramPct = Math.round(vramPcts.reduce((a, b) => a + b, 0) / vramPcts.length * 10) / 10;
+  const avgGpuUtil = Math.round(gpuUtils.reduce((a, b) => a + b, 0) / gpuUtils.length);
+  const minVramPct = Math.min(...vramPcts);
+  const maxVramPct = Math.max(...vramPcts);
+
+  // All samples idle
+  if (samples.every((s) => s.label === "IDLE")) return { verdict: "CONSISTENTLY_IDLE", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+
+  // Check volatility (>20% swing)
+  if (maxVramPct - minVramPct > 20) return { verdict: "VOLATILE", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+
+  // Trend direction: compare first half vs second half
+  const mid = Math.floor(samples.length / 2);
+  const firstHalfAvg = vramPcts.slice(0, mid || 1).reduce((a, b) => a + b, 0) / (mid || 1);
+  const secondHalfAvg = vramPcts.slice(mid).reduce((a, b) => a + b, 0) / (samples.length - mid);
+
+  if (secondHalfAvg > firstHalfAvg + 5) return { verdict: "IMPROVING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+  if (secondHalfAvg < firstHalfAvg - 5) return { verdict: "DEGRADING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+
+  return { verdict: "STABLE_OPTIMAL", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+}
+
 export function injectPytorchEnv(
   env: Record<string, string> | undefined,
   optimize: boolean
