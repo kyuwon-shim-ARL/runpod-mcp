@@ -21364,6 +21364,7 @@ function podSummary(pod) {
     pod.gpu ? `GPU: ${pod.gpu.displayName} x${pod.gpu.count}` : null,
     pod.publicIp ? `IP: ${pod.publicIp}` : "IP: (not yet assigned)",
     pod.portMappings?.["22"] ? `SSH Port: ${pod.portMappings["22"]}` : null,
+    pod.networkVolumeId ? `Network Volume: ${pod.networkVolumeId}` : null,
     pod.costPerHr != null ? `Cost: $${pod.costPerHr}/hr` : null,
     ssh ? `SSH: ${ssh}` : null
   ].filter(Boolean).join("\n");
@@ -21442,6 +21443,7 @@ server.tool(
     imageName: external_exports.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"),
     gpuPreference: external_exports.array(external_exports.string()).default(["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000"]).describe("GPU types in order of preference"),
     minVram: external_exports.number().default(12).describe("Minimum VRAM in GB"),
+    gpuCount: external_exports.number().default(1).describe("Number of GPUs per pod"),
     spot: external_exports.boolean().default(false).describe("Use spot (interruptible) instance \u2014 cheaper but can be preempted"),
     maxBidPerGpu: external_exports.number().default(0.3).describe("Max spot bid per GPU"),
     containerDiskInGb: external_exports.number().default(50),
@@ -21488,7 +21490,7 @@ Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you request
           name: args.name,
           imageName: args.imageName,
           gpuTypeIds: [gpuId],
-          gpuCount: 1,
+          gpuCount: args.gpuCount,
           interruptible: args.spot,
           containerDiskInGb: args.containerDiskInGb,
           volumeInGb: args.volumeInGb,
@@ -21964,6 +21966,7 @@ ${result.stdout}`);
     const output = result.stdout ?? "";
     const sampleBlocks = output.split(/---SAMPLE_\d+---/).filter((b) => b.trim());
     const allSamples = sampleBlocks.map((block) => parseNvidiaSmiOutput(block.trim()));
+    const gpuCount = allSamples[0]?.length ?? 0;
     const primarySamples = allSamples.map((gpus) => gpus[0]).filter(Boolean);
     if (!primarySamples.length) return text("No GPU data returned from nvidia-smi.");
     const trend = summarizeTrend(primarySamples);
@@ -22002,6 +22005,9 @@ ${result.stdout}`);
       case "STABLE_OPTIMAL":
         sections.push("**Excellent**: GPU utilization is stable. No action needed.");
         break;
+    }
+    if (gpuCount > 1) {
+      sections.push("", `**Multi-GPU detected (${gpuCount} GPUs)**: Trend analysis is based on GPU 0 only. Check individual GPU utilization with \`gpu_health_check\` for a full per-GPU breakdown.`);
     }
     if (pod.costPerHr != null) {
       sections.push("", `**Current cost**: $${pod.costPerHr}/hr`);

@@ -73,6 +73,7 @@ function podSummary(pod: Pod): string {
     pod.gpu ? `GPU: ${pod.gpu.displayName} x${pod.gpu.count}` : null,
     pod.publicIp ? `IP: ${pod.publicIp}` : "IP: (not yet assigned)",
     pod.portMappings?.["22"] ? `SSH Port: ${pod.portMappings["22"]}` : null,
+    pod.networkVolumeId ? `Network Volume: ${pod.networkVolumeId}` : null,
     pod.costPerHr != null ? `Cost: $${pod.costPerHr}/hr` : null,
     ssh ? `SSH: ${ssh}` : null,
   ]
@@ -169,6 +170,7 @@ server.tool(
       .default(["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000"])
       .describe("GPU types in order of preference"),
     minVram: z.number().default(12).describe("Minimum VRAM in GB"),
+    gpuCount: z.number().default(1).describe("Number of GPUs per pod"),
     spot: z.boolean().default(false).describe("Use spot (interruptible) instance — cheaper but can be preempted"),
     maxBidPerGpu: z.number().default(0.3).describe("Max spot bid per GPU"),
     containerDiskInGb: z.number().default(50),
@@ -228,7 +230,7 @@ server.tool(
           name: args.name,
           imageName: args.imageName,
           gpuTypeIds: [gpuId],
-          gpuCount: 1,
+          gpuCount: args.gpuCount,
           interruptible: args.spot,
           containerDiskInGb: args.containerDiskInGb,
           volumeInGb: args.volumeInGb,
@@ -777,6 +779,7 @@ server.tool(
     const sampleBlocks = output.split(/---SAMPLE_\d+---/).filter((b) => b.trim());
 
     const allSamples = sampleBlocks.map((block) => parseNvidiaSmiOutput(block.trim()));
+    const gpuCount = allSamples[0]?.length ?? 0;
     const primarySamples = allSamples.map((gpus) => gpus[0]).filter(Boolean);
 
     if (!primarySamples.length) return text("No GPU data returned from nvidia-smi.");
@@ -820,6 +823,10 @@ server.tool(
       case "STABLE_OPTIMAL":
         sections.push("**Excellent**: GPU utilization is stable. No action needed.");
         break;
+    }
+
+    if (gpuCount > 1) {
+      sections.push("", `**Multi-GPU detected (${gpuCount} GPUs)**: Trend analysis is based on GPU 0 only. Check individual GPU utilization with \`gpu_health_check\` for a full per-GPU breakdown.`);
     }
 
     if (pod.costPerHr != null) {
