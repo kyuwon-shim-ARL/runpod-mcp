@@ -258,6 +258,79 @@ describe("getRsyncArgs", () => {
   });
 });
 
+// ── Network Volume API ──
+
+describe("network volume methods", () => {
+  it("listNetworkVolumes returns volumes from GraphQL", async () => {
+    const volumes = [
+      { id: "vol1", name: "train-data", size: 20, dataCenterId: "US-TX-3" },
+      { id: "vol2", name: "checkpoints", size: 50, dataCenterId: "EU-RO-1" },
+    ];
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: { myself: { networkVolumes: volumes } } }))
+    );
+
+    const client = makeClient();
+    const result = await client.listNetworkVolumes();
+    expect(result).toHaveLength(2);
+    expect(result[0].name).toBe("train-data");
+    expect(result[1].dataCenterId).toBe("EU-RO-1");
+  });
+
+  it("getNetworkVolume returns matching volume", async () => {
+    const volumes = [
+      { id: "vol1", name: "train-data", size: 20, dataCenterId: "US-TX-3" },
+    ];
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: { myself: { networkVolumes: volumes } } }))
+    );
+
+    const client = makeClient();
+    const result = await client.getNetworkVolume("vol1");
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe("train-data");
+  });
+
+  it("getNetworkVolume returns null for missing volume", async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: { myself: { networkVolumes: [] } } }))
+    );
+
+    const client = makeClient();
+    const result = await client.getNetworkVolume("nonexistent");
+    expect(result).toBeNull();
+  });
+
+  it("createNetworkVolume sends correct GraphQL mutation", async () => {
+    const created = { id: "vol-new", name: "my-vol", size: 10, dataCenterId: "US-TX-3" };
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: { createNetworkVolume: created } }))
+    );
+
+    const client = makeClient();
+    const result = await client.createNetworkVolume("my-vol", 10, "US-TX-3");
+    expect(result.id).toBe("vol-new");
+    expect(result.size).toBe(10);
+
+    // Verify the request body
+    const call = mockFetch.mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    expect(body.query).toContain("createNetworkVolume");
+    expect(body.variables.input).toEqual({ name: "my-vol", size: 10, dataCenterId: "US-TX-3" });
+  });
+
+  it("deleteNetworkVolume calls REST DELETE", async () => {
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({})));
+
+    const client = makeClient();
+    await client.deleteNetworkVolume("vol-123");
+
+    const call = mockFetch.mock.calls[0];
+    expect(call[0]).toContain("/networkvolumes/vol-123");
+    expect(call[1].method).toBe("DELETE");
+  });
+});
+
 // ── Network error simulation ──
 
 describe("network errors", () => {

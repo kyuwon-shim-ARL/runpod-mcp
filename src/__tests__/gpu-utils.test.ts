@@ -278,3 +278,113 @@ describe("injectPytorchEnv", () => {
     expect(Object.keys(result)).toHaveLength(0);
   });
 });
+
+// ── summarizeTrend ──
+import { summarizeTrend } from "../gpu-utils.js";
+import type { GpuMetrics } from "../gpu-utils.js";
+
+function makeMetrics(overrides: Partial<GpuMetrics> = {}): GpuMetrics {
+  const totalMb = overrides.totalMb ?? 24000;
+  const usedMb = overrides.usedMb ?? 18000;
+  const usedPct = overrides.usedPct ?? Math.round((usedMb / totalMb) * 100 * 10) / 10;
+  return {
+    index: 0,
+    name: "RTX 4090",
+    totalMb,
+    usedMb,
+    freeMb: totalMb - usedMb,
+    usedPct,
+    gpuUtil: overrides.gpuUtil ?? 75,
+    memUtil: overrides.memUtil ?? 60,
+    temp: overrides.temp ?? 65,
+    label: overrides.label ?? "OPTIMAL",
+    ...overrides,
+  };
+}
+
+describe("summarizeTrend", () => {
+  it("returns CONSISTENTLY_IDLE for empty array", () => {
+    expect(summarizeTrend([]).verdict).toBe("CONSISTENTLY_IDLE");
+  });
+
+  it("returns CONSISTENTLY_IDLE when all samples are IDLE", () => {
+    const samples = [
+      makeMetrics({ usedMb: 500, usedPct: 2, label: "IDLE" }),
+      makeMetrics({ usedMb: 600, usedPct: 2.5, label: "IDLE" }),
+      makeMetrics({ usedMb: 550, usedPct: 2.3, label: "IDLE" }),
+    ];
+    expect(summarizeTrend(samples).verdict).toBe("CONSISTENTLY_IDLE");
+  });
+
+  it("returns VOLATILE when VRAM swings > 20%", () => {
+    const samples = [
+      makeMetrics({ usedPct: 30 }),
+      makeMetrics({ usedPct: 80 }),
+      makeMetrics({ usedPct: 35 }),
+    ];
+    expect(summarizeTrend(samples).verdict).toBe("VOLATILE");
+  });
+
+  it("returns IMPROVING when second half is higher", () => {
+    const samples = [
+      makeMetrics({ usedPct: 40, label: "UNDERUTILIZED" }),
+      makeMetrics({ usedPct: 42, label: "UNDERUTILIZED" }),
+      makeMetrics({ usedPct: 55, label: "UNDERUTILIZED" }),
+      makeMetrics({ usedPct: 58, label: "UNDERUTILIZED" }),
+    ];
+    expect(summarizeTrend(samples).verdict).toBe("IMPROVING");
+  });
+
+  it("returns DEGRADING when second half is lower", () => {
+    const samples = [
+      makeMetrics({ usedPct: 80, label: "OPTIMAL" }),
+      makeMetrics({ usedPct: 78, label: "OPTIMAL" }),
+      makeMetrics({ usedPct: 65, label: "MODERATE" }),
+      makeMetrics({ usedPct: 62, label: "MODERATE" }),
+    ];
+    expect(summarizeTrend(samples).verdict).toBe("DEGRADING");
+  });
+
+  it("returns STABLE_OPTIMAL for high stable utilization", () => {
+    const samples = [
+      makeMetrics({ usedPct: 78, label: "OPTIMAL" }),
+      makeMetrics({ usedPct: 80, label: "OPTIMAL" }),
+      makeMetrics({ usedPct: 79, label: "OPTIMAL" }),
+    ];
+    const result = summarizeTrend(samples);
+    expect(result.verdict).toBe("STABLE_OPTIMAL");
+    expect(result.avgVramPct).toBeGreaterThan(75);
+  });
+
+  it("returns STABLE_UNDERUTILIZED for low stable utilization", () => {
+    const samples = [
+      makeMetrics({ usedPct: 40, label: "UNDERUTILIZED" }),
+      makeMetrics({ usedPct: 42, label: "UNDERUTILIZED" }),
+      makeMetrics({ usedPct: 41, label: "UNDERUTILIZED" }),
+    ];
+    const result = summarizeTrend(samples);
+    expect(result.verdict).toBe("STABLE_UNDERUTILIZED");
+    expect(result.avgVramPct).toBeLessThan(60);
+  });
+
+  it("handles 2-sample input", () => {
+    const samples = [
+      makeMetrics({ usedPct: 75, label: "OPTIMAL" }),
+      makeMetrics({ usedPct: 77, label: "OPTIMAL" }),
+    ];
+    const result = summarizeTrend(samples);
+    expect(["STABLE_OPTIMAL", "IMPROVING"]).toContain(result.verdict);
+  });
+
+  it("computes correct averages", () => {
+    const samples = [
+      makeMetrics({ usedPct: 60, gpuUtil: 50 }),
+      makeMetrics({ usedPct: 80, gpuUtil: 70 }),
+    ];
+    const result = summarizeTrend(samples);
+    expect(result.avgVramPct).toBe(70);
+    expect(result.avgGpuUtil).toBe(60);
+    expect(result.minVramPct).toBe(60);
+    expect(result.maxVramPct).toBe(80);
+  });
+});

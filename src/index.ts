@@ -814,6 +814,9 @@ server.tool(
       case "IMPROVING":
         sections.push("**Good**: GPU utilization is ramping up. Training is warming up — re-check in a few minutes to confirm stabilization.");
         break;
+      case "STABLE_UNDERUTILIZED":
+        sections.push("**Action needed**: GPU utilization is stable but low. Consider increasing batch size or switching to a cheaper GPU. Use `gpu_cost_compare` to find alternatives.");
+        break;
       case "STABLE_OPTIMAL":
         sections.push("**Excellent**: GPU utilization is stable. No action needed.");
         break;

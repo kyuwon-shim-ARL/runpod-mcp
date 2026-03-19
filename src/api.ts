@@ -77,7 +77,7 @@ export class RunPodClient {
       imageName: opts.imageName,
       gpuTypeIds: opts.gpuTypeIds,
       gpuCount: opts.gpuCount ?? 1,
-      interruptible: opts.interruptible ?? true,
+      interruptible: opts.interruptible ?? false,
       containerDiskInGb: opts.containerDiskInGb ?? 50,
       volumeInGb: opts.volumeInGb ?? 20,
       volumeMountPath: opts.volumeMountPath ?? "/workspace",

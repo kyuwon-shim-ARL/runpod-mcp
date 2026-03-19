@@ -104,7 +104,7 @@ export function isOverprovisioned(gpuVramGb: number, minVramGb: number): boolean
  * Returns a new object — does not mutate the input.
  * If PYTORCH_CUDA_ALLOC_CONF is already set, preserves the user's value.
  */
-export type TrendVerdict = "STABLE_OPTIMAL" | "IMPROVING" | "DEGRADING" | "CONSISTENTLY_IDLE" | "VOLATILE";
+export type TrendVerdict = "STABLE_OPTIMAL" | "STABLE_UNDERUTILIZED" | "IMPROVING" | "DEGRADING" | "CONSISTENTLY_IDLE" | "VOLATILE";
 
 /**
  * Summarize a series of GPU metric snapshots into a trend verdict.
@@ -140,6 +140,8 @@ export function summarizeTrend(samples: GpuMetrics[]): {
   if (secondHalfAvg > firstHalfAvg + 5) return { verdict: "IMPROVING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
   if (secondHalfAvg < firstHalfAvg - 5) return { verdict: "DEGRADING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
 
+  // Distinguish stable-optimal from stable-underutilized
+  if (avgVramPct < 60) return { verdict: "STABLE_UNDERUTILIZED", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
   return { verdict: "STABLE_OPTIMAL", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
 }
 

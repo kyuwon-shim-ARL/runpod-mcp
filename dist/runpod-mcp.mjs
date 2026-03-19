@@ -21053,7 +21053,7 @@ var RunPodClient = class {
       imageName: opts.imageName,
       gpuTypeIds: opts.gpuTypeIds,
       gpuCount: opts.gpuCount ?? 1,
-      interruptible: opts.interruptible ?? true,
+      interruptible: opts.interruptible ?? false,
       containerDiskInGb: opts.containerDiskInGb ?? 50,
       volumeInGb: opts.volumeInGb ?? 20,
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
@@ -21307,6 +21307,7 @@ function summarizeTrend(samples) {
   const secondHalfAvg = vramPcts.slice(mid).reduce((a, b) => a + b, 0) / (samples.length - mid);
   if (secondHalfAvg > firstHalfAvg + 5) return { verdict: "IMPROVING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
   if (secondHalfAvg < firstHalfAvg - 5) return { verdict: "DEGRADING", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
+  if (avgVramPct < 60) return { verdict: "STABLE_UNDERUTILIZED", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
   return { verdict: "STABLE_OPTIMAL", avgVramPct, avgGpuUtil, minVramPct, maxVramPct };
 }
 function injectPytorchEnv(env, optimize) {
@@ -21994,6 +21995,9 @@ ${result.stdout}`);
         break;
       case "IMPROVING":
         sections.push("**Good**: GPU utilization is ramping up. Training is warming up \u2014 re-check in a few minutes to confirm stabilization.");
+        break;
+      case "STABLE_UNDERUTILIZED":
+        sections.push("**Action needed**: GPU utilization is stable but low. Consider increasing batch size or switching to a cheaper GPU. Use `gpu_cost_compare` to find alternatives.");
         break;
       case "STABLE_OPTIMAL":
         sections.push("**Excellent**: GPU utilization is stable. No action needed.");
