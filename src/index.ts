@@ -113,7 +113,7 @@ server.tool(
     imageName: z.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04").describe("Docker image"),
     gpuTypeId: z.string().describe('GPU type, e.g. "NVIDIA GeForce RTX 3090"'),
     gpuCount: z.number().default(1),
-    spot: z.boolean().default(true).describe("Use spot (interruptible) instance"),
+    spot: z.boolean().default(false).describe("Use spot (interruptible) instance — cheaper but can be preempted at any time"),
     bidPerGpu: z.number().optional().describe("Max bid per GPU for spot instances"),
     containerDiskInGb: z.number().default(50),
     volumeInGb: z.number().default(20),
@@ -169,7 +169,7 @@ server.tool(
       .default(["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000"])
       .describe("GPU types in order of preference"),
     minVram: z.number().default(12).describe("Minimum VRAM in GB"),
-    spot: z.boolean().default(true),
+    spot: z.boolean().default(false).describe("Use spot (interruptible) instance — cheaper but can be preempted"),
     maxBidPerGpu: z.number().default(0.3).describe("Max spot bid per GPU"),
     containerDiskInGb: z.number().default(50),
     volumeInGb: z.number().default(20),
