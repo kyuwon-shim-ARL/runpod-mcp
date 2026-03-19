@@ -61,6 +61,13 @@ export interface CreatePodOptions {
   bidPerGpu?: number;
 }
 
+export interface NetworkVolume {
+  id: string;
+  name: string;
+  size: number;
+  dataCenterId: string;
+}
+
 export interface RunPodApiConfig {
   apiKey: string;
   restBaseUrl: string;

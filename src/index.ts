@@ -175,15 +175,27 @@ server.tool(
     volumeInGb: z.number().default(20),
     sshPublicKey: z.string().optional(),
     env: z.record(z.string()).optional(),
+    networkVolumeId: z.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter."),
     optimizePytorch: z
       .boolean()
       .default(false)
       .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
   },
   safeTool(async (args) => {
-    const gpuTypes = await requireClient().listGpuTypes();
+    const c = requireClient();
+    const gpuTypes = await c.listGpuTypes();
     const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
     const errors: string[] = [];
+
+    // Resolve datacenter affinity from network volume
+    let dataCenterIds: string[] | undefined;
+    let volumeNote = "";
+    if (args.networkVolumeId) {
+      const vol = await c.getNetworkVolume(args.networkVolumeId);
+      if (!vol) return text(`Network volume ${args.networkVolumeId} not found.`);
+      dataCenterIds = [vol.dataCenterId];
+      volumeNote = `\nNetwork Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
+    }
 
     for (const gpuId of args.gpuPreference) {
       const gpu = gpuMap.get(gpuId);
@@ -224,19 +236,21 @@ server.tool(
           sshPublicKey: args.sshPublicKey,
           ports: ["22/tcp"] as string[],
           env: podEnv,
+          networkVolumeId: args.networkVolumeId,
+          dataCenterIds,
         };
 
         if (args.spot && bidPrice) {
-          const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: bidPrice });
+          const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
           return text(
             `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n` +
               `Spot bid: $${bidPrice}/hr\n` +
-              `Pod ID: ${result.id}${overprovisionWarning}\n\nUse wait_for_pod to monitor.`
+              `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\nUse wait_for_pod to monitor.`
           );
         }
 
-        const pod = await requireClient().createPod(opts);
-        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}\n${podSummary(pod)}`);
+        const pod = await c.createPod(opts);
+        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}`);
       } catch (e) {
         if (isAuthError(e)) return errorResult(e); // Auth/quota errors stop GPU iteration immediately
         errors.push(`${gpu.displayName}: ${(e as Error).message}`);
@@ -720,6 +734,90 @@ server.tool(
     }
 
     return text(sections.join("\n"));
+  })
+);
+
+// ══════════════════════════════════════════
+//  NETWORK VOLUME TOOLS
+// ══════════════════════════════════════════
+
+// ── list_network_volumes ──
+server.tool(
+  "list_network_volumes",
+  "List all network volumes in your RunPod account. Network volumes persist data across pod restarts and can be shared between pods in the same datacenter.",
+  {},
+  safeTool(async () => {
+    const volumes = await requireClient().listNetworkVolumes();
+    if (!volumes.length) return text("No network volumes found.");
+    const header = "ID | Name | Size | Datacenter";
+    const sep = "---|------|------|----------";
+    const rows = volumes.map((v) => `${v.id} | ${v.name} | ${v.size}GB | ${v.dataCenterId}`);
+    return text([header, sep, ...rows].join("\n"));
+  })
+);
+
+// ── get_network_volume ──
+server.tool(
+  "get_network_volume",
+  "Get details of a specific network volume",
+  { volumeId: z.string().describe("Network volume ID") },
+  safeTool(async ({ volumeId }) => {
+    const vol = await requireClient().getNetworkVolume(volumeId);
+    if (!vol) return text(`Network volume ${volumeId} not found.`);
+    return text(`ID: ${vol.id}\nName: ${vol.name}\nSize: ${vol.size}GB\nDatacenter: ${vol.dataCenterId}`);
+  })
+);
+
+// ── create_network_volume ──
+server.tool(
+  "create_network_volume",
+  "Create a new network volume for persistent storage. Volumes persist across pod lifecycles and can be pre-loaded with data via a staging pod. Minimum size is 10GB.",
+  {
+    name: z.string().describe("Volume name"),
+    size: z.number().min(10).describe("Size in GB (minimum 10)"),
+    dataCenterId: z.string().describe('Datacenter ID, e.g. "US-TX-3". Must match the datacenter of pods that will use this volume.'),
+  },
+  safeTool(async ({ name, size, dataCenterId }) => {
+    const vol = await requireClient().createNetworkVolume(name, size, dataCenterId);
+    return text(
+      `Network volume created!\nID: ${vol.id}\nName: ${vol.name}\nSize: ${vol.size}GB\nDatacenter: ${vol.dataCenterId}\n\n` +
+        `Attach to a pod with: create_pod or create_pod_auto (networkVolumeId: "${vol.id}")`
+    );
+  })
+);
+
+// ── delete_network_volume ──
+server.tool(
+  "delete_network_volume",
+  "Permanently delete a network volume. WARNING: This is irreversible and destroys all data on the volume. Ensure no pods are using this volume before deletion.",
+  {
+    volumeId: z.string().describe("Network volume ID to delete"),
+    confirmName: z.string().describe("Type the volume name to confirm deletion (safety check)"),
+  },
+  safeTool(async ({ volumeId, confirmName }) => {
+    const c = requireClient();
+    const vol = await c.getNetworkVolume(volumeId);
+    if (!vol) return text(`Network volume ${volumeId} not found.`);
+    if (vol.name !== confirmName) {
+      return text(
+        `Safety check failed: you typed "${confirmName}" but the volume name is "${vol.name}".\n` +
+          `Please provide the exact volume name in confirmName to proceed with deletion.`
+      );
+    }
+
+    // Check for pods using this volume
+    const pods = await c.listPods();
+    const attachedPods = pods.filter((p) => p.networkVolumeId === volumeId);
+    if (attachedPods.length > 0) {
+      const podList = attachedPods.map((p) => `  - ${p.name} (${p.id}, status: ${p.desiredStatus})`).join("\n");
+      return text(
+        `Cannot delete volume "${vol.name}": ${attachedPods.length} pod(s) still attached:\n${podList}\n\n` +
+          `Stop and delete these pods first, then retry.`
+      );
+    }
+
+    await c.deleteNetworkVolume(volumeId);
+    return text(`Network volume "${vol.name}" (${volumeId}) has been permanently deleted.`);
   })
 );
 

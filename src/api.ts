@@ -1,5 +1,5 @@
 import { createConnection } from "node:net";
-import type { Pod, GpuType, CreatePodOptions, RunPodApiConfig } from "./types.js";
+import type { Pod, GpuType, CreatePodOptions, RunPodApiConfig, NetworkVolume } from "./types.js";
 
 /** Normalize portMappings keys: "22/tcp" → "22", "22" → "22" */
 function normalizePorts(pm: Record<string, number> | undefined): Record<string, number> | undefined {
@@ -150,6 +150,7 @@ export class RunPodClient {
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;
     if (opts.dockerArgs) input.dockerArgs = opts.dockerArgs;
+    if (opts.dataCenterIds?.length) input.dataCenterIds = opts.dataCenterIds;
 
     const data = await this.graphqlRequest<{ podRentInterruptable: { id: string } }>(query, { input });
     return data.podRentInterruptable;
@@ -180,6 +181,51 @@ export class RunPodClient {
     `;
     const data = await this.graphqlRequest<{ gpuTypes: GpuType[] }>(query);
     return data.gpuTypes;
+  }
+
+  // ── Network Volumes ──
+
+  async listNetworkVolumes(): Promise<NetworkVolume[]> {
+    const query = `
+      query {
+        myself {
+          networkVolumes {
+            id
+            name
+            size
+            dataCenterId
+          }
+        }
+      }
+    `;
+    const data = await this.graphqlRequest<{ myself: { networkVolumes: NetworkVolume[] } }>(query);
+    return data.myself.networkVolumes;
+  }
+
+  async getNetworkVolume(volumeId: string): Promise<NetworkVolume | null> {
+    const volumes = await this.listNetworkVolumes();
+    return volumes.find((v) => v.id === volumeId) ?? null;
+  }
+
+  async createNetworkVolume(name: string, size: number, dataCenterId: string): Promise<NetworkVolume> {
+    const query = `
+      mutation CreateNetworkVolume($input: CreateNetworkVolumeInput!) {
+        createNetworkVolume(input: $input) {
+          id
+          name
+          size
+          dataCenterId
+        }
+      }
+    `;
+    const data = await this.graphqlRequest<{ createNetworkVolume: NetworkVolume }>(query, {
+      input: { name, size, dataCenterId },
+    });
+    return data.createNetworkVolume;
+  }
+
+  async deleteNetworkVolume(volumeId: string): Promise<void> {
+    await this.restRequest<unknown>("DELETE", `/networkvolumes/${volumeId}`);
   }
 
   // ── SSH Helpers (return args arrays for spawn, not shell strings) ──

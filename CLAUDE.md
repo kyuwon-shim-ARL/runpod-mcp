@@ -16,6 +16,22 @@ When a user is doing ML training on RunPod, follow this optimization pattern:
 - **Spot instance warning**: Recommend checkpoints on network volumes (not container disk) since spot pods can be preempted
 - **Overprovisioning**: If `create_pod_auto` reports overprovisioning, flag it to the user
 
+### Network Volume Workflow
+
+For persistent data that survives pod termination:
+
+1. `create_network_volume` → Create volume in target datacenter (min 10GB)
+2. `create_pod_auto` with `networkVolumeId` → Pod auto-placed in volume's datacenter
+3. Upload data to `/workspace` (mounted from network volume)
+4. Stop/delete pod — data persists on the volume
+5. Later: create new pod with same `networkVolumeId` — data is still there
+
+**Key rules:**
+- Network volumes are datacenter-bound — pods must be in the same datacenter
+- `create_pod_auto` automatically resolves datacenter affinity when `networkVolumeId` is provided
+- `delete_network_volume` requires `confirmName` safety check — user must type exact volume name
+- Use `list_network_volumes` to see all volumes with their datacenter locations
+
 ### Utilization Labels
 - **IDLE** (<30%): GPU is wasted — check if training actually started
 - **UNDERUTILIZED** (30-59%): Increase batch size or use a smaller/cheaper GPU

@@ -21115,6 +21115,7 @@ var RunPodClient = class {
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;
     if (opts.dockerArgs) input.dockerArgs = opts.dockerArgs;
+    if (opts.dataCenterIds?.length) input.dataCenterIds = opts.dataCenterIds;
     const data = await this.graphqlRequest(query, { input });
     return data.podRentInterruptable;
   }
@@ -21142,6 +21143,46 @@ var RunPodClient = class {
     `;
     const data = await this.graphqlRequest(query);
     return data.gpuTypes;
+  }
+  // ── Network Volumes ──
+  async listNetworkVolumes() {
+    const query = `
+      query {
+        myself {
+          networkVolumes {
+            id
+            name
+            size
+            dataCenterId
+          }
+        }
+      }
+    `;
+    const data = await this.graphqlRequest(query);
+    return data.myself.networkVolumes;
+  }
+  async getNetworkVolume(volumeId) {
+    const volumes = await this.listNetworkVolumes();
+    return volumes.find((v) => v.id === volumeId) ?? null;
+  }
+  async createNetworkVolume(name, size, dataCenterId) {
+    const query = `
+      mutation CreateNetworkVolume($input: CreateNetworkVolumeInput!) {
+        createNetworkVolume(input: $input) {
+          id
+          name
+          size
+          dataCenterId
+        }
+      }
+    `;
+    const data = await this.graphqlRequest(query, {
+      input: { name, size, dataCenterId }
+    });
+    return data.createNetworkVolume;
+  }
+  async deleteNetworkVolume(volumeId) {
+    await this.restRequest("DELETE", `/networkvolumes/${volumeId}`);
   }
   // ── SSH Helpers (return args arrays for spawn, not shell strings) ──
   getSshArgs(pod) {
@@ -21389,12 +21430,23 @@ server.tool(
     volumeInGb: external_exports.number().default(20),
     sshPublicKey: external_exports.string().optional(),
     env: external_exports.record(external_exports.string()).optional(),
+    networkVolumeId: external_exports.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter."),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0.")
   },
   safeTool(async (args) => {
-    const gpuTypes = await requireClient().listGpuTypes();
+    const c = requireClient();
+    const gpuTypes = await c.listGpuTypes();
     const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
     const errors = [];
+    let dataCenterIds;
+    let volumeNote = "";
+    if (args.networkVolumeId) {
+      const vol = await c.getNetworkVolume(args.networkVolumeId);
+      if (!vol) return text(`Network volume ${args.networkVolumeId} not found.`);
+      dataCenterIds = [vol.dataCenterId];
+      volumeNote = `
+Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
+    }
     for (const gpuId of args.gpuPreference) {
       const gpu = gpuMap.get(gpuId);
       if (!gpu) continue;
@@ -21425,20 +21477,22 @@ Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you request
           volumeMountPath: "/workspace",
           sshPublicKey: args.sshPublicKey,
           ports: ["22/tcp"],
-          env: podEnv
+          env: podEnv,
+          networkVolumeId: args.networkVolumeId,
+          dataCenterIds
         };
         if (args.spot && bidPrice) {
-          const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: bidPrice });
+          const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
           return text(
             `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})
 Spot bid: $${bidPrice}/hr
-Pod ID: ${result.id}${overprovisionWarning}
+Pod ID: ${result.id}${overprovisionWarning}${volumeNote}
 
 Use wait_for_pod to monitor.`
           );
         }
-        const pod = await requireClient().createPod(opts);
-        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}
+        const pod = await c.createPod(opts);
+        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
 ${podSummary(pod)}`);
       } catch (e) {
         if (isAuthError(e)) return errorResult(e);
@@ -21855,6 +21909,85 @@ Please specify requiredVramGb explicitly.`
       }
     }
     return text(sections.join("\n"));
+  })
+);
+server.tool(
+  "list_network_volumes",
+  "List all network volumes in your RunPod account. Network volumes persist data across pod restarts and can be shared between pods in the same datacenter.",
+  {},
+  safeTool(async () => {
+    const volumes = await requireClient().listNetworkVolumes();
+    if (!volumes.length) return text("No network volumes found.");
+    const header = "ID | Name | Size | Datacenter";
+    const sep = "---|------|------|----------";
+    const rows = volumes.map((v) => `${v.id} | ${v.name} | ${v.size}GB | ${v.dataCenterId}`);
+    return text([header, sep, ...rows].join("\n"));
+  })
+);
+server.tool(
+  "get_network_volume",
+  "Get details of a specific network volume",
+  { volumeId: external_exports.string().describe("Network volume ID") },
+  safeTool(async ({ volumeId }) => {
+    const vol = await requireClient().getNetworkVolume(volumeId);
+    if (!vol) return text(`Network volume ${volumeId} not found.`);
+    return text(`ID: ${vol.id}
+Name: ${vol.name}
+Size: ${vol.size}GB
+Datacenter: ${vol.dataCenterId}`);
+  })
+);
+server.tool(
+  "create_network_volume",
+  "Create a new network volume for persistent storage. Volumes persist across pod lifecycles and can be pre-loaded with data via a staging pod. Minimum size is 10GB.",
+  {
+    name: external_exports.string().describe("Volume name"),
+    size: external_exports.number().min(10).describe("Size in GB (minimum 10)"),
+    dataCenterId: external_exports.string().describe('Datacenter ID, e.g. "US-TX-3". Must match the datacenter of pods that will use this volume.')
+  },
+  safeTool(async ({ name, size, dataCenterId }) => {
+    const vol = await requireClient().createNetworkVolume(name, size, dataCenterId);
+    return text(
+      `Network volume created!
+ID: ${vol.id}
+Name: ${vol.name}
+Size: ${vol.size}GB
+Datacenter: ${vol.dataCenterId}
+
+Attach to a pod with: create_pod or create_pod_auto (networkVolumeId: "${vol.id}")`
+    );
+  })
+);
+server.tool(
+  "delete_network_volume",
+  "Permanently delete a network volume. WARNING: This is irreversible and destroys all data on the volume. Ensure no pods are using this volume before deletion.",
+  {
+    volumeId: external_exports.string().describe("Network volume ID to delete"),
+    confirmName: external_exports.string().describe("Type the volume name to confirm deletion (safety check)")
+  },
+  safeTool(async ({ volumeId, confirmName }) => {
+    const c = requireClient();
+    const vol = await c.getNetworkVolume(volumeId);
+    if (!vol) return text(`Network volume ${volumeId} not found.`);
+    if (vol.name !== confirmName) {
+      return text(
+        `Safety check failed: you typed "${confirmName}" but the volume name is "${vol.name}".
+Please provide the exact volume name in confirmName to proceed with deletion.`
+      );
+    }
+    const pods = await c.listPods();
+    const attachedPods = pods.filter((p) => p.networkVolumeId === volumeId);
+    if (attachedPods.length > 0) {
+      const podList = attachedPods.map((p) => `  - ${p.name} (${p.id}, status: ${p.desiredStatus})`).join("\n");
+      return text(
+        `Cannot delete volume "${vol.name}": ${attachedPods.length} pod(s) still attached:
+${podList}
+
+Stop and delete these pods first, then retry.`
+      );
+    }
+    await c.deleteNetworkVolume(volumeId);
+    return text(`Network volume "${vol.name}" (${volumeId}) has been permanently deleted.`);
   })
 );
 var transport = new StdioServerTransport();
