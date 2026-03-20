@@ -49,7 +49,14 @@ export class RunPodClient {
     }
     const json = (await res.json()) as { data?: T; errors?: Array<{ message: string }> };
     if (json.errors?.length) {
-      throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+      if (json.data) {
+        // Partial success: data returned with some field errors (e.g. lowestPrice)
+        // Log warning but return available data
+        const uniqueMessages = [...new Set(json.errors.map((e) => e.message))];
+        process.stderr.write(`RunPod GraphQL partial error (data still returned): ${uniqueMessages.join("; ")}\n`);
+      } else {
+        throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+      }
     }
     return json.data as T;
   }
@@ -171,7 +178,7 @@ export class RunPodClient {
           communitySpotPrice
           securePrice
           secureSpotPrice
-          lowestPrice(input: { gpuCount: 1 }) {
+          lowestPrice {
             minimumBidPrice
             uninterruptablePrice
             stockStatus

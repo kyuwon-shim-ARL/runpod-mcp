@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { RunPodClient } from "./api.js";
 import type { Pod } from "./types.js";
-import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend } from "./gpu-utils.js";
+import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -85,6 +85,7 @@ function isAuthError(e: unknown): boolean {
   const msg = String((e as { message?: string })?.message ?? "");
   return /\b(401|403|unauthorized|forbidden|authentication)\b/i.test(msg);
 }
+
 
 // ══════════════════════════════════════════
 //  TOOLS
@@ -203,11 +204,11 @@ server.tool(
       const gpu = gpuMap.get(gpuId);
       if (!gpu) continue;
       if (gpu.memoryInGb < args.minVram) continue;
-      const stock = gpu.lowestPrice?.stockStatus;
-      if (stock === "Low" || stock === "Out of Stock") continue;
+      const stock = getStockStatus(gpu);
+      if (!isInStock(gpu)) continue;
 
-      const ondemandPrice = gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? 1.0;
-      const minBid = gpu.lowestPrice?.minimumBidPrice ?? 0;
+      const ondemandPrice = getOnDemandPrice(gpu) ?? 1.0;
+      const minBid = getSpotPrice(gpu) ?? 0;
       const bidPrice = args.spot
         ? Math.min(args.maxBidPerGpu, ondemandPrice * 0.8)
         : undefined;
@@ -261,10 +262,10 @@ server.tool(
     }
 
     const available = gpuTypes
-      .filter((g) => g.memoryInGb >= args.minVram && g.lowestPrice?.stockStatus !== "Out of Stock")
+      .filter((g) => g.memoryInGb >= args.minVram && getStockStatus(g) !== "Out of Stock")
       .sort((a, b) => {
-        const ap = a.lowestPrice?.minimumBidPrice ?? a.communitySpotPrice ?? Infinity;
-        const bp = b.lowestPrice?.minimumBidPrice ?? b.communitySpotPrice ?? Infinity;
+        const ap = getSpotPrice(a) ?? Infinity;
+        const bp = getSpotPrice(b) ?? Infinity;
         return ap - bp;
       })
       .slice(0, 10);
@@ -273,8 +274,8 @@ server.tool(
     return text(
       "No preferred GPU available. Cheapest alternatives:\n\n" +
         available.map((g) => {
-          const price = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
-          const st = g.lowestPrice?.stockStatus ?? "unknown";
+          const price = getSpotPrice(g);
+          const st = getStockStatus(g);
           return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
         }).join("\n") +
         errMsg
@@ -353,12 +354,12 @@ server.tool(
     let gpus = await requireClient().listGpuTypes();
     if (minVram > 0) gpus = gpus.filter((g) => g.memoryInGb >= minVram);
     if (inStockOnly) gpus = gpus.filter((g) => {
-      const status = g.lowestPrice?.stockStatus;
-      return status === "High" || status === "Medium";
+      const status = getStockStatus(g);
+      return status === "High" || status === "Medium" || status === "available";
     });
     gpus.sort((a, b) => {
-      const aPrice = a.lowestPrice?.minimumBidPrice ?? a.communitySpotPrice ?? Infinity;
-      const bPrice = b.lowestPrice?.minimumBidPrice ?? b.communitySpotPrice ?? Infinity;
+      const aPrice = getSpotPrice(a) ?? Infinity;
+      const bPrice = getSpotPrice(b) ?? Infinity;
       return aPrice - bPrice;
     });
 
@@ -367,9 +368,9 @@ server.tool(
     const header = "GPU Type | VRAM | Spot Price | On-Demand | Stock";
     const sep = "---|---|---|---|---";
     const rows = gpus.map((g) => {
-      const spot = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
-      const ondemand = g.lowestPrice?.uninterruptablePrice ?? g.communityPrice ?? null;
-      const stock = g.lowestPrice?.stockStatus ?? (g.communityCloud ? "available" : "n/a");
+      const spot = getSpotPrice(g);
+      const ondemand = getOnDemandPrice(g);
+      const stock = getStockStatus(g);
       return `${g.displayName} | ${g.memoryInGb}GB | ${spot != null ? `$${spot}/hr` : "n/a"} | ${ondemand != null ? `$${ondemand}/hr` : "n/a"} | ${stock}`;
     });
     return text([header, sep, ...rows].join("\n"));
@@ -677,20 +678,19 @@ server.tool(
 
     // Determine pricing mode: compare like-for-like
     const isSpot = pod.adjustedCostPerHr != null && pod.adjustedCostPerHr !== pod.costPerHr;
-    const currentPrice = currentCost ?? currentGpu?.lowestPrice?.minimumBidPrice ?? currentGpu?.communitySpotPrice ?? 0;
+    const currentPrice = currentCost ?? (currentGpu ? getSpotPrice(currentGpu) : null) ?? 0;
 
     // Find alternatives: same or higher VRAM, in stock
     const alternatives = gpuTypes
       .filter((g) => {
         if (g.id === currentGpu?.id) return false;
         if (g.memoryInGb < minVram) return false;
-        const stock = g.lowestPrice?.stockStatus;
-        if (stock === "Out of Stock") return false;
+        if (getStockStatus(g) === "Out of Stock") return false;
         return true;
       })
       .map((g) => {
-        const spotPrice = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
-        const ondemandPrice = g.lowestPrice?.uninterruptablePrice ?? g.communityPrice ?? null;
+        const spotPrice = getSpotPrice(g);
+        const ondemandPrice = getOnDemandPrice(g);
         // Compare like-for-like: use spot price if current pod is spot, else on-demand
         const comparePrice = isSpot ? (spotPrice ?? ondemandPrice) : (ondemandPrice ?? spotPrice);
         return { ...g, spotPrice, ondemandPrice, comparePrice: comparePrice ?? Infinity };
@@ -719,7 +719,7 @@ server.tool(
       sections.push("|-----|------|------|-----------|-------|-----------------|");
       for (const g of cheaper) {
         const savings = (currentPrice - g.comparePrice) * 24 * 30;
-        const stock = g.lowestPrice?.stockStatus ?? "unknown";
+        const stock = getStockStatus(g);
         sections.push(
           `| ${g.displayName} | ${g.memoryInGb}GB | ${g.spotPrice != null ? `$${g.spotPrice}/hr` : "n/a"} | ${g.ondemandPrice != null ? `$${g.ondemandPrice}/hr` : "n/a"} | ${stock} | ~$${savings.toFixed(0)} |`
         );
@@ -730,7 +730,7 @@ server.tool(
     if (similar.length > 0 && cheaper.length < 5) {
       sections.push("### Other Options (same or higher price)\n");
       for (const g of similar.slice(0, 5)) {
-        const stock = g.lowestPrice?.stockStatus ?? "unknown";
+        const stock = getStockStatus(g);
         sections.push(`- ${g.displayName} (${g.memoryInGb}GB) - $${g.comparePrice}/hr [${stock}]`);
       }
     }

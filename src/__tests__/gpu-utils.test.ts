@@ -6,7 +6,12 @@ import {
   calcSuggestedBatchSize,
   isOverprovisioned,
   injectPytorchEnv,
+  getStockStatus,
+  isInStock,
+  getSpotPrice,
+  getOnDemandPrice,
 } from "../gpu-utils.js";
+import type { GpuType } from "../types.js";
 
 // ── labelVramUsage ──
 
@@ -386,5 +391,110 @@ describe("summarizeTrend", () => {
     expect(result.avgGpuUtil).toBe(60);
     expect(result.minVramPct).toBe(60);
     expect(result.maxVramPct).toBe(80);
+  });
+});
+
+// ── GPU Pricing/Stock Fallback Helpers ──
+
+function makeGpu(overrides: Partial<GpuType> = {}): GpuType {
+  return {
+    id: "NVIDIA A100 80GB PCIe",
+    displayName: "A100 PCIe",
+    memoryInGb: 80,
+    ...overrides,
+  };
+}
+
+describe("getStockStatus", () => {
+  it("returns lowestPrice.stockStatus when available", () => {
+    expect(getStockStatus(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "High" } }))).toBe("High");
+  });
+
+  it("falls back to 'available' when lowestPrice is null but communityCloud is true", () => {
+    expect(getStockStatus(makeGpu({ lowestPrice: null, communityCloud: true }))).toBe("available");
+  });
+
+  it("falls back to 'available' when lowestPrice is undefined but secureCloud is true", () => {
+    expect(getStockStatus(makeGpu({ secureCloud: true }))).toBe("available");
+  });
+
+  it("returns 'unknown' when no pricing info at all", () => {
+    expect(getStockStatus(makeGpu({ lowestPrice: null, communityCloud: false, secureCloud: false }))).toBe("unknown");
+  });
+
+  it("returns 'unknown' when lowestPrice is undefined and cloud booleans missing", () => {
+    expect(getStockStatus(makeGpu({}))).toBe("unknown");
+  });
+});
+
+describe("isInStock", () => {
+  it("returns true for High stock", () => {
+    expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "High" } }))).toBe(true);
+  });
+
+  it("returns true for Medium stock", () => {
+    expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "Medium" } }))).toBe(true);
+  });
+
+  it("returns false for Low stock", () => {
+    expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "Low" } }))).toBe(false);
+  });
+
+  it("returns false for Out of Stock", () => {
+    expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "Out of Stock" } }))).toBe(false);
+  });
+
+  it("returns true when lowestPrice is null but communityCloud is true (fallback 'available')", () => {
+    expect(isInStock(makeGpu({ lowestPrice: null, communityCloud: true }))).toBe(true);
+  });
+
+  it("returns true when status is 'unknown' (not explicitly out of stock)", () => {
+    expect(isInStock(makeGpu({ lowestPrice: null }))).toBe(true);
+  });
+});
+
+describe("getSpotPrice", () => {
+  it("returns lowestPrice.minimumBidPrice when available", () => {
+    expect(getSpotPrice(makeGpu({ lowestPrice: { minimumBidPrice: 0.3, uninterruptablePrice: 1.0, stockStatus: "High" } }))).toBe(0.3);
+  });
+
+  it("falls back to communitySpotPrice when lowestPrice is null", () => {
+    expect(getSpotPrice(makeGpu({ lowestPrice: null, communitySpotPrice: 0.25 }))).toBe(0.25);
+  });
+
+  it("returns null when no price info available", () => {
+    expect(getSpotPrice(makeGpu({ lowestPrice: null }))).toBeNull();
+  });
+
+  it("prefers lowestPrice over communitySpotPrice", () => {
+    expect(getSpotPrice(makeGpu({
+      lowestPrice: { minimumBidPrice: 0.3, uninterruptablePrice: 1.0, stockStatus: "High" },
+      communitySpotPrice: 0.25,
+    }))).toBe(0.3);
+  });
+});
+
+describe("getOnDemandPrice", () => {
+  it("returns lowestPrice.uninterruptablePrice when available", () => {
+    expect(getOnDemandPrice(makeGpu({ lowestPrice: { minimumBidPrice: 0.3, uninterruptablePrice: 1.5, stockStatus: "High" } }))).toBe(1.5);
+  });
+
+  it("falls back to communityPrice when lowestPrice is null", () => {
+    expect(getOnDemandPrice(makeGpu({ lowestPrice: null, communityPrice: 1.2 }))).toBe(1.2);
+  });
+
+  it("falls back to securePrice when communityPrice also missing", () => {
+    expect(getOnDemandPrice(makeGpu({ lowestPrice: null, securePrice: 1.8 }))).toBe(1.8);
+  });
+
+  it("returns null when no price info available", () => {
+    expect(getOnDemandPrice(makeGpu({ lowestPrice: null }))).toBeNull();
+  });
+
+  it("prefers lowestPrice over communityPrice", () => {
+    expect(getOnDemandPrice(makeGpu({
+      lowestPrice: { minimumBidPrice: 0.3, uninterruptablePrice: 1.5, stockStatus: "High" },
+      communityPrice: 1.2,
+    }))).toBe(1.5);
   });
 });

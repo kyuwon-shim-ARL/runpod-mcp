@@ -1,4 +1,6 @@
-/** Pure utility functions for GPU monitoring — extracted for testability. */
+/** Pure utility functions for GPU monitoring and pricing — extracted for testability. */
+
+import type { GpuType } from "./types.js";
 
 export interface GpuMetrics {
   index: number;
@@ -154,4 +156,29 @@ export function injectPytorchEnv(
     result.PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True";
   }
   return result;
+}
+
+// ── GPU Pricing/Stock Fallback Helpers ──
+
+/** Extract stock status with fallback when lowestPrice API is down */
+export function getStockStatus(gpu: GpuType): string {
+  if (gpu.lowestPrice?.stockStatus) return gpu.lowestPrice.stockStatus;
+  if (gpu.communityCloud || gpu.secureCloud) return "available";
+  return "unknown";
+}
+
+/** Check if GPU is in stock (not "Out of Stock" or "Low") */
+export function isInStock(gpu: GpuType): boolean {
+  const status = getStockStatus(gpu);
+  return status !== "Out of Stock" && status !== "Low";
+}
+
+/** Get spot/bid price with fallback to communitySpotPrice */
+export function getSpotPrice(gpu: GpuType): number | null {
+  return gpu.lowestPrice?.minimumBidPrice ?? gpu.communitySpotPrice ?? null;
+}
+
+/** Get on-demand price with fallback to communityPrice/securePrice */
+export function getOnDemandPrice(gpu: GpuType): number | null {
+  return gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? gpu.securePrice ?? null;
 }
