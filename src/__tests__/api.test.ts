@@ -256,6 +256,34 @@ describe("getRsyncArgs", () => {
     const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: null } as any;
     expect(client.getRsyncArgs(pod, "/a", "/b", "upload")).toBeNull();
   });
+
+  it("includes --no-same-owner and --no-same-group flags", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
+    expect(args).toContain("--no-same-owner");
+    expect(args).toContain("--no-same-group");
+  });
+
+  it("includes --stats flag and excludes -v (verbose)", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
+    expect(args).toContain("--stats");
+    expect(args!.join(" ")).not.toMatch(/\b-v\b/);
+    expect(args!.join(" ")).not.toMatch(/-avzP/);
+  });
+
+  it("includes --skip-compress for ML binary formats", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
+    const skipCompress = args!.find((a) => a.startsWith("--skip-compress="));
+    expect(skipCompress).toBeDefined();
+    expect(skipCompress).toContain("pt");
+    expect(skipCompress).toContain("safetensors");
+    expect(skipCompress).toContain("gguf");
+  });
 });
 
 // ── Network Volume API ──
@@ -339,5 +367,36 @@ describe("network errors", () => {
 
     const client = makeClient();
     await expect(client.listPods()).rejects.toThrow("fetch failed");
+  });
+});
+
+// ── spawnAsync ──
+
+import { spawnAsync } from "../api.js";
+
+describe("spawnAsync", () => {
+  it("captures stdout from a simple command", async () => {
+    const result = await spawnAsync("echo", ["hello"]);
+    expect(result.stdout.trim()).toBe("hello");
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(result.error).toBeUndefined();
+  });
+
+  it("captures stderr and non-zero exit code", async () => {
+    const result = await spawnAsync("bash", ["-c", "echo err >&2; exit 42"]);
+    expect(result.stderr.trim()).toBe("err");
+    expect(result.status).toBe(42);
+  });
+
+  it("returns error for non-existent command", async () => {
+    const result = await spawnAsync("__nonexistent_cmd__", []);
+    expect(result.error).toBeDefined();
+  });
+
+  it("respects timeout", async () => {
+    const result = await spawnAsync("sleep", ["10"], { timeout: 500 });
+    // Node kills the process on timeout, status is null (signaled, not exited)
+    expect(result.status).toBeNull();
   });
 });

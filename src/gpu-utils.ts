@@ -167,10 +167,10 @@ export function getStockStatus(gpu: GpuType): string {
   return "unknown";
 }
 
-/** Check if GPU is in stock (not "Out of Stock" or "Low") */
+/** Check if GPU is in stock (not "Out of Stock"). Low stock GPUs are included — worth trying. */
 export function isInStock(gpu: GpuType): boolean {
   const status = getStockStatus(gpu);
-  return status !== "Out of Stock" && status !== "Low";
+  return status !== "Out of Stock";
 }
 
 /** Get spot/bid price with fallback to communitySpotPrice */

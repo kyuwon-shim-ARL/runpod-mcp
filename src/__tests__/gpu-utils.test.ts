@@ -436,8 +436,8 @@ describe("isInStock", () => {
     expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "Medium" } }))).toBe(true);
   });
 
-  it("returns false for Low stock", () => {
-    expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "Low" } }))).toBe(false);
+  it("returns true for Low stock (worth trying)", () => {
+    expect(isInStock(makeGpu({ lowestPrice: { minimumBidPrice: 0.5, uninterruptablePrice: 1.0, stockStatus: "Low" } }))).toBe(true);
   });
 
   it("returns false for Out of Stock", () => {

@@ -1,5 +1,74 @@
 import { createConnection } from "node:net";
+import { spawn } from "node:child_process";
 import type { Pod, GpuType, CreatePodOptions, RunPodApiConfig, NetworkVolume } from "./types.js";
+
+/** Result shape matching spawnSync for drop-in compatibility */
+export interface SpawnResult {
+  stdout: string;
+  stderr: string;
+  status: number | null;
+  error?: Error;
+}
+
+const MAX_BUFFER = 50 * 1024 * 1024; // 50 MB
+
+/**
+ * Async spawn wrapper — does NOT block the Node.js event loop.
+ * Returns the same shape as spawnSync for drop-in replacement.
+ */
+export function spawnAsync(
+  cmd: string,
+  args: string[],
+  opts: { timeout?: number } = {}
+): Promise<SpawnResult> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { timeout: opts.timeout });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    let killed = false;
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdoutLen += chunk.length;
+      if (stdoutLen > MAX_BUFFER) {
+        if (!killed) { killed = true; child.kill(); }
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderrLen += chunk.length;
+      if (stderrLen > MAX_BUFFER) {
+        if (!killed) { killed = true; child.kill(); }
+        return;
+      }
+      stderrChunks.push(chunk);
+    });
+
+    child.on("error", (err) => {
+      resolve({ stdout: "", stderr: "", status: null, error: err });
+    });
+
+    child.on("close", (code) => {
+      if (killed) {
+        resolve({
+          stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+          status: code,
+          error: new Error("stdout/stderr exceeded max buffer size"),
+        });
+        return;
+      }
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+        status: code,
+      });
+    });
+  });
+}
 
 /** Normalize portMappings keys: "22/tcp" → "22", "22" → "22" */
 function normalizePorts(pm: Record<string, number> | undefined): Record<string, number> | undefined {
@@ -257,10 +326,11 @@ export class RunPodClient {
     const sshArg = `ssh ${sshCmd.join(" ")}`;
 
     const remote = `root@${pod.publicIp}:${remotePath}`;
+    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
-      return ["rsync", "-avzP", "-e", sshArg, localPath, remote];
+      return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }
-    return ["rsync", "-avzP", "-e", sshArg, remote, localPath];
+    return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, remote, localPath];
   }
 
   // ── Wait for Pod (with TCP probe) ──

@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { RunPodClient } from "./api.js";
+import { RunPodClient, spawnAsync } from "./api.js";
 import type { Pod } from "./types.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
 
@@ -151,18 +151,18 @@ server.tool(
 
     if (args.spot && args.bidPerGpu) {
       const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
-      return text(`Spot pod created!\nID: ${result.id}\n\nUse wait_for_pod to monitor until ready.`);
+      return text(`Spot pod created!\nID: ${result.id}\n\n## Next Steps\n→ wait_for_pod(podId: "${result.id}")`);
     }
 
     const pod = await requireClient().createPod(opts);
-    return text(`Pod created!\n${podSummary(pod)}\n\nUse wait_for_pod to monitor until ready.`);
+    return text(`Pod created!\n${podSummary(pod)}\n\n## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`);
   })
 );
 
 // ── create_pod_auto ──
 server.tool(
   "create_pod_auto",
-  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, skipping those with Low/no stock. Prefer over create_pod when no specific GPU model is required.",
+  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.",
   {
     name: z.string().describe("Pod name"),
     imageName: z.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"),
@@ -183,6 +183,10 @@ server.tool(
       .boolean()
       .default(false)
       .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
+    dryRun: z
+      .boolean()
+      .default(false)
+      .describe("Preview GPU selection and cost estimate without creating a pod. Note: GPU availability may change between dry run and actual creation."),
   },
   safeTool(async (args) => {
     const c = requireClient();
@@ -224,6 +228,24 @@ server.tool(
           `  Consider a smaller GPU to save cost, or increase your workload to utilize the extra VRAM.\n`
         : "";
 
+      // Dry run: return selection info without creating pod
+      if (args.dryRun) {
+        const priceInfo = args.spot && bidPrice
+          ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)`
+          : `On-demand: $${ondemandPrice}/hr`;
+        const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
+        return text(
+          `## Dry Run — Preview Only (no pod created)\n\n` +
+            `GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})\n` +
+            `${priceInfo}\n` +
+            `Estimated monthly: $${monthlyCost.toFixed(0)}\n` +
+            `Image: ${args.imageName}\n` +
+            `GPU count: ${args.gpuCount}${overprovisionWarning}${volumeNote}\n\n` +
+            `Note: GPU availability may change between dry run and actual creation.\n\n` +
+            `## Next Steps\n→ create_pod_auto with same parameters and dryRun: false`
+        );
+      }
+
       try {
         const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
 
@@ -248,15 +270,19 @@ server.tool(
           return text(
             `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n` +
               `Spot bid: $${bidPrice}/hr\n` +
-              `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\nUse wait_for_pod to monitor.`
+              `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\n` +
+              `## Next Steps\n→ wait_for_pod(podId: "${result.id}")`
           );
         }
 
         const pod = await c.createPod(opts);
-        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}`);
+        return text(
+          `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}\n\n` +
+            `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`
+        );
       } catch (e) {
         if (isAuthError(e)) return errorResult(e); // Auth/quota errors stop GPU iteration immediately
-        errors.push(`${gpu.displayName}: ${(e as Error).message}`);
+        errors.push(`${gpu.displayName}${stock === "Low" ? " (Low stock)" : ""}: ${(e as Error).message}`);
         continue;
       }
     }
@@ -271,8 +297,11 @@ server.tool(
       .slice(0, 10);
 
     const errMsg = errors.length ? `\n\nErrors encountered:\n${errors.join("\n")}` : "";
+    const nvConstraint = dataCenterIds
+      ? `\n\n⚠ Network volume constrains pods to datacenter ${dataCenterIds[0]}.${volumeNote}\nGPU availability in this datacenter may be limited. Alternatives shown below are global stock — NOT guaranteed in your datacenter.`
+      : "";
     return text(
-      "No preferred GPU available. Cheapest alternatives:\n\n" +
+      `No preferred GPU available.${nvConstraint}\n\nCheapest alternatives (global stock):\n\n` +
         available.map((g) => {
           const price = getSpotPrice(g);
           const st = getStockStatus(g);
@@ -301,7 +330,7 @@ server.tool(
   { podId: z.string() },
   safeTool(async ({ podId }) => {
     await requireClient().startPod(podId);
-    return text(`Pod ${podId} start requested. Use wait_for_pod to monitor.`);
+    return text(`Pod ${podId} start requested.\n\n## Next Steps\n→ wait_for_pod(podId: "${podId}")`);
   })
 );
 
@@ -391,7 +420,7 @@ server.tool(
   })
 );
 
-// ── execute_ssh_command (uses spawnSync with args array — no shell injection) ──
+// ── execute_ssh_command (uses async spawn with args array — no shell injection) ──
 server.tool(
   "execute_ssh_command",
   "Execute a command on a running pod via SSH. Returns stdout/stderr. Requires wait_for_pod first; background long jobs with nohup.",
@@ -406,11 +435,8 @@ server.tool(
     const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH.");
 
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
+    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
       timeout: timeoutSeconds * 1000,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
     });
 
     if (result.error) return text(`SSH error: ${result.error.message}`);
@@ -421,7 +447,7 @@ server.tool(
   })
 );
 
-// ── upload_files (uses spawnSync with args array — no shell injection) ──
+// ── upload_files (uses async spawn with args array — no shell injection) ──
 server.tool(
   "upload_files",
   "Upload local files/directories to a pod via rsync",
@@ -438,12 +464,7 @@ server.tool(
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):\n${args.join(" ")}`);
 
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(args[0], args.slice(1), {
-      encoding: "utf-8",
-      timeout: 600_000,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const result = await spawnAsync(args[0], args.slice(1), { timeout: 600_000 });
 
     if (result.error) return text(`Upload error: ${result.error.message}`);
     if (result.status !== 0) return text(`Upload failed (exit ${result.status}):\n${result.stderr}`);
@@ -451,7 +472,7 @@ server.tool(
   })
 );
 
-// ── download_files (uses spawnSync with args array — no shell injection) ──
+// ── download_files (uses async spawn with args array — no shell injection) ──
 server.tool(
   "download_files",
   "Download files from a pod to local filesystem via rsync",
@@ -468,12 +489,7 @@ server.tool(
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):\n${args.join(" ")}`);
 
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(args[0], args.slice(1), {
-      encoding: "utf-8",
-      timeout: 600_000,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const result = await spawnAsync(args[0], args.slice(1), { timeout: 600_000 });
 
     if (result.error) return text(`Download error: ${result.error.message}`);
     if (result.status !== 0) return text(`Download failed (exit ${result.status}):\n${result.stderr}`);
@@ -501,16 +517,16 @@ server.tool(
     const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH. Use wait_for_pod first.");
 
-    const { spawnSync } = await import("node:child_process");
-
-    // Query per-GPU metrics
+    // Query per-GPU metrics and per-process memory in parallel
     const gpuCmd =
       "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits 2>&1";
-    const gpuResult = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", gpuCmd], {
-      timeout: timeoutSeconds * 1000,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const procCmd =
+      "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true";
+
+    const [gpuResult, procResult] = await Promise.all([
+      spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", gpuCmd], { timeout: timeoutSeconds * 1000 }),
+      spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", procCmd], { timeout: timeoutSeconds * 1000 }),
+    ]);
 
     if (gpuResult.error) return text(`SSH error: ${gpuResult.error.message}`);
 
@@ -524,15 +540,6 @@ server.tool(
     if (gpuResult.status !== 0) {
       return text(`nvidia-smi failed (exit ${gpuResult.status}):\n${output}\n${gpuResult.stderr ?? ""}`);
     }
-
-    // Query per-process GPU memory
-    const procCmd =
-      "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true";
-    const procResult = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", procCmd], {
-      timeout: timeoutSeconds * 1000,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
 
     // Parse GPU metrics using extracted utility
     const gpus = parseNvidiaSmiOutput(output);
@@ -637,7 +644,7 @@ server.tool(
     if (pod.costPerHr != null) {
       sections.push("", `**Current cost**: $${pod.costPerHr}/hr`);
       if (primaryGpu.label === "IDLE") {
-        sections.push("Consider using `gpu_cost_compare` to find a cheaper GPU that matches your actual usage.");
+        sections.push(`\n## Next Steps\n→ gpu_cost_compare(podId: "${podId}")`);
       }
     }
 
@@ -765,11 +772,8 @@ server.tool(
     }
     const fullCmd = loopParts.join(" && ");
 
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", fullCmd], {
+    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", fullCmd], {
       timeout: timeoutSeconds * 1000,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
     });
 
     if (result.error) return text(`SSH error: ${result.error.message}`);
@@ -881,7 +885,7 @@ server.tool(
     const vol = await requireClient().createNetworkVolume(name, size, dataCenterId);
     return text(
       `Network volume created!\nID: ${vol.id}\nName: ${vol.name}\nSize: ${vol.size}GB\nDatacenter: ${vol.dataCenterId}\n\n` +
-        `Attach to a pod with: create_pod or create_pod_auto (networkVolumeId: "${vol.id}")`
+        `## Next Steps\n→ create_pod_auto(networkVolumeId: "${vol.id}")`
     );
   })
 );
