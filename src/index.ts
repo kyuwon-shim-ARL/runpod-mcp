@@ -348,11 +348,29 @@ server.tool(
 // ── delete_pod ──
 server.tool(
   "delete_pod",
-  "Permanently delete a pod (WARNING: destroys all data not on network volumes)",
+  "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes.",
   { podId: z.string() },
   safeTool(async ({ podId }) => {
-    await requireClient().deletePod(podId);
-    return text(`Pod ${podId} deleted.`);
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const steps: string[] = [];
+
+    if (pod.desiredStatus === "RUNNING") {
+      await c.stopPod(podId);
+      steps.push("Stopped running pod");
+      // Wait for pod to exit before deleting
+      const start = Date.now();
+      const timeout = 60_000;
+      while (Date.now() - start < timeout) {
+        await new Promise((r) => setTimeout(r, 3_000));
+        const current = await c.getPod(podId);
+        if (current.desiredStatus !== "RUNNING") break;
+      }
+    }
+
+    await c.deletePod(podId);
+    steps.push("Deleted pod");
+    return text(`Pod ${podId} deleted.${steps.length > 1 ? ` (was running → auto-stopped first)` : ""}`);
   })
 );
 

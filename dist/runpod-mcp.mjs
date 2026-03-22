@@ -20987,6 +20987,59 @@ var StdioServerTransport = class {
 
 // src/api.ts
 import { createConnection } from "node:net";
+import { spawn } from "node:child_process";
+var MAX_BUFFER = 50 * 1024 * 1024;
+function spawnAsync(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { timeout: opts.timeout });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    let killed = false;
+    child.stdout?.on("data", (chunk) => {
+      stdoutLen += chunk.length;
+      if (stdoutLen > MAX_BUFFER) {
+        if (!killed) {
+          killed = true;
+          child.kill();
+        }
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderrLen += chunk.length;
+      if (stderrLen > MAX_BUFFER) {
+        if (!killed) {
+          killed = true;
+          child.kill();
+        }
+        return;
+      }
+      stderrChunks.push(chunk);
+    });
+    child.on("error", (err) => {
+      resolve({ stdout: "", stderr: "", status: null, error: err });
+    });
+    child.on("close", (code) => {
+      if (killed) {
+        resolve({
+          stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+          status: code,
+          error: new Error("stdout/stderr exceeded max buffer size")
+        });
+        return;
+      }
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+        status: code
+      });
+    });
+  });
+}
 function normalizePorts(pm) {
   if (!pm) return pm;
   const out = {};
@@ -21030,7 +21083,13 @@ var RunPodClient = class {
     }
     const json = await res.json();
     if (json.errors?.length) {
-      throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+      if (json.data) {
+        const uniqueMessages = [...new Set(json.errors.map((e) => e.message))];
+        process.stderr.write(`RunPod GraphQL partial error (data still returned): ${uniqueMessages.join("; ")}
+`);
+      } else {
+        throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+      }
     }
     return json.data;
   }
@@ -21133,7 +21192,7 @@ var RunPodClient = class {
           communitySpotPrice
           securePrice
           secureSpotPrice
-          lowestPrice(input: { gpuCount: 1 }) {
+          lowestPrice {
             minimumBidPrice
             uninterruptablePrice
             stockStatus
@@ -21202,10 +21261,11 @@ var RunPodClient = class {
     if (this.config.sshKeyPath) sshCmd.push("-i", this.config.sshKeyPath);
     const sshArg = `ssh ${sshCmd.join(" ")}`;
     const remote = `root@${pod.publicIp}:${remotePath}`;
+    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
-      return ["rsync", "-avzP", "-e", sshArg, localPath, remote];
+      return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }
-    return ["rsync", "-avzP", "-e", sshArg, remote, localPath];
+    return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, remote, localPath];
   }
   // ── Wait for Pod (with TCP probe) ──
   tcpProbe(host, port, timeoutMs = 5e3) {
@@ -21317,6 +21377,21 @@ function injectPytorchEnv(env, optimize) {
   }
   return result;
 }
+function getStockStatus(gpu) {
+  if (gpu.lowestPrice?.stockStatus) return gpu.lowestPrice.stockStatus;
+  if (gpu.communityCloud || gpu.secureCloud) return "available";
+  return "unknown";
+}
+function isInStock(gpu) {
+  const status = getStockStatus(gpu);
+  return status !== "Out of Stock";
+}
+function getSpotPrice(gpu) {
+  return gpu.lowestPrice?.minimumBidPrice ?? gpu.communitySpotPrice ?? null;
+}
+function getOnDemandPrice(gpu) {
+  return gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? gpu.securePrice ?? null;
+}
 
 // src/index.ts
 var API_KEY = process.env.RUNPOD_API_KEY;
@@ -21426,18 +21501,20 @@ server.tool(
       return text(`Spot pod created!
 ID: ${result.id}
 
-Use wait_for_pod to monitor until ready.`);
+## Next Steps
+\u2192 wait_for_pod(podId: "${result.id}")`);
     }
     const pod = await requireClient().createPod(opts);
     return text(`Pod created!
 ${podSummary(pod)}
 
-Use wait_for_pod to monitor until ready.`);
+## Next Steps
+\u2192 wait_for_pod(podId: "${pod.id}")`);
   })
 );
 server.tool(
   "create_pod_auto",
-  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, skipping those with Low/no stock. Prefer over create_pod when no specific GPU model is required.",
+  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.",
   {
     name: external_exports.string().describe("Pod name"),
     imageName: external_exports.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"),
@@ -21451,7 +21528,8 @@ server.tool(
     sshPublicKey: external_exports.string().optional(),
     env: external_exports.record(external_exports.string()).optional(),
     networkVolumeId: external_exports.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter."),
-    optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0.")
+    optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
+    dryRun: external_exports.boolean().default(false).describe("Preview GPU selection and cost estimate without creating a pod. Note: GPU availability may change between dry run and actual creation.")
   },
   safeTool(async (args) => {
     const c = requireClient();
@@ -21471,10 +21549,10 @@ Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
       const gpu = gpuMap.get(gpuId);
       if (!gpu) continue;
       if (gpu.memoryInGb < args.minVram) continue;
-      const stock = gpu.lowestPrice?.stockStatus;
-      if (stock === "Low" || stock === "Out of Stock") continue;
-      const ondemandPrice = gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? 1;
-      const minBid = gpu.lowestPrice?.minimumBidPrice ?? 0;
+      const stock = getStockStatus(gpu);
+      if (!isInStock(gpu)) continue;
+      const ondemandPrice = getOnDemandPrice(gpu) ?? 1;
+      const minBid = getSpotPrice(gpu) ?? 0;
       const bidPrice = args.spot ? Math.min(args.maxBidPerGpu, ondemandPrice * 0.8) : void 0;
       if (args.spot && bidPrice != null && minBid > 0 && bidPrice < minBid) {
         errors.push(`${gpu.displayName}: Bid $${bidPrice.toFixed(3)}/hr below minimum $${minBid}/hr, skipped`);
@@ -21484,6 +21562,24 @@ Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
 Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you requested ${args.minVram}GB minimum.
   Consider a smaller GPU to save cost, or increase your workload to utilize the extra VRAM.
 ` : "";
+      if (args.dryRun) {
+        const priceInfo = args.spot && bidPrice ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)` : `On-demand: $${ondemandPrice}/hr`;
+        const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
+        return text(
+          `## Dry Run \u2014 Preview Only (no pod created)
+
+GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})
+${priceInfo}
+Estimated monthly: $${monthlyCost.toFixed(0)}
+Image: ${args.imageName}
+GPU count: ${args.gpuCount}${overprovisionWarning}${volumeNote}
+
+Note: GPU availability may change between dry run and actual creation.
+
+## Next Steps
+\u2192 create_pod_auto with same parameters and dryRun: false`
+        );
+      }
       try {
         const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
         const opts = {
@@ -21508,31 +21604,45 @@ Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you request
 Spot bid: $${bidPrice}/hr
 Pod ID: ${result.id}${overprovisionWarning}${volumeNote}
 
-Use wait_for_pod to monitor.`
+## Next Steps
+\u2192 wait_for_pod(podId: "${result.id}")`
           );
         }
         const pod = await c.createPod(opts);
-        return text(`Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
-${podSummary(pod)}`);
+        return text(
+          `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
+${podSummary(pod)}
+
+## Next Steps
+\u2192 wait_for_pod(podId: "${pod.id}")`
+        );
       } catch (e) {
         if (isAuthError(e)) return errorResult(e);
-        errors.push(`${gpu.displayName}: ${e.message}`);
+        errors.push(`${gpu.displayName}${stock === "Low" ? " (Low stock)" : ""}: ${e.message}`);
         continue;
       }
     }
-    const available = gpuTypes.filter((g) => g.memoryInGb >= args.minVram && g.lowestPrice?.stockStatus !== "Out of Stock").sort((a, b) => {
-      const ap = a.lowestPrice?.minimumBidPrice ?? a.communitySpotPrice ?? Infinity;
-      const bp = b.lowestPrice?.minimumBidPrice ?? b.communitySpotPrice ?? Infinity;
+    const available = gpuTypes.filter((g) => g.memoryInGb >= args.minVram && getStockStatus(g) !== "Out of Stock").sort((a, b) => {
+      const ap = getSpotPrice(a) ?? Infinity;
+      const bp = getSpotPrice(b) ?? Infinity;
       return ap - bp;
     }).slice(0, 10);
     const errMsg = errors.length ? `
 
 Errors encountered:
 ${errors.join("\n")}` : "";
+    const nvConstraint = dataCenterIds ? `
+
+\u26A0 Network volume constrains pods to datacenter ${dataCenterIds[0]}.${volumeNote}
+GPU availability in this datacenter may be limited. Alternatives shown below are global stock \u2014 NOT guaranteed in your datacenter.` : "";
     return text(
-      "No preferred GPU available. Cheapest alternatives:\n\n" + available.map((g) => {
-        const price = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
-        const st = g.lowestPrice?.stockStatus ?? "unknown";
+      `No preferred GPU available.${nvConstraint}
+
+Cheapest alternatives (global stock):
+
+` + available.map((g) => {
+        const price = getSpotPrice(g);
+        const st = getStockStatus(g);
         return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
       }).join("\n") + errMsg
     );
@@ -21553,7 +21663,10 @@ server.tool(
   { podId: external_exports.string() },
   safeTool(async ({ podId }) => {
     await requireClient().startPod(podId);
-    return text(`Pod ${podId} start requested. Use wait_for_pod to monitor.`);
+    return text(`Pod ${podId} start requested.
+
+## Next Steps
+\u2192 wait_for_pod(podId: "${podId}")`);
   })
 );
 server.tool(
@@ -21567,11 +21680,26 @@ server.tool(
 );
 server.tool(
   "delete_pod",
-  "Permanently delete a pod (WARNING: destroys all data not on network volumes)",
+  "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes.",
   { podId: external_exports.string() },
   safeTool(async ({ podId }) => {
-    await requireClient().deletePod(podId);
-    return text(`Pod ${podId} deleted.`);
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    const steps = [];
+    if (pod.desiredStatus === "RUNNING") {
+      await c.stopPod(podId);
+      steps.push("Stopped running pod");
+      const start = Date.now();
+      const timeout = 6e4;
+      while (Date.now() - start < timeout) {
+        await new Promise((r) => setTimeout(r, 3e3));
+        const current = await c.getPod(podId);
+        if (current.desiredStatus !== "RUNNING") break;
+      }
+    }
+    await c.deletePod(podId);
+    steps.push("Deleted pod");
+    return text(`Pod ${podId} deleted.${steps.length > 1 ? ` (was running \u2192 auto-stopped first)` : ""}`);
   })
 );
 server.tool(
@@ -21600,21 +21728,21 @@ server.tool(
     let gpus = await requireClient().listGpuTypes();
     if (minVram > 0) gpus = gpus.filter((g) => g.memoryInGb >= minVram);
     if (inStockOnly) gpus = gpus.filter((g) => {
-      const status = g.lowestPrice?.stockStatus;
-      return status === "High" || status === "Medium";
+      const status = getStockStatus(g);
+      return status === "High" || status === "Medium" || status === "available";
     });
     gpus.sort((a, b) => {
-      const aPrice = a.lowestPrice?.minimumBidPrice ?? a.communitySpotPrice ?? Infinity;
-      const bPrice = b.lowestPrice?.minimumBidPrice ?? b.communitySpotPrice ?? Infinity;
+      const aPrice = getSpotPrice(a) ?? Infinity;
+      const bPrice = getSpotPrice(b) ?? Infinity;
       return aPrice - bPrice;
     });
     if (!gpus.length) return text("No GPUs match the criteria.");
     const header = "GPU Type | VRAM | Spot Price | On-Demand | Stock";
     const sep = "---|---|---|---|---";
     const rows = gpus.map((g) => {
-      const spot = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
-      const ondemand = g.lowestPrice?.uninterruptablePrice ?? g.communityPrice ?? null;
-      const stock = g.lowestPrice?.stockStatus ?? (g.communityCloud ? "available" : "n/a");
+      const spot = getSpotPrice(g);
+      const ondemand = getOnDemandPrice(g);
+      const stock = getStockStatus(g);
       return `${g.displayName} | ${g.memoryInGb}GB | ${spot != null ? `$${spot}/hr` : "n/a"} | ${ondemand != null ? `$${ondemand}/hr` : "n/a"} | ${stock}`;
     });
     return text([header, sep, ...rows].join("\n"));
@@ -21645,11 +21773,8 @@ server.tool(
     const pod = await c.getPod(podId);
     const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH.");
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
-      timeout: timeoutSeconds * 1e3,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024
+    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
+      timeout: timeoutSeconds * 1e3
     });
     if (result.error) return text(`SSH error: ${result.error.message}`);
     if (result.status !== 0) {
@@ -21680,12 +21805,7 @@ server.tool(
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):
 ${args.join(" ")}`);
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(args[0], args.slice(1), {
-      encoding: "utf-8",
-      timeout: 6e5,
-      maxBuffer: 10 * 1024 * 1024
-    });
+    const result = await spawnAsync(args[0], args.slice(1), { timeout: 6e5 });
     if (result.error) return text(`Upload error: ${result.error.message}`);
     if (result.status !== 0) return text(`Upload failed (exit ${result.status}):
 ${result.stderr}`);
@@ -21710,12 +21830,7 @@ server.tool(
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):
 ${args.join(" ")}`);
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(args[0], args.slice(1), {
-      encoding: "utf-8",
-      timeout: 6e5,
-      maxBuffer: 10 * 1024 * 1024
-    });
+    const result = await spawnAsync(args[0], args.slice(1), { timeout: 6e5 });
     if (result.error) return text(`Download error: ${result.error.message}`);
     if (result.status !== 0) return text(`Download failed (exit ${result.status}):
 ${result.stderr}`);
@@ -21739,13 +21854,12 @@ server.tool(
     const pod = await c.getPod(podId);
     const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH. Use wait_for_pod first.");
-    const { spawnSync } = await import("node:child_process");
     const gpuCmd = "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits 2>&1";
-    const gpuResult = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", gpuCmd], {
-      timeout: timeoutSeconds * 1e3,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024
-    });
+    const procCmd = "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true";
+    const [gpuResult, procResult] = await Promise.all([
+      spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", gpuCmd], { timeout: timeoutSeconds * 1e3 }),
+      spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", procCmd], { timeout: timeoutSeconds * 1e3 })
+    ]);
     if (gpuResult.error) return text(`SSH error: ${gpuResult.error.message}`);
     const output = (gpuResult.stdout ?? "").trim();
     if (!output || output.includes("command not found") || output.includes("not found")) {
@@ -21758,12 +21872,6 @@ server.tool(
 ${output}
 ${gpuResult.stderr ?? ""}`);
     }
-    const procCmd = "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true";
-    const procResult = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", procCmd], {
-      timeout: timeoutSeconds * 1e3,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024
-    });
     const gpus = parseNvidiaSmiOutput(output);
     if (!gpus.length) return text("No GPU data returned from nvidia-smi.");
     const sections = ["## GPU Health Check\n"];
@@ -21849,7 +21957,9 @@ ${gpuResult.stderr ?? ""}`);
     if (pod.costPerHr != null) {
       sections.push("", `**Current cost**: $${pod.costPerHr}/hr`);
       if (primaryGpu.label === "IDLE") {
-        sections.push("Consider using `gpu_cost_compare` to find a cheaper GPU that matches your actual usage.");
+        sections.push(`
+## Next Steps
+\u2192 gpu_cost_compare(podId: "${podId}")`);
       }
     }
     return text(sections.join("\n"));
@@ -21881,16 +21991,15 @@ Please specify requiredVramGb explicitly.`
       return text(`Could not determine current GPU cost for ${pod.gpu.displayName}.`);
     }
     const isSpot = pod.adjustedCostPerHr != null && pod.adjustedCostPerHr !== pod.costPerHr;
-    const currentPrice = currentCost ?? currentGpu?.lowestPrice?.minimumBidPrice ?? currentGpu?.communitySpotPrice ?? 0;
+    const currentPrice = currentCost ?? (currentGpu ? getSpotPrice(currentGpu) : null) ?? 0;
     const alternatives = gpuTypes.filter((g) => {
       if (g.id === currentGpu?.id) return false;
       if (g.memoryInGb < minVram) return false;
-      const stock = g.lowestPrice?.stockStatus;
-      if (stock === "Out of Stock") return false;
+      if (getStockStatus(g) === "Out of Stock") return false;
       return true;
     }).map((g) => {
-      const spotPrice = g.lowestPrice?.minimumBidPrice ?? g.communitySpotPrice ?? null;
-      const ondemandPrice = g.lowestPrice?.uninterruptablePrice ?? g.communityPrice ?? null;
+      const spotPrice = getSpotPrice(g);
+      const ondemandPrice = getOnDemandPrice(g);
       const comparePrice = isSpot ? spotPrice ?? ondemandPrice : ondemandPrice ?? spotPrice;
       return { ...g, spotPrice, ondemandPrice, comparePrice: comparePrice ?? Infinity };
     }).filter((g) => g.comparePrice < Infinity).sort((a, b) => a.comparePrice - b.comparePrice).slice(0, 10);
@@ -21914,7 +22023,7 @@ Please specify requiredVramGb explicitly.`
       sections.push("|-----|------|------|-----------|-------|-----------------|");
       for (const g of cheaper) {
         const savings = (currentPrice - g.comparePrice) * 24 * 30;
-        const stock = g.lowestPrice?.stockStatus ?? "unknown";
+        const stock = getStockStatus(g);
         sections.push(
           `| ${g.displayName} | ${g.memoryInGb}GB | ${g.spotPrice != null ? `$${g.spotPrice}/hr` : "n/a"} | ${g.ondemandPrice != null ? `$${g.ondemandPrice}/hr` : "n/a"} | ${stock} | ~$${savings.toFixed(0)} |`
         );
@@ -21924,7 +22033,7 @@ Please specify requiredVramGb explicitly.`
     if (similar.length > 0 && cheaper.length < 5) {
       sections.push("### Other Options (same or higher price)\n");
       for (const g of similar.slice(0, 5)) {
-        const stock = g.lowestPrice?.stockStatus ?? "unknown";
+        const stock = getStockStatus(g);
         sections.push(`- ${g.displayName} (${g.memoryInGb}GB) - $${g.comparePrice}/hr [${stock}]`);
       }
     }
@@ -21953,11 +22062,8 @@ server.tool(
       loopParts.push(smiCmd);
     }
     const fullCmd = loopParts.join(" && ");
-    const { spawnSync } = await import("node:child_process");
-    const result = spawnSync(sshArgs[0], [...sshArgs.slice(1), "--", fullCmd], {
-      timeout: timeoutSeconds * 1e3,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024
+    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", fullCmd], {
+      timeout: timeoutSeconds * 1e3
     });
     if (result.error) return text(`SSH error: ${result.error.message}`);
     if (result.status !== 0) return text(`nvidia-smi failed (exit ${result.status}):
@@ -22058,7 +22164,8 @@ Name: ${vol.name}
 Size: ${vol.size}GB
 Datacenter: ${vol.dataCenterId}
 
-Attach to a pod with: create_pod or create_pod_auto (networkVolumeId: "${vol.id}")`
+## Next Steps
+\u2192 create_pod_auto(networkVolumeId: "${vol.id}")`
     );
   })
 );
