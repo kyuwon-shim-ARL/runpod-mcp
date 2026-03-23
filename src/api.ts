@@ -100,7 +100,9 @@ export class RunPodClient {
       const text = await res.text();
       throw new Error(`RunPod REST API ${method} ${path}: ${res.status} ${text}`);
     }
-    return res.json() as Promise<T>;
+    const raw = await res.text();
+    if (!raw) return undefined as T;
+    return JSON.parse(raw) as T;
   }
 
   private async graphqlRequest<T>(query: string, variables?: Record<string, unknown>): Promise<T> {

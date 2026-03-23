@@ -374,6 +374,71 @@ server.tool(
   })
 );
 
+// ── cleanup_stale_pods ──
+server.tool(
+  "cleanup_stale_pods",
+  "Find and delete EXITED pods that have been idle longer than graceHours. Pods with 'keep' or 'persist' in their name are skipped. Use dryRun=true (default) to preview what would be deleted.",
+  {
+    graceHours: z.number().default(2).describe("Hours since last status change before a pod is considered stale"),
+    dryRun: z.boolean().default(true).describe("If true, only list stale pods without deleting"),
+  },
+  safeTool(async ({ graceHours, dryRun }) => {
+    const c = requireClient();
+    const pods = await c.listPods();
+    const now = Date.now();
+    const graceMs = graceHours * 60 * 60 * 1000;
+    const skipPattern = /keep|persist/i;
+
+    const stale: { pod: Pod; idleHours: number; reason?: string }[] = [];
+    const skipped: { pod: Pod; reason: string }[] = [];
+
+    for (const pod of pods) {
+      if (pod.desiredStatus !== "EXITED") {
+        skipped.push({ pod, reason: `status=${pod.desiredStatus}` });
+        continue;
+      }
+      if (skipPattern.test(pod.name)) {
+        skipped.push({ pod, reason: "name contains keep/persist" });
+        continue;
+      }
+      if (!pod.lastStatusChange) {
+        skipped.push({ pod, reason: "no lastStatusChange timestamp" });
+        continue;
+      }
+      const idleMs = now - new Date(pod.lastStatusChange).getTime();
+      if (idleMs < graceMs) {
+        skipped.push({ pod, reason: `idle ${(idleMs / 3600000).toFixed(1)}h < grace ${graceHours}h` });
+        continue;
+      }
+      stale.push({ pod, idleHours: Math.round(idleMs / 3600000) });
+    }
+
+    if (!stale.length) {
+      return text(`No stale pods found.\n\nSkipped: ${skipped.length} pod(s)${skipped.length ? "\n" + skipped.map(s => `  - ${s.pod.name}: ${s.reason}`).join("\n") : ""}`);
+    }
+
+    if (dryRun) {
+      const lines = stale.map(s =>
+        `  - ${s.pod.name} (${s.pod.id}) — idle ${s.idleHours}h, ${s.pod.gpu?.displayName ?? "unknown GPU"}, $${s.pod.costPerHr ?? "?"}/hr`
+      );
+      return text(`[DRY RUN] Would delete ${stale.length} stale pod(s):\n${lines.join("\n")}\n\nRe-run with dryRun=false to delete.`);
+    }
+
+    const deleted: string[] = [];
+    const failed: string[] = [];
+    for (const s of stale) {
+      try {
+        await c.deletePod(s.pod.id);
+        deleted.push(`${s.pod.name} (idle ${s.idleHours}h)`);
+      } catch (e) {
+        deleted.push(`${s.pod.name} (idle ${s.idleHours}h)`);
+      }
+    }
+
+    return text(`Deleted ${deleted.length} stale pod(s):\n${deleted.map(d => `  - ${d}`).join("\n")}${failed.length ? `\n\nFailed: ${failed.join(", ")}` : ""}`);
+  })
+);
+
 // ── wait_for_pod ──
 server.tool(
   "wait_for_pod",
