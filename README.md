@@ -42,7 +42,7 @@ claude mcp add runpod --scope user \
   -- node /path/to/runpod-mcp/dist/index.js
 ```
 
-## Tools (16)
+## Tools (18)
 
 | Tool | Description |
 |------|-------------|
@@ -53,14 +53,16 @@ claude mcp add runpod --scope user \
 | `stop_pod` | Stop pod (preserves volume) |
 | `start_pod` | Start a stopped pod |
 | `restart_pod` | Restart a running pod |
-| `delete_pod` | Permanently delete a pod |
+| `delete_pod` | Permanently delete a pod (auto-stops running pods) |
 | `wait_for_pod` | Poll until SSH-ready (TCP probe) |
+| `cleanup_stale_pods` | Find and delete EXITED pods idle beyond grace period |
 | `list_gpu_types` | GPU types with pricing and stock (GraphQL) |
 | `get_ssh_command` | Get SSH connection command |
 | `execute_ssh_command` | Run command on pod via SSH |
 | `upload_files` | Upload files via rsync |
 | `download_files` | Download files via rsync |
 | `gpu_health_check` | Check GPU utilization with batch size advisor |
+| `gpu_sample_burst` | Multi-sample GPU metrics with trend analysis |
 | `gpu_cost_compare` | Compare GPU costs against cheaper alternatives |
 
 ## Environment Variables
@@ -89,19 +91,29 @@ claude mcp add runpod --scope user \
 - GraphQL mutations use parameterized variables (no string interpolation)
 - Port mappings normalized on read (`"22/tcp"` → `"22"`)
 
-## Compared to @runpod/mcp-server
+## Why runpod-tools-mcp?
 
-The official RunPod MCP server covers pod/endpoint creation but lacks:
+This server is built for **GPU cost optimization and operational control** — not just pod CRUD.
 
-| Feature | Official | This server |
-|---------|----------|-------------|
-| Pod stop/start/restart | No | Yes |
-| SSH execution | No | Yes |
-| File transfer (rsync) | No | Yes |
-| Wait for ready (TCP probe) | No | Yes |
-| GPU stock checking | No | Yes |
-| Auto GPU selection | No | Yes |
-| Spot bid pricing | No | Yes |
+### vs @runpod/mcp-server (official)
+
+| Dimension | Official | runpod-tools-mcp |
+|-----------|----------|-----------------|
+| **Tools** | 6 (create, list, get, terminate, endpoints) | 18 (full lifecycle + monitoring) |
+| **GPU cost optimization** | None | `gpu_health_check`, `gpu_cost_compare`, `gpu_sample_burst` with batch size advisor and trend analysis |
+| **Idle detection** | None | `cleanup_stale_pods` + standalone `runpod-watchdog` daemon for 24/7 cron monitoring |
+| **SSH/rsync** | None | Async spawn with args arrays (no shell injection), rsync with skip-compress for ML files |
+| **Spot instances** | None | GraphQL spot bidding with `cloudType` (ALL/SECURE/COMMUNITY) selection |
+| **Pod lifecycle** | Create + terminate | Create, start, stop, restart, delete (auto-stop before delete), wait-for-ready with TCP probe |
+| **Network volumes** | None | List, get, create, delete with datacenter affinity and safety checks |
+
+### Key differentiator: GPU waste prevention
+
+Claude Code reads the [GPU Management Protocol](CLAUDE.md) and proactively:
+1. Checks GPU utilization after training starts (`gpu_health_check`)
+2. Recommends batch size increases for underutilized GPUs
+3. Suggests cheaper GPU alternatives via `gpu_cost_compare`
+4. Detects idle pods with `cleanup_stale_pods` and the `runpod-watchdog` daemon
 
 ## License
 

@@ -59,6 +59,7 @@ export interface CreatePodOptions {
   dataCenterIds?: string[];
   supportPublicIp?: boolean;
   bidPerGpu?: number;
+  cloudType?: "ALL" | "SECURE" | "COMMUNITY";
 }
 
 export interface NetworkVolume {

@@ -81,7 +81,7 @@ function normalizePorts(pm: Record<string, number> | undefined): Record<string, 
 }
 
 export class RunPodClient {
-  private config: RunPodApiConfig;
+  readonly config: RunPodApiConfig;
 
   constructor(config: RunPodApiConfig) {
     this.config = config;
@@ -161,6 +161,7 @@ export class RunPodClient {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: opts.ports ?? ["22/tcp"],
       supportPublicIp: opts.supportPublicIp ?? true,
+      cloudType: opts.cloudType ?? "ALL",
       env: { ...opts.env },
     };
 
@@ -223,7 +224,7 @@ export class RunPodClient {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: (opts.ports ?? ["22/tcp"]).join(","),
       env: envArray,
-      cloudType: "SECURE",
+      cloudType: opts.cloudType ?? "ALL",
       supportPublicIp: opts.supportPublicIp ?? true,
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;

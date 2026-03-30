@@ -5,6 +5,7 @@ import { z } from "zod";
 import { RunPodClient, spawnAsync } from "./api.js";
 import type { Pod } from "./types.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop } from "./pod-ops.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -125,6 +126,10 @@ server.tool(
     ports: z.array(z.string()).default(["22/tcp"]),
     env: z.record(z.string()).optional().describe("Environment variables"),
     dockerArgs: z.string().optional(),
+    cloudType: z
+      .enum(["ALL", "SECURE", "COMMUNITY"])
+      .default("ALL")
+      .describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
     optimizePytorch: z
       .boolean()
       .default(false)
@@ -147,6 +152,7 @@ server.tool(
       ports: args.ports,
       env: podEnv,
       dockerArgs: args.dockerArgs,
+      cloudType: args.cloudType,
     };
 
     if (args.spot && args.bidPerGpu) {
@@ -183,6 +189,10 @@ server.tool(
       .boolean()
       .default(false)
       .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
+    cloudType: z
+      .enum(["ALL", "SECURE", "COMMUNITY"])
+      .default("ALL")
+      .describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
     dryRun: z
       .boolean()
       .default(false)
@@ -191,8 +201,6 @@ server.tool(
   safeTool(async (args) => {
     const c = requireClient();
     const gpuTypes = await c.listGpuTypes();
-    const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
-    const errors: string[] = [];
 
     // Resolve datacenter affinity from network volume
     let dataCenterIds: string[] | undefined;
@@ -204,30 +212,15 @@ server.tool(
       volumeNote = `\nNetwork Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
     }
 
-    for (const gpuId of args.gpuPreference) {
-      const gpu = gpuMap.get(gpuId);
-      if (!gpu) continue;
-      if (gpu.memoryInGb < args.minVram) continue;
-      const stock = getStockStatus(gpu);
-      if (!isInStock(gpu)) continue;
+    const { candidates, errors } = selectGpuCandidates(gpuTypes, {
+      gpuPreference: args.gpuPreference,
+      minVram: args.minVram,
+      gpuCount: args.gpuCount,
+      spot: args.spot,
+      maxBidPerGpu: args.maxBidPerGpu,
+    });
 
-      const ondemandPrice = getOnDemandPrice(gpu) ?? 1.0;
-      const minBid = getSpotPrice(gpu) ?? 0;
-      const bidPrice = args.spot
-        ? Math.min(args.maxBidPerGpu, ondemandPrice * 0.8)
-        : undefined;
-
-      // Skip if bid price is below minimum bid
-      if (args.spot && bidPrice != null && minBid > 0 && bidPrice < minBid) {
-        errors.push(`${gpu.displayName}: Bid $${bidPrice.toFixed(3)}/hr below minimum $${minBid}/hr, skipped`);
-        continue;
-      }
-
-      const overprovisionWarning = isOverprovisioned(gpu.memoryInGb, args.minVram)
-        ? `\nOverprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you requested ${args.minVram}GB minimum.\n` +
-          `  Consider a smaller GPU to save cost, or increase your workload to utilize the extra VRAM.\n`
-        : "";
-
+    for (const { gpu, gpuId, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning } of candidates) {
       // Dry run: return selection info without creating pod
       if (args.dryRun) {
         const priceInfo = args.spot && bidPrice
@@ -263,6 +256,7 @@ server.tool(
           env: podEnv,
           networkVolumeId: args.networkVolumeId,
           dataCenterIds,
+          cloudType: args.cloudType,
         };
 
         if (args.spot && bidPrice) {
@@ -281,7 +275,7 @@ server.tool(
             `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`
         );
       } catch (e) {
-        if (isAuthError(e)) return errorResult(e); // Auth/quota errors stop GPU iteration immediately
+        if (isAuthError(e)) return errorResult(e);
         errors.push(`${gpu.displayName}${stock === "Low" ? " (Low stock)" : ""}: ${(e as Error).message}`);
         continue;
       }
@@ -351,26 +345,8 @@ server.tool(
   "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes.",
   { podId: z.string() },
   safeTool(async ({ podId }) => {
-    const c = requireClient();
-    const pod = await c.getPod(podId);
-    const steps: string[] = [];
-
-    if (pod.desiredStatus === "RUNNING") {
-      await c.stopPod(podId);
-      steps.push("Stopped running pod");
-      // Wait for pod to exit before deleting
-      const start = Date.now();
-      const timeout = 60_000;
-      while (Date.now() - start < timeout) {
-        await new Promise((r) => setTimeout(r, 3_000));
-        const current = await c.getPod(podId);
-        if (current.desiredStatus !== "RUNNING") break;
-      }
-    }
-
-    await c.deletePod(podId);
-    steps.push("Deleted pod");
-    return text(`Pod ${podId} deleted.${steps.length > 1 ? ` (was running → auto-stopped first)` : ""}`);
+    const { wasRunning } = await deletePodWithStop(requireClient(), podId);
+    return text(`Pod ${podId} deleted.${wasRunning ? ` (was running → auto-stopped first)` : ""}`);
   })
 );
 
@@ -385,33 +361,7 @@ server.tool(
   safeTool(async ({ graceHours, dryRun }) => {
     const c = requireClient();
     const pods = await c.listPods();
-    const now = Date.now();
-    const graceMs = graceHours * 60 * 60 * 1000;
-    const skipPattern = /keep|persist/i;
-
-    const stale: { pod: Pod; idleHours: number; reason?: string }[] = [];
-    const skipped: { pod: Pod; reason: string }[] = [];
-
-    for (const pod of pods) {
-      if (pod.desiredStatus !== "EXITED") {
-        skipped.push({ pod, reason: `status=${pod.desiredStatus}` });
-        continue;
-      }
-      if (skipPattern.test(pod.name)) {
-        skipped.push({ pod, reason: "name contains keep/persist" });
-        continue;
-      }
-      if (!pod.lastStatusChange) {
-        skipped.push({ pod, reason: "no lastStatusChange timestamp" });
-        continue;
-      }
-      const idleMs = now - new Date(pod.lastStatusChange).getTime();
-      if (idleMs < graceMs) {
-        skipped.push({ pod, reason: `idle ${(idleMs / 3600000).toFixed(1)}h < grace ${graceHours}h` });
-        continue;
-      }
-      stale.push({ pod, idleHours: Math.round(idleMs / 3600000) });
-    }
+    const { stale, skipped } = filterStalePods(pods, graceHours);
 
     if (!stale.length) {
       return text(`No stale pods found.\n\nSkipped: ${skipped.length} pod(s)${skipped.length ? "\n" + skipped.map(s => `  - ${s.pod.name}: ${s.reason}`).join("\n") : ""}`);
@@ -431,7 +381,7 @@ server.tool(
         await c.deletePod(s.pod.id);
         deleted.push(`${s.pod.name} (idle ${s.idleHours}h)`);
       } catch (e) {
-        deleted.push(`${s.pod.name} (idle ${s.idleHours}h)`);
+        failed.push(`${s.pod.name} (idle ${s.idleHours}h): ${(e as Error).message}`);
       }
     }
 
