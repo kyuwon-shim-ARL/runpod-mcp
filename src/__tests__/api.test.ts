@@ -202,8 +202,15 @@ describe("getSshArgs", () => {
     const args = client.getSshArgs(pod);
 
     expect(args).toEqual([
-      "ssh", "-o", "StrictHostKeyChecking=no", "-p", "10022",
-      "-i", "/tmp/test_key", "root@1.2.3.4",
+      "ssh",
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "ConnectTimeout=15",
+      "-o", "BatchMode=yes",
+      "-o", "ServerAliveInterval=15",
+      "-o", "ServerAliveCountMax=3",
+      "-p", "10022",
+      "-i", "/tmp/test_key",
+      "root@1.2.3.4",
     ]);
   });
 
@@ -223,7 +230,7 @@ describe("getSshArgs", () => {
     const client = makeClient();
     const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
     const cmd = client.getSshCommandString(pod);
-    expect(cmd).toBe("ssh -o StrictHostKeyChecking=no -p 10022 -i /tmp/test_key root@1.2.3.4");
+    expect(cmd).toBe("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -p 10022 -i /tmp/test_key root@1.2.3.4");
   });
 });
 
@@ -283,6 +290,79 @@ describe("getRsyncArgs", () => {
     expect(skipCompress).toContain("pt");
     expect(skipCompress).toContain("safetensors");
     expect(skipCompress).toContain("gguf");
+  });
+
+  it("includes --timeout=120 for rsync transfer timeout", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
+    expect(args).toContain("--timeout=120");
+  });
+
+  it("includes ConnectTimeout and BatchMode in rsync ssh command", () => {
+    const client = makeClient();
+    const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
+    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
+    const sshArg = args!.find((a) => a.startsWith("ssh "));
+    expect(sshArg).toContain("ConnectTimeout=15");
+    expect(sshArg).toContain("BatchMode=yes");
+    // ServerAlive excluded from rsync ssh (false positives during idle compression)
+    expect(sshArg).not.toContain("ServerAliveInterval");
+  });
+});
+
+// ── waitForPod ──
+
+describe("waitForPod", () => {
+  it("resolves when pod is running with SSH ready", async () => {
+    const client = makeClient();
+    const readyPod = {
+      id: "p1", name: "test", desiredStatus: "RUNNING",
+      publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+    };
+    vi.spyOn(client, "getPod").mockResolvedValue(readyPod as any);
+    vi.spyOn(client as any, "tcpProbe").mockResolvedValue(true);
+
+    const pod = await client.waitForPod("p1", 5000, 100);
+    expect(pod.id).toBe("p1");
+  });
+
+  it("throws on terminal state (EXITED)", async () => {
+    const client = makeClient();
+    const exitedPod = { id: "p1", name: "test", desiredStatus: "EXITED" };
+    vi.spyOn(client, "getPod").mockResolvedValue(exitedPod as any);
+
+    await expect(client.waitForPod("p1", 5000, 100)).rejects.toThrow("terminal state: EXITED");
+  });
+
+  it("throws on timeout when pod never becomes ready", async () => {
+    const client = makeClient();
+    const pendingPod = { id: "p1", name: "test", desiredStatus: "CREATED" };
+    vi.spyOn(client, "getPod").mockResolvedValue(pendingPod as any);
+
+    await expect(client.waitForPod("p1", 300, 100)).rejects.toThrow("did not become ready");
+  });
+
+  it("calls onProgress callback with status updates", async () => {
+    const client = makeClient();
+    const pendingPod = { id: "p1", name: "test", desiredStatus: "CREATED" };
+    const readyPod = {
+      id: "p1", name: "test", desiredStatus: "RUNNING",
+      publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+    };
+
+    let callCount = 0;
+    vi.spyOn(client, "getPod").mockImplementation(async () => {
+      callCount++;
+      return (callCount >= 2 ? readyPod : pendingPod) as any;
+    });
+    vi.spyOn(client as any, "tcpProbe").mockResolvedValue(true);
+
+    const messages: string[] = [];
+    await client.waitForPod("p1", 5000, 50, (msg) => messages.push(msg));
+
+    expect(messages.length).toBeGreaterThan(0);
+    expect(messages.some((m) => m.includes("CREATED") || m.includes("RUNNING"))).toBe(true);
   });
 });
 

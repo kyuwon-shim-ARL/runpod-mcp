@@ -1,9 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { loadState, saveState, checkPod, runWatchdog } from "../watchdog.js";
 import type { WatchdogOptions, Alerter, PodIdleState } from "../watchdog.js";
+import { spawnAsync } from "../api.js";
 import { writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
+
+vi.mock("../api.js", async () => {
+  const actual = await vi.importActual("../api.js");
+  return {
+    ...actual,
+    spawnAsync: vi.fn(),
+  };
+});
+
+const mockSpawnAsync = vi.mocked(spawnAsync);
 
 // ── State persistence ──
 
@@ -113,5 +124,133 @@ describe("runWatchdog", () => {
     await runWatchdog(client, makeOptions());
     const state = loadState(stateFile);
     expect(state).not.toHaveProperty("old-pod");
+  });
+
+  it("accumulates idle count and triggers warn alerter", async () => {
+    // 8-col nvidia-smi output: index, name, total, used, free, gpuUtil, memUtil, temp
+    // Low usage = IDLE (< 30% VRAM)
+    const idleOutput = "0, RTX 3090, 24576, 2000, 22576, 5, 3, 45";
+    mockSpawnAsync.mockResolvedValue({ stdout: idleOutput, stderr: "", status: 0 });
+
+    const client = {
+      listPods: vi.fn().mockResolvedValue([
+        { id: "p1", name: "training-run", desiredStatus: "RUNNING", costPerHr: 0.44 },
+      ]),
+      getPod: vi.fn().mockResolvedValue({
+        id: "p1", name: "training-run", desiredStatus: "RUNNING",
+        publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+      }),
+      config: { sshKeyPath: "/tmp/key" },
+    } as any;
+
+    const alerter = makeAlerter();
+
+    // First run
+    await runWatchdog(client, makeOptions(), alerter);
+    expect(alerter.warns).toHaveLength(1);
+    expect(alerter.warns[0]).toContain("training-run");
+    expect(alerter.warns[0]).toContain(":1:"); // idle count = 1
+
+    // Second run — idle accumulates
+    await runWatchdog(client, makeOptions(), alerter);
+    expect(alerter.warns).toHaveLength(2);
+    expect(alerter.warns[1]).toContain(":2:"); // idle count = 2
+  });
+
+  it("auto-stops pod after reaching idle threshold", async () => {
+    const idleOutput = "0, RTX 3090, 24576, 1000, 23576, 2, 1, 40";
+    mockSpawnAsync.mockResolvedValue({ stdout: idleOutput, stderr: "", status: 0 });
+
+    const stopPod = vi.fn().mockResolvedValue({});
+    const client = {
+      listPods: vi.fn().mockResolvedValue([
+        { id: "p1", name: "idle-pod", desiredStatus: "RUNNING", costPerHr: 0.44 },
+      ]),
+      getPod: vi.fn().mockResolvedValue({
+        id: "p1", name: "idle-pod", desiredStatus: "RUNNING",
+        publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+      }),
+      stopPod,
+      config: { sshKeyPath: "/tmp/key" },
+    } as any;
+
+    const alerter = makeAlerter();
+    const opts = makeOptions({ autoStop: true, idleThreshold: 2 });
+
+    // Run 1: idle count = 1, no stop yet
+    await runWatchdog(client, opts, alerter);
+    expect(stopPod).not.toHaveBeenCalled();
+
+    // Run 2: idle count = 2 >= threshold, auto-stop triggered
+    const result = await runWatchdog(client, opts, alerter);
+    expect(stopPod).toHaveBeenCalledWith("p1");
+    expect(result.stopped).toBe(1);
+    expect(alerter.actions).toHaveLength(1);
+    expect(alerter.actions[0]).toContain("Auto-stopped");
+  });
+});
+
+// ── checkPod ──
+
+describe("checkPod", () => {
+  beforeEach(() => {
+    mockSpawnAsync.mockReset();
+  });
+
+  it("returns NO_SSH when pod has no public IP", async () => {
+    const client = {
+      getPod: vi.fn().mockResolvedValue({
+        id: "p1", publicIp: null, portMappings: {},
+      }),
+    } as any;
+
+    const result = await checkPod(client, "p1", "test-pod", undefined);
+    expect(result.status).toBe("NO_SSH");
+    expect(result.vramPercent).toBeNull();
+  });
+
+  it("returns SSH_FAILED when SSH command fails", async () => {
+    const client = {
+      getPod: vi.fn().mockResolvedValue({
+        id: "p1", publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+      }),
+    } as any;
+
+    mockSpawnAsync.mockResolvedValue({ stdout: "", stderr: "Connection refused", status: 255 });
+
+    const result = await checkPod(client, "p1", "test-pod", "/tmp/key");
+    expect(result.status).toBe("SSH_FAILED");
+  });
+
+  it("returns UNKNOWN when nvidia-smi output is empty", async () => {
+    const client = {
+      getPod: vi.fn().mockResolvedValue({
+        id: "p1", publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+      }),
+    } as any;
+
+    mockSpawnAsync.mockResolvedValue({ stdout: "", stderr: "", status: 0 });
+
+    const result = await checkPod(client, "p1", "test-pod", undefined);
+    expect(result.status).toBe("UNKNOWN");
+  });
+
+  it("returns IDLE label for low VRAM usage", async () => {
+    const client = {
+      getPod: vi.fn().mockResolvedValue({
+        id: "p1", publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+      }),
+    } as any;
+
+    // 8-col format: index, name, total, used, free, gpuUtil, memUtil, temp
+    // 2000 / 24576 = ~8% → IDLE
+    mockSpawnAsync.mockResolvedValue({
+      stdout: "0, RTX 3090, 24576, 2000, 22576, 5, 3, 45",
+      stderr: "", status: 0,
+    });
+
+    const result = await checkPod(client, "p1", "test-pod", "/tmp/key");
+    expect(result.status).toBe("IDLE");
+    expect(result.vramPercent).toBe(8);
   });
 });

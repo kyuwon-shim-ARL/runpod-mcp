@@ -4,6 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { RunPodClient, spawnAsync } from "./api.js";
 import type { Pod } from "./types.js";
+import { safeTool, text, errorResult } from "./tool-helpers.js";
+import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
 import { filterStalePods, selectGpuCandidates, deletePodWithStop } from "./pod-ops.js";
 
@@ -35,34 +37,10 @@ function requireClient(): RunPodClient {
 
 const server = new McpServer({
   name: "runpod-tools",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // ── Helpers ──
-
-type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
-
-function text(s: string): ToolResult {
-  return { content: [{ type: "text" as const, text: s }] };
-}
-
-function errorResult(e: unknown): ToolResult {
-  const msg = e instanceof Error ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
-
-/** Wrap a tool handler with error catching that returns MCP-friendly error text instead of throwing */
-function safeTool<T extends Record<string, unknown>>(
-  handler: (args: T) => Promise<ToolResult>
-): (args: T) => Promise<ToolResult> {
-  return async (args: T) => {
-    try {
-      return await handler(args);
-    } catch (e) {
-      return errorResult(e);
-    }
-  };
-}
 
 function podSummary(pod: Pod): string {
   const c = requireClient();
@@ -398,8 +376,16 @@ server.tool(
     timeoutSeconds: z.number().default(300).describe("Max wait time in seconds"),
     intervalSeconds: z.number().default(10).describe("Poll interval in seconds"),
   },
-  safeTool(async ({ podId, timeoutSeconds, intervalSeconds }) => {
-    const pod = await requireClient().waitForPod(podId, timeoutSeconds * 1000, intervalSeconds * 1000);
+  safeTool(async ({ podId, timeoutSeconds, intervalSeconds }, extra?: any) => {
+    const onProgress = extra?.sendNotification
+      ? (message: string) => {
+          extra.sendNotification({
+            method: "notifications/message",
+            params: { level: "info", logger: "wait_for_pod", data: message },
+          }).catch(() => {});
+        }
+      : undefined;
+    const pod = await requireClient().waitForPod(podId, timeoutSeconds * 1000, intervalSeconds * 1000, onProgress);
     return text(`Pod is ready!\n\n${podSummary(pod)}`);
   })
 );

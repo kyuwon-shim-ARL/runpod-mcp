@@ -88,7 +88,7 @@ export async function checkPod(
     ...(sshKeyPath ? ["-i", sshKeyPath] : []),
     "-p", String(pod.portMappings["22"]),
     `root@${pod.publicIp}`,
-    "nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits",
+    "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits",
   ];
 
   const result = await spawnAsync("ssh", sshArgs, { timeout: 30_000 });

@@ -87,49 +87,84 @@ export class RunPodClient {
     this.config = config;
   }
 
-  private async restRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.config.restBaseUrl}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.config.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`RunPod REST API ${method} ${path}: ${res.status} ${text}`);
+  private async restRequest<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<T> {
+    const timeoutMs = opts?.timeoutMs ?? 30_000;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signals: AbortSignal[] = [timeoutSignal];
+    if (opts?.signal) signals.push(opts.signal);
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+
+    try {
+      const res = await fetch(`${this.config.restBaseUrl}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`RunPod REST API ${method} ${path}: ${res.status} ${text}`);
+      }
+      const raw = await res.text();
+      if (!raw) return undefined as T;
+      return JSON.parse(raw) as T;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error(`RunPod REST API ${method} ${path}: request timed out after ${timeoutMs / 1000}s`);
+      }
+      throw e;
     }
-    const raw = await res.text();
-    if (!raw) return undefined as T;
-    return JSON.parse(raw) as T;
   }
 
-  private async graphqlRequest<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
-    const res = await fetch(this.config.graphqlUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.config.apiKey}`,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`RunPod GraphQL API: ${res.status} ${text}`);
-    }
-    const json = (await res.json()) as { data?: T; errors?: Array<{ message: string }> };
-    if (json.errors?.length) {
-      if (json.data) {
-        // Partial success: data returned with some field errors (e.g. lowestPrice)
-        // Log warning but return available data
-        const uniqueMessages = [...new Set(json.errors.map((e) => e.message))];
-        process.stderr.write(`RunPod GraphQL partial error (data still returned): ${uniqueMessages.join("; ")}\n`);
-      } else {
-        throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+  private async graphqlRequest<T>(
+    query: string,
+    variables?: Record<string, unknown>,
+    opts?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<T> {
+    const timeoutMs = opts?.timeoutMs ?? 30_000;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signals: AbortSignal[] = [timeoutSignal];
+    if (opts?.signal) signals.push(opts.signal);
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+
+    try {
+      const res = await fetch(this.config.graphqlUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify({ query, variables }),
+        signal,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`RunPod GraphQL API: ${res.status} ${text}`);
       }
+      const json = (await res.json()) as { data?: T; errors?: Array<{ message: string }> };
+      if (json.errors?.length) {
+        if (json.data) {
+          const uniqueMessages = [...new Set(json.errors.map((e) => e.message))];
+          process.stderr.write(`RunPod GraphQL partial error (data still returned): ${uniqueMessages.join("; ")}\n`);
+        } else {
+          throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+        }
+      }
+      return json.data as T;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error(`RunPod GraphQL API: request timed out after ${timeoutMs / 1000}s`);
+      }
+      throw e;
     }
-    return json.data as T;
   }
 
   /** Normalize pod portMappings on read */
@@ -173,7 +208,7 @@ export class RunPodClient {
     if (opts.dockerStartCmd) body.dockerStartCmd = opts.dockerStartCmd;
     if (opts.dataCenterIds) body.dataCenterIds = opts.dataCenterIds;
 
-    const pod = await this.restRequest<Pod>("POST", "/pods", body);
+    const pod = await this.restRequest<Pod>("POST", "/pods", body, { timeoutMs: 60_000 });
     return this.normalizePod(pod);
   }
 
@@ -231,7 +266,7 @@ export class RunPodClient {
     if (opts.dockerArgs) input.dockerArgs = opts.dockerArgs;
     if (opts.dataCenterIds?.length) input.dataCenterIds = opts.dataCenterIds;
 
-    const data = await this.graphqlRequest<{ podRentInterruptable: { id: string } }>(query, { input });
+    const data = await this.graphqlRequest<{ podRentInterruptable: { id: string } }>(query, { input }, { timeoutMs: 60_000 });
     return data.podRentInterruptable;
   }
 
@@ -311,7 +346,15 @@ export class RunPodClient {
 
   getSshArgs(pod: Pod): string[] | null {
     if (!pod.publicIp || !pod.portMappings?.["22"]) return null;
-    const args = ["ssh", "-o", "StrictHostKeyChecking=no", "-p", String(pod.portMappings["22"])];
+    const args = [
+      "ssh",
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "ConnectTimeout=15",
+      "-o", "BatchMode=yes",
+      "-o", "ServerAliveInterval=15",
+      "-o", "ServerAliveCountMax=3",
+      "-p", String(pod.portMappings["22"]),
+    ];
     if (this.config.sshKeyPath) args.push("-i", this.config.sshKeyPath);
     args.push(`root@${pod.publicIp}`);
     return args;
@@ -324,12 +367,12 @@ export class RunPodClient {
 
   getRsyncArgs(pod: Pod, localPath: string, remotePath: string, direction: "upload" | "download"): string[] | null {
     if (!pod.publicIp || !pod.portMappings?.["22"]) return null;
-    const sshCmd = ["-o", "StrictHostKeyChecking=no", "-p", String(pod.portMappings["22"])];
+    const sshCmd = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes", "-p", String(pod.portMappings["22"])];
     if (this.config.sshKeyPath) sshCmd.push("-i", this.config.sshKeyPath);
     const sshArg = `ssh ${sshCmd.join(" ")}`;
 
     const remote = `root@${pod.publicIp}:${remotePath}`;
-    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
+    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
       return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }
@@ -356,16 +399,25 @@ export class RunPodClient {
     });
   }
 
-  async waitForPod(podId: string, timeoutMs: number = 300_000, intervalMs: number = 10_000): Promise<Pod> {
+  async waitForPod(
+    podId: string,
+    timeoutMs: number = 300_000,
+    intervalMs: number = 10_000,
+    onProgress?: (message: string) => void
+  ): Promise<Pod> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const pod = await this.getPod(podId);
+      const elapsed = Math.round((Date.now() - start) / 1000);
       if (pod.desiredStatus === "RUNNING" && pod.publicIp && pod.portMappings?.["22"]) {
+        onProgress?.(`[${elapsed}s] Pod RUNNING, probing SSH at ${pod.publicIp}:${pod.portMappings["22"]}...`);
         const sshReady = await this.tcpProbe(pod.publicIp, pod.portMappings["22"]);
         if (sshReady) return pod;
-      }
-      if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "ERROR") {
+        onProgress?.(`[${elapsed}s] SSH not ready yet, retrying...`);
+      } else if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "ERROR") {
         throw new Error(`Pod ${podId} entered terminal state: ${pod.desiredStatus}`);
+      } else {
+        onProgress?.(`[${elapsed}s] Pod status: ${pod.desiredStatus}, waiting...`);
       }
       await new Promise((r) => setTimeout(r, intervalMs));
     }
