@@ -21626,6 +21626,100 @@ function toYaml(value, indent = 0) {
   }
   return lines.join("\n") + "\n";
 }
+function parseDuBytes(output) {
+  const m = output.trim().match(/^(\d+)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+function parseDfAvailBytes(output) {
+  const lines = output.trim().split("\n");
+  if (lines.length < 2) return null;
+  const m = lines[1].trim().match(/^(\d+)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+function checkFreeSpace(localBytes, availBytes, safetyMargin = 1.1) {
+  const required2 = Math.ceil(localBytes * safetyMargin);
+  if (availBytes >= required2) {
+    return {
+      status: "OK",
+      message: `Free space OK: ${formatBytes(availBytes)} available, ${formatBytes(required2)} required (with ${Math.round((safetyMargin - 1) * 100)}% margin)`,
+      localBytes,
+      availBytes
+    };
+  }
+  const shortBy = required2 - availBytes;
+  return {
+    status: "FREE_SPACE_LOW",
+    message: `Destination has only ${formatBytes(availBytes)} free, but upload needs ${formatBytes(required2)} (local data: ${formatBytes(localBytes)} + 10% margin). Short by ${formatBytes(shortBy)}. Increase the network volume size or pick a different destination \u2014 uploading anyway WILL silently truncate files (rsync/tar produce 0-byte files when quota fills). If you really know what you're doing, pass verifySize=false to skip this check.`,
+    localBytes,
+    availBytes
+  };
+}
+function checkSizeMatch(localBytes, remoteBytes, tolerance = 0.95) {
+  if (localBytes === 0) {
+    return {
+      status: "OK",
+      message: "Source is empty; nothing to verify",
+      localBytes,
+      remoteBytes,
+      ratio: 1
+    };
+  }
+  const ratio = remoteBytes / localBytes;
+  if (ratio >= tolerance) {
+    return {
+      status: "OK",
+      message: `Size match OK: local ${formatBytes(localBytes)} \u2192 remote ${formatBytes(remoteBytes)} (${(ratio * 100).toFixed(1)}%)`,
+      localBytes,
+      remoteBytes,
+      ratio
+    };
+  }
+  return {
+    status: "SIZE_MISMATCH",
+    message: `Upload looks INCOMPLETE: local ${formatBytes(localBytes)} but remote only ${formatBytes(remoteBytes)} (${(ratio * 100).toFixed(1)}%). This is the silent-truncation pattern (NV quota exceeded \u2192 0-byte files). Inspect the destination, free space, and consider re-uploading after enlarging the volume.`,
+    localBytes,
+    remoteBytes,
+    ratio
+  };
+}
+function formatBytes(n) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 100 ? 0 : 1)}${units[i]}`;
+}
+var SETUP_COMMAND_PATTERNS = [
+  /\bapt(-get)?\s+(install|update|upgrade)\b/,
+  /\b(pip|pip3)\s+install\b/,
+  /\bconda\s+(install|create)\b/,
+  /\bgit\s+clone\b/,
+  /\brsync\b/,
+  /\btar\s+-?[xc]/,
+  /\bunzip\b/,
+  /\bwget\b/,
+  /\bcurl\s+(-O|.*-o\s)/,
+  /\bdocker\s+(pull|run)\b/,
+  /\bmake\s+(install|build)\b/
+];
+function looksLikeSetupCommand(command) {
+  return SETUP_COMMAND_PATTERNS.some((p) => p.test(command));
+}
+function estimatePodCost(costPerHr, startedAt, now = /* @__PURE__ */ new Date()) {
+  if (!costPerHr || !startedAt) return null;
+  const start = new Date(startedAt).getTime();
+  if (!Number.isFinite(start)) return null;
+  const hours = (now.getTime() - start) / 36e5;
+  if (hours < 0) return null;
+  return { hours, cost: hours * costPerHr };
+}
 function buildPodMetadataStub(input) {
   const stub = {
     pod_id: input.pod_id,
@@ -22015,11 +22109,25 @@ server.tool(
 );
 server.tool(
   "delete_pod",
-  "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes.",
+  "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes. Returns an estimated total cost (uptime \xD7 cost_per_hr) for closing the pod metadata record.",
   { podId: external_exports.string() },
   safeTool(async ({ podId }) => {
-    const { wasRunning } = await deletePodWithStop(requireClient(), podId);
-    return text(`Pod ${podId} deleted.${wasRunning ? ` (was running \u2192 auto-stopped first)` : ""}`);
+    const c = requireClient();
+    let costEstimate = null;
+    let podName;
+    try {
+      const pod = await c.getPod(podId);
+      podName = pod.name;
+      costEstimate = estimatePodCost(pod.costPerHr, pod.lastStartedAt);
+    } catch {
+    }
+    const { wasRunning } = await deletePodWithStop(c, podId);
+    const stoppedNote = wasRunning ? " (was running \u2192 auto-stopped first)" : "";
+    const costNote = costEstimate ? `
+
+[Cost estimate] Uptime ${costEstimate.hours.toFixed(2)}h \xD7 rate \u2192 $${costEstimate.cost.toFixed(2)}
+Update the pod metadata: read .omc/pods/<file>.yaml \u2192 set deleted_at and cost_actual_usd \u2192 save_pod_metadata \u2192 git commit "chore(pod): close ${podName ?? podId}"` : "\n\n[Cost estimate] Unavailable (no costPerHr or lastStartedAt). Set cost_actual_usd manually if you tracked it.";
+    return text(`Pod ${podId} deleted.${stoppedNote}${costNote}`);
   })
 );
 server.tool(
@@ -22224,32 +22332,98 @@ ${result.stderr}
 Stdout:
 ${result.stdout}`);
     }
-    return text(result.stdout || "(no output)");
+    const setupHint = looksLikeSetupCommand(command) ? `
+
+[Setup step detected] This command looks like provisioning. Append it to post_create_steps in your pod metadata yaml (Read .omc/pods/<pod>.yaml \u2192 modify \u2192 save_pod_metadata).` : "";
+    return text((result.stdout || "(no output)") + setupHint);
   })
 );
 server.tool(
   "upload_files",
-  "Upload local files/directories to a pod via rsync",
+  "Upload local files/directories to a pod via rsync. By default performs free-space precheck and post-upload size verification to catch silent truncation (the failure mode where rsync produces 0-byte files when the destination quota is full).",
   {
     podId: external_exports.string(),
     localPath: external_exports.string().describe("Local file or directory path"),
     remotePath: external_exports.string().default("/workspace").describe("Destination path on pod"),
-    dryRun: external_exports.boolean().default(false).describe("Show command without executing")
+    dryRun: external_exports.boolean().default(false).describe("Show command without executing"),
+    verifySize: external_exports.boolean().default(true).describe("Run pre-upload free-space precheck and post-upload du size match. Set false to skip (only for power users with a reason)."),
+    verifyPath: external_exports.string().optional().describe("Override the path used for the post-upload du verification on the pod. Defaults to `${remotePath}/${basename(localPath)}` for directory uploads, or `${remotePath}` for single files.")
   },
-  safeTool(async ({ podId, localPath, remotePath, dryRun }) => {
+  safeTool(async ({ podId, localPath, remotePath, dryRun, verifySize, verifyPath }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const args = c.getRsyncArgs(pod, localPath, remotePath, "upload");
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):
 ${args.join(" ")}`);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs && verifySize) {
+      return text("Pod has no SSH endpoint; cannot run integrity checks. Pass verifySize=false to skip them.");
+    }
+    let localBytes = null;
+    if (verifySize) {
+      const duLocal = await spawnAsync("du", ["-sb", localPath], { timeout: 6e4 });
+      if (duLocal.status !== 0) {
+        return text(`Failed to measure local size of ${localPath}: ${duLocal.stderr || "du exited non-zero"}`);
+      }
+      localBytes = parseDuBytes(duLocal.stdout);
+      if (localBytes == null) {
+        return text(`Could not parse local du output: ${duLocal.stdout}`);
+      }
+    }
+    if (verifySize && sshArgs && localBytes != null) {
+      const dfCmd = `df -B1 --output=avail "${remotePath}" 2>/dev/null || df -B1 --output=avail "$(dirname "${remotePath}")"`;
+      const df = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", dfCmd], { timeout: 3e4 });
+      if (df.status === 0) {
+        const avail = parseDfAvailBytes(df.stdout);
+        if (avail != null) {
+          const check2 = checkFreeSpace(localBytes, avail);
+          if (check2.status === "FREE_SPACE_LOW") {
+            return text(`[PRE-UPLOAD CHECK FAILED]
+${check2.message}`);
+          }
+        }
+      }
+    }
     const result = await spawnAsync(args[0], args.slice(1), { timeout: 6e5 });
     if (result.error) return text(`Upload error: ${result.error.message}`);
     if (result.status !== 0) return text(`Upload failed (exit ${result.status}):
 ${result.stderr}`);
+    let postNote = "";
+    if (verifySize && sshArgs && localBytes != null) {
+      const inferredDest = verifyPath ?? (localPath.endsWith("/") ? remotePath : `${remotePath.replace(/\/+$/, "")}/${localPath.replace(/\/+$/, "").split("/").pop()}`);
+      const duRemote = await spawnAsync(
+        sshArgs[0],
+        [...sshArgs.slice(1), "--", `du -sb "${inferredDest}" 2>/dev/null`],
+        { timeout: 6e4 }
+      );
+      if (duRemote.status === 0) {
+        const remoteBytes = parseDuBytes(duRemote.stdout);
+        if (remoteBytes != null) {
+          const check2 = checkSizeMatch(localBytes, remoteBytes);
+          if (check2.status === "SIZE_MISMATCH") {
+            return text(
+              `[POST-UPLOAD INTEGRITY FAILED]
+${check2.message}
+
+Verified path on pod: ${inferredDest}
+Rsync output:
+${result.stdout}`
+            );
+          }
+          postNote = `
+
+[Integrity OK] ${check2.message} at ${inferredDest}`;
+        }
+      } else {
+        postNote = `
+
+[Integrity SKIPPED] Could not du remote path "${inferredDest}" (${duRemote.stderr.trim() || "no output"}). Pass verifyPath to override.`;
+      }
+    }
     return text(`Upload complete.
 
-${result.stdout}`);
+${result.stdout}${postNote}`);
   })
 );
 server.tool(

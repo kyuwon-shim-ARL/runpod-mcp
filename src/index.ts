@@ -9,7 +9,7 @@ import type { Pod } from "./types.js";
 import { safeTool, text, errorResult } from "./tool-helpers.js";
 import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub } from "./pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -415,11 +415,30 @@ server.tool(
 // ── delete_pod ──
 server.tool(
   "delete_pod",
-  "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes.",
+  "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes. Returns an estimated total cost (uptime × cost_per_hr) for closing the pod metadata record.",
   { podId: z.string() },
   safeTool(async ({ podId }) => {
-    const { wasRunning } = await deletePodWithStop(requireClient(), podId);
-    return text(`Pod ${podId} deleted.${wasRunning ? ` (was running → auto-stopped first)` : ""}`);
+    const c = requireClient();
+    // Capture cost-relevant info BEFORE deletion (the pod is gone after).
+    let costEstimate: ReturnType<typeof estimatePodCost> = null;
+    let podName: string | undefined;
+    try {
+      const pod = await c.getPod(podId);
+      podName = pod.name;
+      costEstimate = estimatePodCost(pod.costPerHr, pod.lastStartedAt);
+    } catch {
+      // Pod may already be unreachable; proceed with deletion attempt anyway.
+    }
+
+    const { wasRunning } = await deletePodWithStop(c, podId);
+
+    const stoppedNote = wasRunning ? " (was running → auto-stopped first)" : "";
+    const costNote = costEstimate
+      ? `\n\n[Cost estimate] Uptime ${costEstimate.hours.toFixed(2)}h × rate → $${costEstimate.cost.toFixed(2)}` +
+        `\nUpdate the pod metadata: read .omc/pods/<file>.yaml → set deleted_at and cost_actual_usd → save_pod_metadata → git commit "chore(pod): close ${podName ?? podId}"`
+      : "\n\n[Cost estimate] Unavailable (no costPerHr or lastStartedAt). Set cost_actual_usd manually if you tracked it.";
+
+    return text(`Pod ${podId} deleted.${stoppedNote}${costNote}`);
   })
 );
 
@@ -650,32 +669,126 @@ server.tool(
     if (result.status !== 0) {
       return text(`Exit code: ${result.status}\n\nStderr:\n${result.stderr}\n\nStdout:\n${result.stdout}`);
     }
-    return text(result.stdout || "(no output)");
+    // Setup-step heuristic: nudge Claude to record this in pod metadata if it
+    // looks like an apt/pip/git/etc install. Avoids forgetting setup steps that
+    // make the pod reproducible later. See CLAUDE.md "Pod Metadata Persistence".
+    const setupHint = looksLikeSetupCommand(command)
+      ? `\n\n[Setup step detected] This command looks like provisioning. Append it to post_create_steps in your pod metadata yaml (Read .omc/pods/<pod>.yaml → modify → save_pod_metadata).`
+      : "";
+    return text((result.stdout || "(no output)") + setupHint);
   })
 );
 
 // ── upload_files (uses async spawn with args array — no shell injection) ──
+//
+// Integrity checks (Patch D — silent truncation defense):
+//   1. PRE: query pod's free space at the destination, abort if < local + 10%
+//   2. POST: compare local `du -sb` vs remote `du -sb` of the destination,
+//      flag if remote is < 95% of local (the silent-truncation pattern from
+//      the piu-v2 incident where 16996 .npy files were 0-byte)
+// Both can be skipped with verifySize=false for power-user cases.
 server.tool(
   "upload_files",
-  "Upload local files/directories to a pod via rsync",
+  "Upload local files/directories to a pod via rsync. By default performs free-space precheck and post-upload size verification to catch silent truncation (the failure mode where rsync produces 0-byte files when the destination quota is full).",
   {
     podId: z.string(),
     localPath: z.string().describe("Local file or directory path"),
     remotePath: z.string().default("/workspace").describe("Destination path on pod"),
     dryRun: z.boolean().default(false).describe("Show command without executing"),
+    verifySize: z
+      .boolean()
+      .default(true)
+      .describe("Run pre-upload free-space precheck and post-upload du size match. Set false to skip (only for power users with a reason)."),
+    verifyPath: z
+      .string()
+      .optional()
+      .describe("Override the path used for the post-upload du verification on the pod. Defaults to `${remotePath}/${basename(localPath)}` for directory uploads, or `${remotePath}` for single files."),
   },
-  safeTool(async ({ podId, localPath, remotePath, dryRun }) => {
+  safeTool(async ({ podId, localPath, remotePath, dryRun, verifySize, verifyPath }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     const args = c.getRsyncArgs(pod, localPath, remotePath, "upload");
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):\n${args.join(" ")}`);
 
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs && verifySize) {
+      return text("Pod has no SSH endpoint; cannot run integrity checks. Pass verifySize=false to skip them.");
+    }
+
+    // ── Step 1: local size measurement ──
+    let localBytes: number | null = null;
+    if (verifySize) {
+      const duLocal = await spawnAsync("du", ["-sb", localPath], { timeout: 60_000 });
+      if (duLocal.status !== 0) {
+        return text(`Failed to measure local size of ${localPath}: ${duLocal.stderr || "du exited non-zero"}`);
+      }
+      localBytes = parseDuBytes(duLocal.stdout);
+      if (localBytes == null) {
+        return text(`Could not parse local du output: ${duLocal.stdout}`);
+      }
+    }
+
+    // ── Step 2: pre-upload free-space precheck ──
+    if (verifySize && sshArgs && localBytes != null) {
+      // Run df on the parent of remotePath (the destination directory must exist before we can df it)
+      const dfCmd = `df -B1 --output=avail "${remotePath}" 2>/dev/null || df -B1 --output=avail "$(dirname "${remotePath}")"`;
+      const df = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", dfCmd], { timeout: 30_000 });
+      if (df.status === 0) {
+        const avail = parseDfAvailBytes(df.stdout);
+        if (avail != null) {
+          const check = checkFreeSpace(localBytes, avail);
+          if (check.status === "FREE_SPACE_LOW") {
+            return text(`[PRE-UPLOAD CHECK FAILED]\n${check.message}`);
+          }
+        }
+        // If parse failed, fall through silently — better to upload than block on a transient parse miss
+      }
+    }
+
+    // ── Step 3: actual rsync ──
     const result = await spawnAsync(args[0], args.slice(1), { timeout: 600_000 });
 
     if (result.error) return text(`Upload error: ${result.error.message}`);
     if (result.status !== 0) return text(`Upload failed (exit ${result.status}):\n${result.stderr}`);
-    return text(`Upload complete.\n\n${result.stdout}`);
+
+    let postNote = "";
+
+    // ── Step 4: post-upload size verification ──
+    if (verifySize && sshArgs && localBytes != null) {
+      // Infer the actual destination on the pod.
+      // rsync semantics: if localPath ends with `/`, contents go INTO remotePath.
+      // Otherwise the basename of localPath is appended to remotePath.
+      const inferredDest = verifyPath
+        ?? (localPath.endsWith("/")
+          ? remotePath
+          : `${remotePath.replace(/\/+$/, "")}/${localPath.replace(/\/+$/, "").split("/").pop()}`);
+
+      const duRemote = await spawnAsync(
+        sshArgs[0],
+        [...sshArgs.slice(1), "--", `du -sb "${inferredDest}" 2>/dev/null`],
+        { timeout: 60_000 }
+      );
+
+      if (duRemote.status === 0) {
+        const remoteBytes = parseDuBytes(duRemote.stdout);
+        if (remoteBytes != null) {
+          const check = checkSizeMatch(localBytes, remoteBytes);
+          if (check.status === "SIZE_MISMATCH") {
+            return text(
+              `[POST-UPLOAD INTEGRITY FAILED]\n${check.message}\n\n` +
+                `Verified path on pod: ${inferredDest}\n` +
+                `Rsync output:\n${result.stdout}`
+            );
+          }
+          postNote = `\n\n[Integrity OK] ${check.message} at ${inferredDest}`;
+        }
+      } else {
+        postNote = `\n\n[Integrity SKIPPED] Could not du remote path "${inferredDest}" (${duRemote.stderr.trim() || "no output"}). Pass verifyPath to override.`;
+      }
+    }
+
+    return text(`Upload complete.\n\n${result.stdout}${postNote}`);
   })
 );
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, sanitizePodName, isoToDateStamp, buildPodMetadataPath, toYaml, buildPodMetadataStub } from "../pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, sanitizePodName, isoToDateStamp, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "../pod-ops.js";
 import type { Pod, GpuType } from "../types.js";
 
 // ── Helper factories ──
@@ -397,6 +397,123 @@ describe("buildPodMetadataStub", () => {
       created_at: "2026-04-07T00:00:00Z",
     });
     expect(JSON.parse(stub).gpu_count).toBe(1);
+  });
+});
+
+// ── Patch D: upload integrity helpers ──
+
+describe("parseDuBytes", () => {
+  it("parses 'du -sb' output", () => {
+    expect(parseDuBytes("123456\t/path/to/dir")).toBe(123456);
+    expect(parseDuBytes("0\t/empty")).toBe(0);
+  });
+
+  it("returns null on garbage input", () => {
+    expect(parseDuBytes("not a number")).toBeNull();
+    expect(parseDuBytes("")).toBeNull();
+  });
+});
+
+describe("parseDfAvailBytes", () => {
+  it("parses 'df -B1 --output=avail' output (header on line 1, value on line 2)", () => {
+    expect(parseDfAvailBytes("Avail\n5368709120")).toBe(5368709120);
+    expect(parseDfAvailBytes("Available\n  1024  ")).toBe(1024);
+  });
+
+  it("returns null when header is missing or value is unparseable", () => {
+    expect(parseDfAvailBytes("Avail")).toBeNull();
+    expect(parseDfAvailBytes("Avail\nnope")).toBeNull();
+    expect(parseDfAvailBytes("")).toBeNull();
+  });
+});
+
+describe("checkFreeSpace", () => {
+  it("passes when avail >= local * margin", () => {
+    const r = checkFreeSpace(1_000_000, 2_000_000);
+    expect(r.status).toBe("OK");
+    expect(r.message).toContain("Free space OK");
+  });
+
+  it("fails with the silent-truncation warning when avail is short", () => {
+    const r = checkFreeSpace(22_000_000_000, 20_000_000_000); // piu-v2 scenario: 22GB into 20GB
+    expect(r.status).toBe("FREE_SPACE_LOW");
+    expect(r.message).toContain("silently truncate");
+    expect(r.message).toContain("verifySize=false");
+  });
+
+  it("respects custom safety margin", () => {
+    // local=100, avail=105, margin=1.0 → OK; margin=1.1 → FAIL
+    expect(checkFreeSpace(100, 105, 1.0).status).toBe("OK");
+    expect(checkFreeSpace(100, 105, 1.1).status).toBe("FREE_SPACE_LOW");
+  });
+});
+
+describe("checkSizeMatch", () => {
+  it("passes on full match", () => {
+    expect(checkSizeMatch(1000, 1000).status).toBe("OK");
+  });
+
+  it("passes within tolerance (95% default)", () => {
+    expect(checkSizeMatch(1000, 960).status).toBe("OK");
+    expect(checkSizeMatch(1000, 950).status).toBe("OK");
+  });
+
+  it("flags the silent-truncation pattern", () => {
+    // piu-v2: 22GB local, but only ~5GB landed (16996 of 75264 files were 0-byte)
+    const r = checkSizeMatch(22_000_000_000, 5_000_000_000);
+    expect(r.status).toBe("SIZE_MISMATCH");
+    expect(r.message).toContain("INCOMPLETE");
+    expect(r.message).toContain("silent-truncation");
+  });
+
+  it("treats empty source as trivially OK", () => {
+    expect(checkSizeMatch(0, 0).status).toBe("OK");
+  });
+});
+
+describe("looksLikeSetupCommand", () => {
+  it("matches common provisioning commands", () => {
+    expect(looksLikeSetupCommand("apt-get install -y rsync tmux")).toBe(true);
+    expect(looksLikeSetupCommand("pip install transformers peft")).toBe(true);
+    expect(looksLikeSetupCommand("git clone https://github.com/foo/bar")).toBe(true);
+    expect(looksLikeSetupCommand("rsync -av /src /dst")).toBe(true);
+    expect(looksLikeSetupCommand("tar -xf data.tar")).toBe(true);
+    expect(looksLikeSetupCommand("conda install numpy")).toBe(true);
+  });
+
+  it("does not match runtime commands", () => {
+    expect(looksLikeSetupCommand("python train.py")).toBe(false);
+    expect(looksLikeSetupCommand("nvidia-smi")).toBe(false);
+    expect(looksLikeSetupCommand("ls /workspace")).toBe(false);
+    expect(looksLikeSetupCommand("tail -f log")).toBe(false);
+  });
+});
+
+describe("estimatePodCost", () => {
+  it("computes uptime hours and cost", () => {
+    const now = new Date("2026-04-08T12:00:00Z");
+    const r = estimatePodCost(0.59, "2026-04-07T12:00:00Z", now);
+    expect(r).not.toBeNull();
+    expect(r!.hours).toBe(24);
+    expect(r!.cost).toBeCloseTo(0.59 * 24, 5);
+  });
+
+  it("returns null when costPerHr is missing", () => {
+    expect(estimatePodCost(undefined, "2026-04-07T12:00:00Z", new Date())).toBeNull();
+  });
+
+  it("returns null when startedAt is missing", () => {
+    expect(estimatePodCost(0.5, undefined, new Date())).toBeNull();
+  });
+
+  it("returns null when startedAt is invalid", () => {
+    expect(estimatePodCost(0.5, "not-a-date", new Date())).toBeNull();
+  });
+
+  it("returns null for negative durations (clock skew)", () => {
+    const now = new Date("2026-04-07T00:00:00Z");
+    const future = "2026-04-08T00:00:00Z";
+    expect(estimatePodCost(0.5, future, now)).toBeNull();
   });
 });
 
