@@ -12,9 +12,9 @@ When a user is doing ML training on RunPod, follow this optimization pattern:
 5. **Re-call `gpu_health_check` every 5-10 min during long training runs** to detect degradation or idle drift
 
 ### Critical Rules
+- **NEVER use spot instances** — always use on-demand (`spot: false`, which is the default). Spot pods can be preempted at any time and there is NO automatic backup or checkpoint-on-preemption mechanism in this MCP server. If the user explicitly insists on spot, warn them that data on container disk will be lost on preemption and require checkpointing to a network volume.
 - **Background long-running commands**: `execute_ssh_command` blocks the MCP server (spawnSync). Use `nohup cmd > /workspace/log 2>&1 &` and poll with `tail`
 - **Never auto-adjust batch size or migrate GPUs** — always present recommendations and let the user decide
-- **Spot instance warning**: Recommend checkpoints on network volumes (not container disk) since spot pods can be preempted
 - **Overprovisioning**: If `create_pod_auto` reports overprovisioning, flag it to the user
 - **Always recommend `optimizePytorch: true`** for PyTorch workloads — enables `expandable_segments:True` which reduces VRAM fragmentation significantly
 - **Proactively suggest network volumes** when the user describes iterative experiments, repeated fine-tuning, or datasets > 1GB — avoids re-uploading data on every pod
