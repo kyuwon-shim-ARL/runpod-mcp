@@ -2980,7 +2980,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve.call(this, root, ref);
+      let _sch = resolve2.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a = root.localRefs) === null || _a === void 0 ? void 0 : _a[ref];
         const { schemaId } = this.opts;
@@ -3007,7 +3007,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve(root, ref) {
+    function resolve2(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3582,7 +3582,7 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve(baseURI, relativeURI, options) {
+    function resolve2(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
@@ -3809,7 +3809,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve,
+      resolve: resolve2,
       resolveComponent,
       equal,
       serialize,
@@ -18870,7 +18870,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error2) {
@@ -18887,7 +18887,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       const earlyReject = (error2) => {
         reject(error2);
       };
@@ -18965,7 +18965,7 @@ var Protocol = class {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve(parseResult.data);
+            resolve2(parseResult.data);
           }
         } catch (error2) {
           reject(error2);
@@ -19226,12 +19226,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve, interval);
+      const timeoutId = setTimeout(resolve2, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -20331,7 +20331,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -20974,23 +20974,27 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve) => {
+    return new Promise((resolve2) => {
       const json = serializeMessage(message);
       if (this._stdout.write(json)) {
-        resolve();
+        resolve2();
       } else {
-        this._stdout.once("drain", resolve);
+        this._stdout.once("drain", resolve2);
       }
     });
   }
 };
+
+// src/index.ts
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 // src/api.ts
 import { createConnection } from "node:net";
 import { spawn } from "node:child_process";
 var MAX_BUFFER = 50 * 1024 * 1024;
 function spawnAsync(cmd, args, opts = {}) {
-  return new Promise((resolve) => {
+  return new Promise((resolve2) => {
     const child = spawn(cmd, args, { timeout: opts.timeout });
     const stdoutChunks = [];
     const stderrChunks = [];
@@ -21020,11 +21024,11 @@ function spawnAsync(cmd, args, opts = {}) {
       stderrChunks.push(chunk);
     });
     child.on("error", (err) => {
-      resolve({ stdout: "", stderr: "", status: null, error: err });
+      resolve2({ stdout: "", stderr: "", status: null, error: err });
     });
     child.on("close", (code) => {
       if (killed) {
-        resolve({
+        resolve2({
           stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
           stderr: Buffer.concat(stderrChunks).toString("utf-8"),
           status: code,
@@ -21032,7 +21036,7 @@ function spawnAsync(cmd, args, opts = {}) {
         });
         return;
       }
-      resolve({
+      resolve2({
         stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
         stderr: Buffer.concat(stderrChunks).toString("utf-8"),
         status: code
@@ -21312,19 +21316,19 @@ var RunPodClient = class {
   }
   // ── Wait for Pod (with TCP probe) ──
   tcpProbe(host, port, timeoutMs = 5e3) {
-    return new Promise((resolve) => {
+    return new Promise((resolve2) => {
       const sock = createConnection({ host, port, timeout: timeoutMs });
       sock.on("connect", () => {
         sock.destroy();
-        resolve(true);
+        resolve2(true);
       });
       sock.on("error", () => {
         sock.destroy();
-        resolve(false);
+        resolve2(false);
       });
       sock.on("timeout", () => {
         sock.destroy();
-        resolve(false);
+        resolve2(false);
       });
     });
   }
@@ -21536,6 +21540,21 @@ Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you request
     candidates.push({ gpu, gpuId, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning });
   }
   return { candidates, errors };
+}
+function sanitizePodName(name) {
+  return name.trim().replace(/[/\\:*?"<>|]/g, "-").replace(/\s+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "unnamed-pod";
+}
+function isoToDateStamp(iso, now = /* @__PURE__ */ new Date()) {
+  if (iso) {
+    const d = new Date(iso);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  return now.toISOString().slice(0, 10);
+}
+function buildPodMetadataPath(metadata, basePath = ".runpod/pods") {
+  const dateStamp = isoToDateStamp(metadata.created_at);
+  const safeName = sanitizePodName(metadata.name ?? "unnamed-pod");
+  return `${basePath}/${dateStamp}_${safeName}.json`;
 }
 async function deletePodWithStop(client2, podId, timeoutMs = 6e4) {
   const pod = await client2.getPod(podId);
@@ -21887,6 +21906,76 @@ Re-run with dryRun=false to delete.`);
 ${deleted.map((d) => `  - ${d}`).join("\n")}${failed.length ? `
 
 Failed: ${failed.join(", ")}` : ""}`);
+  })
+);
+var podMetadataSchema = external_exports.object({
+  pod_id: external_exports.string().describe("RunPod pod ID"),
+  name: external_exports.string().describe("Pod name (used in the filename)"),
+  purpose: external_exports.string().optional().describe("One-line description of what this pod is for"),
+  created_at: external_exports.string().optional().describe("ISO timestamp when the pod was created (drives the filename date stamp; defaults to today)"),
+  deleted_at: external_exports.string().nullable().optional().describe("ISO timestamp when the pod was deleted (null while still alive)"),
+  datacenter: external_exports.string().optional(),
+  gpu: external_exports.string().optional().describe("e.g. 'NVIDIA GeForce RTX 4090 (24GB)'"),
+  gpu_count: external_exports.number().optional(),
+  cost_per_hr: external_exports.number().optional(),
+  cost_actual_usd: external_exports.number().optional().describe("Final cost after deletion (set when closing the record)"),
+  container_disk_gb: external_exports.number().optional(),
+  image: external_exports.string().optional().describe("Docker image tag"),
+  network_volume: external_exports.object({
+    id: external_exports.string(),
+    name: external_exports.string(),
+    size_gb: external_exports.number(),
+    datacenter: external_exports.string().optional()
+  }).nullable().optional(),
+  ssh: external_exports.object({ host: external_exports.string(), port: external_exports.number() }).optional(),
+  post_create_steps: external_exports.array(external_exports.string()).optional().describe("Shell commands run after pod creation (apt-get, pip install, etc.)"),
+  data: external_exports.object({
+    source: external_exports.string().optional(),
+    dest: external_exports.string().optional(),
+    transfer_method: external_exports.string().optional(),
+    size_gb: external_exports.number().optional()
+  }).optional(),
+  code: external_exports.object({ source: external_exports.string().optional(), commit: external_exports.string().optional() }).optional(),
+  execution: external_exports.object({
+    script: external_exports.string().optional(),
+    log: external_exports.string().optional(),
+    output_dir: external_exports.string().optional(),
+    expected_runs: external_exports.number().optional(),
+    expected_gpu_hours: external_exports.number().optional(),
+    expected_cost_usd: external_exports.number().optional()
+  }).optional(),
+  monitor: external_exports.object({ cron_id: external_exports.string().optional() }).optional(),
+  incidents: external_exports.array(external_exports.string()).optional().describe("Free-form incident log \u2014 append entries as they happen, then re-save")
+}).passthrough();
+server.tool(
+  "save_pod_metadata",
+  "Persist a pod's provisioning recipe to disk so debugging is possible after the pod is deleted. Writes JSON to `{path}/{YYYY-MM-DD}_{podName}.json`. Default path: `.runpod/pods/` relative to the caller's CWD. The file is meant to be git-committed in the user's project repo. Call after pod setup completes (post-create installs done, training launched), again on incidents (append to incidents[] and re-save), and once more before deletion (set deleted_at + cost_actual_usd). See CLAUDE.md 'Pod Metadata Persistence' for the full workflow.",
+  {
+    metadata: podMetadataSchema,
+    path: external_exports.string().optional().describe("Base directory for the metadata file (default: '.runpod/pods'). Relative paths resolve against the current working directory. Will be created if it does not exist.")
+  },
+  safeTool(async ({ metadata, path }) => {
+    const basePath = path ?? ".runpod/pods";
+    const relPath = buildPodMetadataPath(metadata, basePath);
+    const absPath = isAbsolute(relPath) ? relPath : resolve(process.cwd(), relPath);
+    try {
+      await mkdir(dirname(absPath), { recursive: true });
+      await writeFile(absPath, JSON.stringify(metadata, null, 2) + "\n", "utf8");
+    } catch (e) {
+      return text(`Failed to save pod metadata to ${absPath}: ${e.message}`);
+    }
+    const incidentCount = metadata.incidents?.length ?? 0;
+    const stepCount = metadata.post_create_steps?.length ?? 0;
+    const closed = metadata.deleted_at ? " [CLOSED]" : "";
+    return text(
+      `Pod metadata saved${closed}
+Path: ${absPath}
+Pod: ${metadata.name} (${metadata.pod_id})
+Steps recorded: ${stepCount} | Incidents: ${incidentCount}
+
+## Next Steps
+\u2192 git add ${relPath} && git commit -m "docs: record pod ${metadata.name}"`
+    );
   })
 );
 server.tool(
@@ -22343,20 +22432,25 @@ Datacenter: ${vol.dataCenterId}`);
 );
 server.tool(
   "create_network_volume",
-  "Create a new network volume for persistent storage. Volumes persist across pod lifecycles and can be pre-loaded with data via a staging pod. Minimum size is 10GB.",
+  "Create a new network volume for persistent storage. Volumes persist across pod lifecycles and can be pre-loaded with data via a staging pod. Minimum size is 10GB but 50GB is the practical floor \u2014 undersized volumes silently truncate files when full (rsync/tar produce 0-byte files at quota).",
   {
     name: external_exports.string().describe("Volume name"),
-    size: external_exports.number().min(10).describe("Size in GB (minimum 10)"),
-    dataCenterId: external_exports.string().describe('Datacenter ID, e.g. "US-TX-3". Must match the datacenter of pods that will use this volume.')
+    size: external_exports.number().min(10).describe(
+      "Size in GB. Sizing formula: ceil((dataset_gb + outputs_gb) * 1.3) with 30% headroom for checkpoints/logs/tmp. Practical minimum: 50GB. Cost is ~$0.07/GB/month so 50GB \u2248 $3.50/mo, 100GB \u2248 $7/mo \u2014 the cost of an undersized volume (re-upload, debug, truncated training data) vastly exceeds the storage cost. NEVER use the 10GB minimum unless you've calculated and confirmed the dataset fits."
+    ),
+    dataCenterId: external_exports.string().describe('Datacenter ID, e.g. "US-GA-1". Must match the datacenter of pods that will use this volume.')
   },
   safeTool(async ({ name, size, dataCenterId }) => {
     const vol = await requireClient().createNetworkVolume(name, size, dataCenterId);
+    const undersized = size < 50 ? `
+
+\u26A0 ${size}GB is below the recommended 50GB floor. If your dataset + outputs exceed ${Math.floor(size / 1.3)}GB, files will be silently truncated when the volume fills up.` : "";
     return text(
       `Network volume created!
 ID: ${vol.id}
 Name: ${vol.name}
 Size: ${vol.size}GB
-Datacenter: ${vol.dataCenterId}
+Datacenter: ${vol.dataCenterId}${undersized}
 
 ## Next Steps
 \u2192 create_pod_auto(networkVolumeId: "${vol.id}")`

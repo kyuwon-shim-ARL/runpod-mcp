@@ -2,12 +2,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { RunPodClient, spawnAsync } from "./api.js";
 import type { Pod } from "./types.js";
 import { safeTool, text, errorResult } from "./tool-helpers.js";
 import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix } from "./pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath } from "./pod-ops.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -402,6 +404,99 @@ server.tool(
     }
 
     return text(`Deleted ${deleted.length} stale pod(s):\n${deleted.map(d => `  - ${d}`).join("\n")}${failed.length ? `\n\nFailed: ${failed.join(", ")}` : ""}`);
+  })
+);
+
+// ── save_pod_metadata ──
+//
+// Persists a pod's full provisioning recipe to disk so debugging is possible
+// after the pod is deleted. Without this, the DC, image tag, installed packages,
+// data layout, launch command, and incident history vanish with the pod.
+//
+// The file lives in the user's project repo (NOT in runpod-mcp), default path
+// `.runpod/pods/{YYYY-MM-DD}_{podName}.json`. The caller is expected to git
+// commit it. See CLAUDE.md "Pod Metadata Persistence" for the workflow.
+const podMetadataSchema = z
+  .object({
+    pod_id: z.string().describe("RunPod pod ID"),
+    name: z.string().describe("Pod name (used in the filename)"),
+    purpose: z.string().optional().describe("One-line description of what this pod is for"),
+    created_at: z.string().optional().describe("ISO timestamp when the pod was created (drives the filename date stamp; defaults to today)"),
+    deleted_at: z.string().nullable().optional().describe("ISO timestamp when the pod was deleted (null while still alive)"),
+    datacenter: z.string().optional(),
+    gpu: z.string().optional().describe("e.g. 'NVIDIA GeForce RTX 4090 (24GB)'"),
+    gpu_count: z.number().optional(),
+    cost_per_hr: z.number().optional(),
+    cost_actual_usd: z.number().optional().describe("Final cost after deletion (set when closing the record)"),
+    container_disk_gb: z.number().optional(),
+    image: z.string().optional().describe("Docker image tag"),
+    network_volume: z
+      .object({
+        id: z.string(),
+        name: z.string(),
+        size_gb: z.number(),
+        datacenter: z.string().optional(),
+      })
+      .nullable()
+      .optional(),
+    ssh: z.object({ host: z.string(), port: z.number() }).optional(),
+    post_create_steps: z.array(z.string()).optional().describe("Shell commands run after pod creation (apt-get, pip install, etc.)"),
+    data: z
+      .object({
+        source: z.string().optional(),
+        dest: z.string().optional(),
+        transfer_method: z.string().optional(),
+        size_gb: z.number().optional(),
+      })
+      .optional(),
+    code: z.object({ source: z.string().optional(), commit: z.string().optional() }).optional(),
+    execution: z
+      .object({
+        script: z.string().optional(),
+        log: z.string().optional(),
+        output_dir: z.string().optional(),
+        expected_runs: z.number().optional(),
+        expected_gpu_hours: z.number().optional(),
+        expected_cost_usd: z.number().optional(),
+      })
+      .optional(),
+    monitor: z.object({ cron_id: z.string().optional() }).optional(),
+    incidents: z.array(z.string()).optional().describe("Free-form incident log — append entries as they happen, then re-save"),
+  })
+  .passthrough();
+
+server.tool(
+  "save_pod_metadata",
+  "Persist a pod's provisioning recipe to disk so debugging is possible after the pod is deleted. Writes JSON to `{path}/{YYYY-MM-DD}_{podName}.json`. Default path: `.runpod/pods/` relative to the caller's CWD. The file is meant to be git-committed in the user's project repo. Call after pod setup completes (post-create installs done, training launched), again on incidents (append to incidents[] and re-save), and once more before deletion (set deleted_at + cost_actual_usd). See CLAUDE.md 'Pod Metadata Persistence' for the full workflow.",
+  {
+    metadata: podMetadataSchema,
+    path: z
+      .string()
+      .optional()
+      .describe("Base directory for the metadata file (default: '.runpod/pods'). Relative paths resolve against the current working directory. Will be created if it does not exist."),
+  },
+  safeTool(async ({ metadata, path }) => {
+    const basePath = path ?? ".runpod/pods";
+    const relPath = buildPodMetadataPath(metadata, basePath);
+    const absPath = isAbsolute(relPath) ? relPath : resolve(process.cwd(), relPath);
+
+    try {
+      await mkdir(dirname(absPath), { recursive: true });
+      await writeFile(absPath, JSON.stringify(metadata, null, 2) + "\n", "utf8");
+    } catch (e) {
+      return text(`Failed to save pod metadata to ${absPath}: ${(e as Error).message}`);
+    }
+
+    const incidentCount = metadata.incidents?.length ?? 0;
+    const stepCount = metadata.post_create_steps?.length ?? 0;
+    const closed = metadata.deleted_at ? " [CLOSED]" : "";
+    return text(
+      `Pod metadata saved${closed}\n` +
+        `Path: ${absPath}\n` +
+        `Pod: ${metadata.name} (${metadata.pod_id})\n` +
+        `Steps recorded: ${stepCount} | Incidents: ${incidentCount}\n\n` +
+        `## Next Steps\n→ git add ${relPath} && git commit -m "docs: record pod ${metadata.name}"`
+    );
   })
 );
 
@@ -932,16 +1027,24 @@ server.tool(
 // ── create_network_volume ──
 server.tool(
   "create_network_volume",
-  "Create a new network volume for persistent storage. Volumes persist across pod lifecycles and can be pre-loaded with data via a staging pod. Minimum size is 10GB.",
+  "Create a new network volume for persistent storage. Volumes persist across pod lifecycles and can be pre-loaded with data via a staging pod. Minimum size is 10GB but 50GB is the practical floor — undersized volumes silently truncate files when full (rsync/tar produce 0-byte files at quota).",
   {
     name: z.string().describe("Volume name"),
-    size: z.number().min(10).describe("Size in GB (minimum 10)"),
-    dataCenterId: z.string().describe('Datacenter ID, e.g. "US-TX-3". Must match the datacenter of pods that will use this volume.'),
+    size: z
+      .number()
+      .min(10)
+      .describe(
+        "Size in GB. Sizing formula: ceil((dataset_gb + outputs_gb) * 1.3) with 30% headroom for checkpoints/logs/tmp. Practical minimum: 50GB. Cost is ~$0.07/GB/month so 50GB ≈ $3.50/mo, 100GB ≈ $7/mo — the cost of an undersized volume (re-upload, debug, truncated training data) vastly exceeds the storage cost. NEVER use the 10GB minimum unless you've calculated and confirmed the dataset fits."
+      ),
+    dataCenterId: z.string().describe('Datacenter ID, e.g. "US-GA-1". Must match the datacenter of pods that will use this volume.'),
   },
   safeTool(async ({ name, size, dataCenterId }) => {
     const vol = await requireClient().createNetworkVolume(name, size, dataCenterId);
+    const undersized = size < 50
+      ? `\n\n⚠ ${size}GB is below the recommended 50GB floor. If your dataset + outputs exceed ${Math.floor(size / 1.3)}GB, files will be silently truncated when the volume fills up.`
+      : "";
     return text(
-      `Network volume created!\nID: ${vol.id}\nName: ${vol.name}\nSize: ${vol.size}GB\nDatacenter: ${vol.dataCenterId}\n\n` +
+      `Network volume created!\nID: ${vol.id}\nName: ${vol.name}\nSize: ${vol.size}GB\nDatacenter: ${vol.dataCenterId}${undersized}\n\n` +
         `## Next Steps\n→ create_pod_auto(networkVolumeId: "${vol.id}")`
     );
   })

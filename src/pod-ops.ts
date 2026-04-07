@@ -162,6 +162,51 @@ export function selectGpuCandidates(
   return { candidates, errors };
 }
 
+// ── save_pod_metadata helpers ──
+
+/**
+ * Sanitize a pod name for use as a filename component.
+ * Removes/replaces characters that are unsafe on common filesystems.
+ */
+export function sanitizePodName(name: string): string {
+  return name
+    .trim()
+    .replace(/[/\\:*?"<>|]/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "unnamed-pod";
+}
+
+/**
+ * Extract YYYY-MM-DD from an ISO timestamp, falling back to today's date in UTC.
+ */
+export function isoToDateStamp(iso: string | undefined, now: Date = new Date()): string {
+  if (iso) {
+    const d = new Date(iso);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * Build the canonical save path for a pod metadata file.
+ *
+ * Pattern: {basePath}/{YYYY-MM-DD}_{sanitized-name}.json
+ *   - basePath defaults to ".runpod/pods" (relative to the consumer's CWD)
+ *   - date stamp is taken from metadata.created_at, or today if absent
+ *   - name is sanitized for cross-platform filesystem safety
+ */
+export function buildPodMetadataPath(
+  metadata: { name?: string; created_at?: string },
+  basePath: string = ".runpod/pods"
+): string {
+  const dateStamp = isoToDateStamp(metadata.created_at);
+  const safeName = sanitizePodName(metadata.name ?? "unnamed-pod");
+  // Use forward slash; Node fs accepts it on all platforms.
+  return `${basePath}/${dateStamp}_${safeName}.json`;
+}
+
 // ── delete_pod with auto-stop ──
 
 export async function deletePodWithStop(

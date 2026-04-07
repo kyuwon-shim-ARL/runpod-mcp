@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix } from "../pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, sanitizePodName, isoToDateStamp, buildPodMetadataPath } from "../pod-ops.js";
 import type { Pod, GpuType } from "../types.js";
 
 // ── Helper factories ──
@@ -214,6 +214,77 @@ describe("formatDcGpuFailureMatrix", () => {
     const out = formatDcGpuFailureMatrix([{ dc: "EU-RO-1", gpu: "A100", error: longErr }]);
     expect(out).toContain("...");
     expect(out.length).toBeLessThan(500);
+  });
+});
+
+// ── save_pod_metadata helpers ──
+
+describe("sanitizePodName", () => {
+  it("strips filesystem-unsafe characters", () => {
+    expect(sanitizePodName("piu/v2:t14*test")).toBe("piu-v2-t14-test");
+    expect(sanitizePodName('a"b<c>d|e?')).toBe("a-b-c-d-e");
+  });
+
+  it("collapses whitespace and dashes", () => {
+    expect(sanitizePodName("  foo   bar  ")).toBe("foo-bar");
+    expect(sanitizePodName("foo---bar")).toBe("foo-bar");
+  });
+
+  it("trims leading/trailing dashes", () => {
+    expect(sanitizePodName("---foo---")).toBe("foo");
+  });
+
+  it("falls back to 'unnamed-pod' for empty input", () => {
+    expect(sanitizePodName("")).toBe("unnamed-pod");
+    expect(sanitizePodName("   ")).toBe("unnamed-pod");
+    expect(sanitizePodName("///")).toBe("unnamed-pod");
+  });
+
+  it("truncates very long names to 80 chars", () => {
+    const longName = "a".repeat(200);
+    const out = sanitizePodName(longName);
+    expect(out.length).toBe(80);
+  });
+});
+
+describe("isoToDateStamp", () => {
+  it("extracts YYYY-MM-DD from a valid ISO timestamp", () => {
+    expect(isoToDateStamp("2026-04-07T08:06:39Z")).toBe("2026-04-07");
+    expect(isoToDateStamp("2025-12-31T23:59:59.999Z")).toBe("2025-12-31");
+  });
+
+  it("falls back to provided 'now' for missing or invalid input", () => {
+    const now = new Date("2026-04-07T12:00:00Z");
+    expect(isoToDateStamp(undefined, now)).toBe("2026-04-07");
+    expect(isoToDateStamp("not-a-date", now)).toBe("2026-04-07");
+  });
+});
+
+describe("buildPodMetadataPath", () => {
+  it("uses default base path '.runpod/pods'", () => {
+    const out = buildPodMetadataPath({ name: "piu-v2-t14", created_at: "2026-04-07T08:00:00Z" });
+    expect(out).toBe(".runpod/pods/2026-04-07_piu-v2-t14.json");
+  });
+
+  it("respects custom base path", () => {
+    const out = buildPodMetadataPath(
+      { name: "test", created_at: "2026-04-07T00:00:00Z" },
+      ".omc/pods"
+    );
+    expect(out).toBe(".omc/pods/2026-04-07_test.json");
+  });
+
+  it("sanitizes unsafe pod names in the filename", () => {
+    const out = buildPodMetadataPath(
+      { name: "bad/name:1*", created_at: "2026-04-07T00:00:00Z" },
+      ".runpod/pods"
+    );
+    expect(out).toBe(".runpod/pods/2026-04-07_bad-name-1.json");
+  });
+
+  it("falls back to 'unnamed-pod' when name is missing", () => {
+    const out = buildPodMetadataPath({ created_at: "2026-04-07T00:00:00Z" });
+    expect(out).toBe(".runpod/pods/2026-04-07_unnamed-pod.json");
   });
 });
 

@@ -67,7 +67,7 @@ User requests GPU work
 
 **Use this when data upload or preprocessing is needed before GPU training.** Avoids paying GPU rates ($0.44+/hr) while uploading or preprocessing data.
 
-1. `create_network_volume` (20GB+, target datacenter)
+1. `create_network_volume` (size = `ceil((dataset_gb + outputs_gb) * 1.3)`, **min 50GB** — see NV Sizing Formula below)
 2. `create_pod_auto` with `networkVolumeId` — use a **cheap GPU or smallest available** just for upload
 3. `upload_files` to `/workspace` + run any CPU preprocessing
 4. `stop_pod` or `delete_pod` — data persists on the network volume
@@ -106,6 +106,72 @@ For persistent data that survives pod termination:
 - `create_pod_auto` automatically resolves datacenter affinity when `networkVolumeId` is provided
 - `delete_network_volume` requires `confirmName` safety check — user must type exact volume name
 - Use `list_network_volumes` to see all volumes with their datacenter locations
+
+#### NV Sizing Formula
+
+**Do not default to 20GB** — that's a trap for any non-trivial dataset. The 20GB
+quota silently truncates files (rsync/tar will produce 0-byte files when full).
+
+```
+size_gb = ceil((dataset_gb + outputs_gb) * 1.3)   # 30% headroom for checkpoints, logs, tmp
+minimum recommended = 50GB                         # below this, the cost saving is negligible
+```
+
+**Cost reference:** RunPod NV is ~$0.07/GB/month → 50GB = ~$3.50/mo, 100GB = ~$7/mo.
+Even if you forget for a month, the cost of a too-small NV (re-upload, debug time,
+truncated training data) vastly exceeds the storage cost.
+
+**Sizing examples:**
+- 1GB dataset, 2GB checkpoints → `ceil(3 * 1.3) = 4` → use **50GB** (minimum)
+- 22GB dataset, 5GB outputs → `ceil(27 * 1.3) = 36` → use **50GB**
+- 80GB dataset, 20GB outputs → `ceil(100 * 1.3) = 130` → use **150GB**
+
+When you suggest `create_network_volume` to the user, always state the computed
+size and the formula. Never accept "use the default" — there is no good default.
+
+### Pod Metadata Persistence (`save_pod_metadata`)
+
+After a pod is fully provisioned (image installed, packages installed, data
+uploaded, training launched), call `save_pod_metadata` to capture the full
+provisioning recipe. Without this, debugging a failed run later is impossible —
+the pod is gone and so is every detail of how it was set up.
+
+**When to call:**
+1. **After post-create setup completes** — image, apt/pip installs, data upload
+   done, training command launched in tmux/nohup
+2. **After encountering an incident** — append to `incidents[]` and re-save
+3. **Before deleting the pod** — set `deleted_at` and final `cost_actual_usd`
+
+**Default save path:** `./.runpod/pods/{YYYY-MM-DD}_{podName}.json` (relative
+to the user's working directory). Override with `path` argument if the project
+uses a different convention.
+
+**Required schema fields:**
+```
+pod_id, name, purpose, created_at
+datacenter, gpu, gpu_count, cost_per_hr, image
+```
+
+**Recommended fields (fill what you know):**
+```
+deleted_at, container_disk_gb, network_volume {id, name, size_gb, datacenter},
+ssh {host, port}, post_create_steps [], data {source, dest, transfer_method},
+code {source, commit}, execution {script, log, output_dir, expected_*},
+monitor {cron_id}, incidents []
+```
+
+**Workflow rule:** the metadata file lives in the **user's project repo**, NOT
+in runpod-mcp. It should be tracked in git so future debugging has the full
+history. After saving, suggest `git add .runpod/pods/<file>.json && git commit`.
+
+**Example call sequence:**
+```
+create_pod_auto → wait_for_pod → upload_files → execute_ssh_command (setup)
+→ execute_ssh_command (training launch)
+→ save_pod_metadata({...full provisioning recipe...})
+→ git commit .runpod/pods/...
+→ (later, on incident) read existing metadata, append to incidents[], save again
+```
 
 ### Utilization Labels
 - **IDLE** (<30%): GPU is wasted — check if training actually started
