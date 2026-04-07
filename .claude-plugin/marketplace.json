@@ -10,7 +10,7 @@
     {
       "name": "runpod-mcp",
       "description": "Full lifecycle GPU pod management, SSH execution, file transfer, and intelligent GPU selection via RunPod API",
-      "version": "0.1.0",
+      "version": "0.4.0",
       "author": {
         "name": "Kyuwon Shim"
       },
@@ -20,5 +20,5 @@
       "tags": ["runpod", "gpu", "ssh", "cloud", "machine-learning", "mcp"]
     }
   ],
-  "version": "0.1.0"
+  "version": "0.4.0"
 }
