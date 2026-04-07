@@ -142,9 +142,19 @@ the pod is gone and so is every detail of how it was set up.
 2. **After encountering an incident** — append to `incidents[]` and re-save
 3. **Before deleting the pod** — set `deleted_at` and final `cost_actual_usd`
 
-**Default save path:** `./.runpod/pods/{YYYY-MM-DD}_{podName}.json` (relative
-to the user's working directory). Override with `path` argument if the project
-uses a different convention.
+**Default save path:** `./.omc/pods/{YYYY-MM-DD}_{podName}.yaml` (relative
+to the user's working directory, aligned with the existing `.omc/*` convention).
+Output is YAML for human readability of multi-line `post_create_steps` and
+`incidents`. Override with `path` argument if the project uses a different
+convention.
+
+**Auto-prefill stub:** `create_pod` and `create_pod_auto` now echo a `## Pod
+Metadata Stub` block in their response, pre-filled with everything known at
+pod-creation time (pod_id, datacenter, gpu, image, cost_per_hr,
+container_disk_gb, network_volume). You only need to fill in `purpose` and
+later append to `post_create_steps` / `incidents`. **Pass that stub straight
+to `save_pod_metadata` once `purpose` is set** — there is no excuse for
+forgetting to record a pod.
 
 **Required schema fields:**
 ```
@@ -162,15 +172,18 @@ monitor {cron_id}, incidents []
 
 **Workflow rule:** the metadata file lives in the **user's project repo**, NOT
 in runpod-mcp. It should be tracked in git so future debugging has the full
-history. After saving, suggest `git add .runpod/pods/<file>.json && git commit`.
+history. After saving, commit with the format `chore(pod): record {pod_name}`.
 
 **Example call sequence:**
 ```
-create_pod_auto → wait_for_pod → upload_files → execute_ssh_command (setup)
-→ execute_ssh_command (training launch)
-→ save_pod_metadata({...full provisioning recipe...})
-→ git commit .runpod/pods/...
-→ (later, on incident) read existing metadata, append to incidents[], save again
+create_pod_auto                              ← response includes Pod Metadata Stub
+→ save_pod_metadata({metadata: <stub + purpose>})  ← record IMMEDIATELY, don't wait
+→ git add .omc/pods/<file>.yaml && git commit -m "chore(pod): record <name>"
+→ wait_for_pod → upload_files → execute_ssh_command (setup)
+→ (after each major setup step) read existing yaml, append to post_create_steps, save_pod_metadata again
+→ execute_ssh_command (training launch) → append launch command to post_create_steps
+→ (on incident) read yaml, append to incidents[], save_pod_metadata again, commit
+→ (before delete_pod) set deleted_at + cost_actual_usd, save_pod_metadata, commit
 ```
 
 ### Utilization Labels

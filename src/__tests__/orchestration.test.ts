@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, sanitizePodName, isoToDateStamp, buildPodMetadataPath } from "../pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, sanitizePodName, isoToDateStamp, buildPodMetadataPath, toYaml, buildPodMetadataStub } from "../pod-ops.js";
 import type { Pod, GpuType } from "../types.js";
 
 // ── Helper factories ──
@@ -261,30 +261,142 @@ describe("isoToDateStamp", () => {
 });
 
 describe("buildPodMetadataPath", () => {
-  it("uses default base path '.runpod/pods'", () => {
+  it("uses default base path '.omc/pods' and .yaml extension", () => {
     const out = buildPodMetadataPath({ name: "piu-v2-t14", created_at: "2026-04-07T08:00:00Z" });
-    expect(out).toBe(".runpod/pods/2026-04-07_piu-v2-t14.json");
+    expect(out).toBe(".omc/pods/2026-04-07_piu-v2-t14.yaml");
   });
 
   it("respects custom base path", () => {
     const out = buildPodMetadataPath(
       { name: "test", created_at: "2026-04-07T00:00:00Z" },
-      ".omc/pods"
+      ".runpod/pods"
     );
-    expect(out).toBe(".omc/pods/2026-04-07_test.json");
+    expect(out).toBe(".runpod/pods/2026-04-07_test.yaml");
   });
 
   it("sanitizes unsafe pod names in the filename", () => {
     const out = buildPodMetadataPath(
-      { name: "bad/name:1*", created_at: "2026-04-07T00:00:00Z" },
-      ".runpod/pods"
+      { name: "bad/name:1*", created_at: "2026-04-07T00:00:00Z" }
     );
-    expect(out).toBe(".runpod/pods/2026-04-07_bad-name-1.json");
+    expect(out).toBe(".omc/pods/2026-04-07_bad-name-1.yaml");
   });
 
   it("falls back to 'unnamed-pod' when name is missing", () => {
     const out = buildPodMetadataPath({ created_at: "2026-04-07T00:00:00Z" });
-    expect(out).toBe(".runpod/pods/2026-04-07_unnamed-pod.json");
+    expect(out).toBe(".omc/pods/2026-04-07_unnamed-pod.yaml");
+  });
+});
+
+describe("toYaml", () => {
+  it("emits scalars correctly", () => {
+    expect(toYaml(null)).toBe("null\n");
+    expect(toYaml(true)).toBe("true\n");
+    expect(toYaml(42)).toBe("42\n");
+    expect(toYaml("hello")).toBe("hello\n");
+  });
+
+  it("quotes strings that look like numbers or booleans", () => {
+    expect(toYaml("123").trim()).toBe('"123"');
+    expect(toYaml("true").trim()).toBe('"true"');
+    expect(toYaml("null").trim()).toBe('"null"');
+  });
+
+  it("quotes strings with special chars", () => {
+    expect(toYaml("a: b").trim()).toBe('"a: b"');
+    expect(toYaml("{inline}").trim()).toBe('"{inline}"');
+  });
+
+  it("emits a flat object", () => {
+    const out = toYaml({ pod_id: "abc", gpu_count: 1, deleted_at: null });
+    expect(out).toBe("pod_id: abc\ngpu_count: 1\ndeleted_at: null\n");
+  });
+
+  it("emits a nested object with indentation", () => {
+    const out = toYaml({ network_volume: { id: "v1", size_gb: 50 } });
+    expect(out).toBe("network_volume:\n  id: v1\n  size_gb: 50\n");
+  });
+
+  it("emits arrays of strings", () => {
+    const out = toYaml({ post_create_steps: ["pip install foo", "apt-get install bar"] });
+    expect(out).toBe("post_create_steps:\n  - pip install foo\n  - apt-get install bar\n");
+  });
+
+  it("emits empty arrays and objects inline", () => {
+    expect(toYaml({ incidents: [] }).trim()).toBe("incidents: []");
+    expect(toYaml({ extras: {} }).trim()).toBe("extras: {}");
+  });
+
+  it("handles multiline strings as block scalars", () => {
+    const out = toYaml({ note: "line1\nline2" });
+    expect(out).toContain("note: |");
+    expect(out).toContain("line1");
+    expect(out).toContain("line2");
+  });
+
+  it("round-trips a realistic pod metadata document", () => {
+    const meta = {
+      pod_id: "oukau8f6ezy0kj",
+      name: "piu-v2-t14",
+      purpose: "T14 EMA+SWA ablation",
+      created_at: "2026-04-07T08:06:39Z",
+      datacenter: "EU-RO-1",
+      network_volume: { id: "6bi4k0e6or", name: "piu-v2-data-eu", size_gb: 50 },
+      post_create_steps: ["apt-get install -y rsync", "pip install torch"],
+      incidents: [],
+    };
+    const out = toYaml(meta);
+    // Spot-check key features
+    expect(out).toContain("pod_id: oukau8f6ezy0kj");
+    expect(out).toContain("network_volume:\n  id: 6bi4k0e6or");
+    expect(out).toContain("post_create_steps:\n  - apt-get install -y rsync");
+    expect(out).toContain("incidents: []");
+  });
+});
+
+describe("buildPodMetadataStub", () => {
+  it("includes all known fields and placeholder for unknowns", () => {
+    const stub = buildPodMetadataStub({
+      pod_id: "abc123",
+      name: "test-pod",
+      created_at: "2026-04-07T00:00:00Z",
+      datacenter: "US-GA-1",
+      gpu: "RTX 4090 (24GB)",
+      gpu_count: 1,
+      cost_per_hr: 0.44,
+      image: "runpod/pytorch:2.4.0",
+      container_disk_gb: 50,
+    });
+    const parsed = JSON.parse(stub);
+    expect(parsed.pod_id).toBe("abc123");
+    expect(parsed.purpose).toBe("<fill in: what this pod is for>");
+    expect(parsed.deleted_at).toBeNull();
+    expect(parsed.network_volume).toBeNull();
+    expect(parsed.ssh).toBeNull();
+    expect(parsed.post_create_steps).toEqual([]);
+    expect(parsed.incidents).toEqual([]);
+    expect(parsed.gpu).toBe("RTX 4090 (24GB)");
+    expect(parsed.datacenter).toBe("US-GA-1");
+  });
+
+  it("includes network_volume when provided", () => {
+    const stub = buildPodMetadataStub({
+      pod_id: "abc",
+      name: "test",
+      created_at: "2026-04-07T00:00:00Z",
+      network_volume: { id: "v1", name: "data", size_gb: 50, datacenter: "EU-RO-1" },
+    });
+    const parsed = JSON.parse(stub);
+    expect(parsed.network_volume.id).toBe("v1");
+    expect(parsed.network_volume.size_gb).toBe(50);
+  });
+
+  it("defaults gpu_count to 1", () => {
+    const stub = buildPodMetadataStub({
+      pod_id: "abc",
+      name: "test",
+      created_at: "2026-04-07T00:00:00Z",
+    });
+    expect(JSON.parse(stub).gpu_count).toBe(1);
   });
 });
 

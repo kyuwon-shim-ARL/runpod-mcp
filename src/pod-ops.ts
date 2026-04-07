@@ -192,19 +192,159 @@ export function isoToDateStamp(iso: string | undefined, now: Date = new Date()):
 /**
  * Build the canonical save path for a pod metadata file.
  *
- * Pattern: {basePath}/{YYYY-MM-DD}_{sanitized-name}.json
- *   - basePath defaults to ".runpod/pods" (relative to the consumer's CWD)
+ * Pattern: {basePath}/{YYYY-MM-DD}_{sanitized-name}.yaml
+ *   - basePath defaults to ".omc/pods" (aligned with existing .omc/* convention)
  *   - date stamp is taken from metadata.created_at, or today if absent
  *   - name is sanitized for cross-platform filesystem safety
  */
 export function buildPodMetadataPath(
   metadata: { name?: string; created_at?: string },
-  basePath: string = ".runpod/pods"
+  basePath: string = ".omc/pods"
 ): string {
   const dateStamp = isoToDateStamp(metadata.created_at);
   const safeName = sanitizePodName(metadata.name ?? "unnamed-pod");
   // Use forward slash; Node fs accepts it on all platforms.
-  return `${basePath}/${dateStamp}_${safeName}.json`;
+  return `${basePath}/${dateStamp}_${safeName}.yaml`;
+}
+
+// ── Minimal YAML serializer (zero-dep) ──
+//
+// Hand-written for the pod metadata schema. NOT a full YAML 1.2 implementation —
+// only handles: null, boolean, finite number, string (bare/quoted/block scalar),
+// homogeneous arrays of scalars or objects, and nested plain objects.
+//
+// Why not a real YAML lib: keeps runpod-mcp dependency-free (current deps:
+// @modelcontextprotocol/sdk + zod). The schema is small and stable, and the
+// output is round-trippable through any standard YAML parser.
+
+function isYamlPlainScalar(s: string): boolean {
+  if (s === "") return false;
+  if (/^\s|\s$/.test(s)) return false;
+  // Special chars that require quoting in YAML 1.2 plain scalars
+  if (/[:#&*!|>'"%@`,?\[\]{}]/.test(s)) return false;
+  if (s.includes("\n")) return false;
+  // Strings that look like YAML keywords or numbers must be quoted to round-trip
+  if (/^(null|true|false|yes|no|on|off|~)$/i.test(s)) return false;
+  if (/^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(s)) return false;
+  return true;
+}
+
+function emitYamlScalar(value: unknown, indent: number): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+  if (typeof value === "string") {
+    if (value.includes("\n")) {
+      // Block scalar (literal style preserves newlines)
+      const blockIndent = " ".repeat(indent + 2);
+      const lines = value.split("\n").map((l) => blockIndent + l).join("\n");
+      return "|\n" + lines;
+    }
+    return isYamlPlainScalar(value) ? value : JSON.stringify(value);
+  }
+  // Fallback for other types — JSON-encode (rare in our schema)
+  return JSON.stringify(value);
+}
+
+/**
+ * Serialize a plain JS value to YAML. Limited to the pod metadata schema's needs:
+ * objects, arrays, strings, numbers, booleans, null. Output is human-readable
+ * and parseable by any standard YAML 1.2 library.
+ */
+export function toYaml(value: unknown, indent: number = 0): string {
+  const pad = " ".repeat(indent);
+
+  // Top-level scalar
+  if (value === null || value === undefined || typeof value !== "object") {
+    return emitYamlScalar(value, indent) + "\n";
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return pad + "[]\n";
+    const lines: string[] = [];
+    for (const item of value) {
+      if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+        // Object item: first key inline with "- ", rest indented
+        const inner = toYaml(item, indent + 2).trimEnd();
+        const innerLines = inner.split("\n");
+        // First line: replace leading "  " (the inner pad) with "- "
+        lines.push(pad + "- " + innerLines[0].trimStart());
+        for (const l of innerLines.slice(1)) lines.push(l);
+      } else {
+        lines.push(pad + "- " + emitYamlScalar(item, indent));
+      }
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  // Plain object
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return pad + "{}\n";
+  const lines: string[] = [];
+  for (const [k, v] of entries) {
+    if (v === null || v === undefined) {
+      lines.push(pad + k + ": null");
+    } else if (Array.isArray(v)) {
+      if (v.length === 0) {
+        lines.push(pad + k + ": []");
+      } else {
+        lines.push(pad + k + ":");
+        lines.push(toYaml(v, indent + 2).trimEnd());
+      }
+    } else if (typeof v === "object") {
+      const subEntries = Object.entries(v as Record<string, unknown>);
+      if (subEntries.length === 0) {
+        lines.push(pad + k + ": {}");
+      } else {
+        lines.push(pad + k + ":");
+        lines.push(toYaml(v, indent + 2).trimEnd());
+      }
+    } else {
+      lines.push(pad + k + ": " + emitYamlScalar(v, indent));
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+// ── create_pod_auto: prefill metadata stub ──
+
+export interface PodMetadataStubInput {
+  pod_id: string;
+  name: string;
+  created_at: string;
+  datacenter?: string;
+  gpu?: string;
+  gpu_count?: number;
+  cost_per_hr?: number;
+  image?: string;
+  container_disk_gb?: number;
+  network_volume?: { id: string; name: string; size_gb: number; datacenter?: string } | null;
+}
+
+/**
+ * Build a JSON-formatted pod metadata stub from facts known at pod-creation time.
+ * Echoed in create_pod / create_pod_auto responses so Claude can pass it directly
+ * to save_pod_metadata after enriching with purpose / post_create_steps / etc.
+ */
+export function buildPodMetadataStub(input: PodMetadataStubInput): string {
+  const stub = {
+    pod_id: input.pod_id,
+    name: input.name,
+    purpose: "<fill in: what this pod is for>",
+    created_at: input.created_at,
+    deleted_at: null,
+    datacenter: input.datacenter ?? null,
+    gpu: input.gpu ?? null,
+    gpu_count: input.gpu_count ?? 1,
+    cost_per_hr: input.cost_per_hr ?? null,
+    container_disk_gb: input.container_disk_gb ?? null,
+    image: input.image ?? null,
+    network_volume: input.network_volume ?? null,
+    ssh: null,
+    post_create_steps: [],
+    incidents: [],
+  };
+  return JSON.stringify(stub, null, 2);
 }
 
 // ── delete_pod with auto-stop ──

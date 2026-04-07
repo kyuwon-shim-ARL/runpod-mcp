@@ -9,7 +9,7 @@ import type { Pod } from "./types.js";
 import { safeTool, text, errorResult } from "./tool-helpers.js";
 import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath } from "./pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub } from "./pod-ops.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -135,13 +135,38 @@ server.tool(
       cloudType: args.cloudType,
     };
 
+    const buildStub = (podId: string, costPerHr: number | null) =>
+      buildPodMetadataStub({
+        pod_id: podId,
+        name: args.name,
+        created_at: new Date().toISOString(),
+        gpu: args.gpuTypeId,
+        gpu_count: args.gpuCount,
+        cost_per_hr: costPerHr ?? undefined,
+        image: args.imageName,
+        container_disk_gb: args.containerDiskInGb,
+        network_volume: args.networkVolumeId
+          ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0 }
+          : null,
+      });
+
     if (args.spot && args.bidPerGpu) {
       const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
-      return text(`Spot pod created!\nID: ${result.id}\n\n## Next Steps\n→ wait_for_pod(podId: "${result.id}")`);
+      const stub = buildStub(result.id, args.bidPerGpu);
+      return text(
+        `Spot pod created!\nID: ${result.id}\n\n` +
+          `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
+          `## Next Steps\n→ wait_for_pod(podId: "${result.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
+      );
     }
 
     const pod = await requireClient().createPod(opts);
-    return text(`Pod created!\n${podSummary(pod)}\n\n## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`);
+    const stub = buildStub(pod.id, null);
+    return text(
+      `Pod created!\n${podSummary(pod)}\n\n` +
+        `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
+        `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
+    );
   })
 );
 
@@ -265,19 +290,49 @@ server.tool(
 
           if (args.spot && bidPrice) {
             const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+            const stub = buildPodMetadataStub({
+              pod_id: result.id,
+              name: args.name,
+              created_at: new Date().toISOString(),
+              datacenter: dc,
+              gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
+              gpu_count: args.gpuCount,
+              cost_per_hr: bidPrice,
+              image: args.imageName,
+              container_disk_gb: args.containerDiskInGb,
+              network_volume: args.networkVolumeId
+                ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc }
+                : null,
+            });
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})\n` +
                 `Spot bid: $${bidPrice}/hr\n` +
                 `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\n` +
-                `## Next Steps\n→ wait_for_pod(podId: "${result.id}")`
+                `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
+                `## Next Steps\n→ wait_for_pod(podId: "${result.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
             );
           }
 
           const pod = await c.createPod(opts);
           const dcLabel = nvDataCenterId ? dc : `${dc} (price: $${ondemandPrice}/hr)`;
+          const stub = buildPodMetadataStub({
+            pod_id: pod.id,
+            name: args.name,
+            created_at: new Date().toISOString(),
+            datacenter: dc,
+            gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
+            gpu_count: args.gpuCount,
+            cost_per_hr: ondemandPrice,
+            image: args.imageName,
+            container_disk_gb: args.containerDiskInGb,
+            network_volume: args.networkVolumeId
+              ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc }
+              : null,
+          });
           return text(
             `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}\n\n` +
-              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`
+              `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
+              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
           );
         } catch (e) {
           if (isAuthError(e)) return errorResult(e);
@@ -467,22 +522,22 @@ const podMetadataSchema = z
 
 server.tool(
   "save_pod_metadata",
-  "Persist a pod's provisioning recipe to disk so debugging is possible after the pod is deleted. Writes JSON to `{path}/{YYYY-MM-DD}_{podName}.json`. Default path: `.runpod/pods/` relative to the caller's CWD. The file is meant to be git-committed in the user's project repo. Call after pod setup completes (post-create installs done, training launched), again on incidents (append to incidents[] and re-save), and once more before deletion (set deleted_at + cost_actual_usd). See CLAUDE.md 'Pod Metadata Persistence' for the full workflow.",
+  "Persist a pod's provisioning recipe to disk so debugging is possible after the pod is deleted. Writes YAML to `{path}/{YYYY-MM-DD}_{podName}.yaml`. Default path: `.omc/pods/` relative to the caller's CWD (aligned with the existing `.omc/*` convention). The file is meant to be git-committed in the user's project repo. Call after pod setup completes (post-create installs done, training launched), again on incidents (append to incidents[] and re-save), and once more before deletion (set deleted_at + cost_actual_usd). See CLAUDE.md 'Pod Metadata Persistence' for the full workflow.",
   {
     metadata: podMetadataSchema,
     path: z
       .string()
       .optional()
-      .describe("Base directory for the metadata file (default: '.runpod/pods'). Relative paths resolve against the current working directory. Will be created if it does not exist."),
+      .describe("Base directory for the metadata file (default: '.omc/pods'). Relative paths resolve against the current working directory. Will be created if it does not exist."),
   },
   safeTool(async ({ metadata, path }) => {
-    const basePath = path ?? ".runpod/pods";
+    const basePath = path ?? ".omc/pods";
     const relPath = buildPodMetadataPath(metadata, basePath);
     const absPath = isAbsolute(relPath) ? relPath : resolve(process.cwd(), relPath);
 
     try {
       await mkdir(dirname(absPath), { recursive: true });
-      await writeFile(absPath, JSON.stringify(metadata, null, 2) + "\n", "utf8");
+      await writeFile(absPath, toYaml(metadata), "utf8");
     } catch (e) {
       return text(`Failed to save pod metadata to ${absPath}: ${(e as Error).message}`);
     }
@@ -495,7 +550,7 @@ server.tool(
         `Path: ${absPath}\n` +
         `Pod: ${metadata.name} (${metadata.pod_id})\n` +
         `Steps recorded: ${stepCount} | Incidents: ${incidentCount}\n\n` +
-        `## Next Steps\n→ git add ${relPath} && git commit -m "docs: record pod ${metadata.name}"`
+        `## Next Steps\n→ git add ${relPath} && git commit -m "chore(pod): record ${metadata.name}"`
     );
   })
 );

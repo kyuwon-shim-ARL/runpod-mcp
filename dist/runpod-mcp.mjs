@@ -21551,10 +21551,100 @@ function isoToDateStamp(iso, now = /* @__PURE__ */ new Date()) {
   }
   return now.toISOString().slice(0, 10);
 }
-function buildPodMetadataPath(metadata, basePath = ".runpod/pods") {
+function buildPodMetadataPath(metadata, basePath = ".omc/pods") {
   const dateStamp = isoToDateStamp(metadata.created_at);
   const safeName = sanitizePodName(metadata.name ?? "unnamed-pod");
-  return `${basePath}/${dateStamp}_${safeName}.json`;
+  return `${basePath}/${dateStamp}_${safeName}.yaml`;
+}
+function isYamlPlainScalar(s) {
+  if (s === "") return false;
+  if (/^\s|\s$/.test(s)) return false;
+  if (/[:#&*!|>'"%@`,?\[\]{}]/.test(s)) return false;
+  if (s.includes("\n")) return false;
+  if (/^(null|true|false|yes|no|on|off|~)$/i.test(s)) return false;
+  if (/^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(s)) return false;
+  return true;
+}
+function emitYamlScalar(value, indent) {
+  if (value === null || value === void 0) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+  if (typeof value === "string") {
+    if (value.includes("\n")) {
+      const blockIndent = " ".repeat(indent + 2);
+      const lines = value.split("\n").map((l) => blockIndent + l).join("\n");
+      return "|\n" + lines;
+    }
+    return isYamlPlainScalar(value) ? value : JSON.stringify(value);
+  }
+  return JSON.stringify(value);
+}
+function toYaml(value, indent = 0) {
+  const pad = " ".repeat(indent);
+  if (value === null || value === void 0 || typeof value !== "object") {
+    return emitYamlScalar(value, indent) + "\n";
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return pad + "[]\n";
+    const lines2 = [];
+    for (const item of value) {
+      if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+        const inner = toYaml(item, indent + 2).trimEnd();
+        const innerLines = inner.split("\n");
+        lines2.push(pad + "- " + innerLines[0].trimStart());
+        for (const l of innerLines.slice(1)) lines2.push(l);
+      } else {
+        lines2.push(pad + "- " + emitYamlScalar(item, indent));
+      }
+    }
+    return lines2.join("\n") + "\n";
+  }
+  const entries = Object.entries(value);
+  if (entries.length === 0) return pad + "{}\n";
+  const lines = [];
+  for (const [k, v] of entries) {
+    if (v === null || v === void 0) {
+      lines.push(pad + k + ": null");
+    } else if (Array.isArray(v)) {
+      if (v.length === 0) {
+        lines.push(pad + k + ": []");
+      } else {
+        lines.push(pad + k + ":");
+        lines.push(toYaml(v, indent + 2).trimEnd());
+      }
+    } else if (typeof v === "object") {
+      const subEntries = Object.entries(v);
+      if (subEntries.length === 0) {
+        lines.push(pad + k + ": {}");
+      } else {
+        lines.push(pad + k + ":");
+        lines.push(toYaml(v, indent + 2).trimEnd());
+      }
+    } else {
+      lines.push(pad + k + ": " + emitYamlScalar(v, indent));
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+function buildPodMetadataStub(input) {
+  const stub = {
+    pod_id: input.pod_id,
+    name: input.name,
+    purpose: "<fill in: what this pod is for>",
+    created_at: input.created_at,
+    deleted_at: null,
+    datacenter: input.datacenter ?? null,
+    gpu: input.gpu ?? null,
+    gpu_count: input.gpu_count ?? 1,
+    cost_per_hr: input.cost_per_hr ?? null,
+    container_disk_gb: input.container_disk_gb ?? null,
+    image: input.image ?? null,
+    network_volume: input.network_volume ?? null,
+    ssh: null,
+    post_create_steps: [],
+    incidents: []
+  };
+  return JSON.stringify(stub, null, 2);
 }
 async function deletePodWithStop(client2, podId, timeoutMs = 6e4) {
   const pod = await client2.getPod(podId);
@@ -21662,20 +21752,49 @@ server.tool(
       dockerArgs: args.dockerArgs,
       cloudType: args.cloudType
     };
+    const buildStub = (podId, costPerHr) => buildPodMetadataStub({
+      pod_id: podId,
+      name: args.name,
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      gpu: args.gpuTypeId,
+      gpu_count: args.gpuCount,
+      cost_per_hr: costPerHr ?? void 0,
+      image: args.imageName,
+      container_disk_gb: args.containerDiskInGb,
+      network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0 } : null
+    });
     if (args.spot && args.bidPerGpu) {
       const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
-      return text(`Spot pod created!
+      const stub2 = buildStub(result.id, args.bidPerGpu);
+      return text(
+        `Spot pod created!
 ID: ${result.id}
 
-## Next Steps
-\u2192 wait_for_pod(podId: "${result.id}")`);
-    }
-    const pod = await requireClient().createPod(opts);
-    return text(`Pod created!
-${podSummary(pod)}
+## Pod Metadata Stub (pass to save_pod_metadata after enriching)
+\`\`\`json
+${stub2}
+\`\`\`
 
 ## Next Steps
-\u2192 wait_for_pod(podId: "${pod.id}")`);
+\u2192 wait_for_pod(podId: "${result.id}")
+\u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})`
+      );
+    }
+    const pod = await requireClient().createPod(opts);
+    const stub = buildStub(pod.id, null);
+    return text(
+      `Pod created!
+${podSummary(pod)}
+
+## Pod Metadata Stub (pass to save_pod_metadata after enriching)
+\`\`\`json
+${stub}
+\`\`\`
+
+## Next Steps
+\u2192 wait_for_pod(podId: "${pod.id}")
+\u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})`
+    );
   })
 );
 server.tool(
@@ -21766,23 +21885,59 @@ Note: per-DC stock cannot be probed without creating a pod. Real run will iterat
           };
           if (args.spot && bidPrice) {
             const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+            const stub2 = buildPodMetadataStub({
+              pod_id: result.id,
+              name: args.name,
+              created_at: (/* @__PURE__ */ new Date()).toISOString(),
+              datacenter: dc,
+              gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
+              gpu_count: args.gpuCount,
+              cost_per_hr: bidPrice,
+              image: args.imageName,
+              container_disk_gb: args.containerDiskInGb,
+              network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
+            });
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})
 Spot bid: $${bidPrice}/hr
 Pod ID: ${result.id}${overprovisionWarning}${volumeNote}
 
+## Pod Metadata Stub (pass to save_pod_metadata after enriching)
+\`\`\`json
+${stub2}
+\`\`\`
+
 ## Next Steps
-\u2192 wait_for_pod(podId: "${result.id}")`
+\u2192 wait_for_pod(podId: "${result.id}")
+\u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})`
             );
           }
           const pod = await c.createPod(opts);
           const dcLabel = nvDataCenterId ? dc : `${dc} (price: $${ondemandPrice}/hr)`;
+          const stub = buildPodMetadataStub({
+            pod_id: pod.id,
+            name: args.name,
+            created_at: (/* @__PURE__ */ new Date()).toISOString(),
+            datacenter: dc,
+            gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
+            gpu_count: args.gpuCount,
+            cost_per_hr: ondemandPrice,
+            image: args.imageName,
+            container_disk_gb: args.containerDiskInGb,
+            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
+          });
           return text(
             `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
 ${podSummary(pod)}
 
+## Pod Metadata Stub (pass to save_pod_metadata after enriching)
+\`\`\`json
+${stub}
+\`\`\`
+
 ## Next Steps
-\u2192 wait_for_pod(podId: "${pod.id}")`
+\u2192 wait_for_pod(podId: "${pod.id}")
+\u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})`
           );
         } catch (e) {
           if (isAuthError(e)) return errorResult(e);
@@ -21949,18 +22104,18 @@ var podMetadataSchema = external_exports.object({
 }).passthrough();
 server.tool(
   "save_pod_metadata",
-  "Persist a pod's provisioning recipe to disk so debugging is possible after the pod is deleted. Writes JSON to `{path}/{YYYY-MM-DD}_{podName}.json`. Default path: `.runpod/pods/` relative to the caller's CWD. The file is meant to be git-committed in the user's project repo. Call after pod setup completes (post-create installs done, training launched), again on incidents (append to incidents[] and re-save), and once more before deletion (set deleted_at + cost_actual_usd). See CLAUDE.md 'Pod Metadata Persistence' for the full workflow.",
+  "Persist a pod's provisioning recipe to disk so debugging is possible after the pod is deleted. Writes YAML to `{path}/{YYYY-MM-DD}_{podName}.yaml`. Default path: `.omc/pods/` relative to the caller's CWD (aligned with the existing `.omc/*` convention). The file is meant to be git-committed in the user's project repo. Call after pod setup completes (post-create installs done, training launched), again on incidents (append to incidents[] and re-save), and once more before deletion (set deleted_at + cost_actual_usd). See CLAUDE.md 'Pod Metadata Persistence' for the full workflow.",
   {
     metadata: podMetadataSchema,
-    path: external_exports.string().optional().describe("Base directory for the metadata file (default: '.runpod/pods'). Relative paths resolve against the current working directory. Will be created if it does not exist.")
+    path: external_exports.string().optional().describe("Base directory for the metadata file (default: '.omc/pods'). Relative paths resolve against the current working directory. Will be created if it does not exist.")
   },
   safeTool(async ({ metadata, path }) => {
-    const basePath = path ?? ".runpod/pods";
+    const basePath = path ?? ".omc/pods";
     const relPath = buildPodMetadataPath(metadata, basePath);
     const absPath = isAbsolute(relPath) ? relPath : resolve(process.cwd(), relPath);
     try {
       await mkdir(dirname(absPath), { recursive: true });
-      await writeFile(absPath, JSON.stringify(metadata, null, 2) + "\n", "utf8");
+      await writeFile(absPath, toYaml(metadata), "utf8");
     } catch (e) {
       return text(`Failed to save pod metadata to ${absPath}: ${e.message}`);
     }
@@ -21974,7 +22129,7 @@ Pod: ${metadata.name} (${metadata.pod_id})
 Steps recorded: ${stepCount} | Incidents: ${incidentCount}
 
 ## Next Steps
-\u2192 git add ${relPath} && git commit -m "docs: record pod ${metadata.name}"`
+\u2192 git add ${relPath} && git commit -m "chore(pod): record ${metadata.name}"`
     );
   })
 );
