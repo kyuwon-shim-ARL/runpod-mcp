@@ -53,6 +53,53 @@ export function filterStalePods(
   return { stale, skipped };
 }
 
+// ── create_pod_auto DC priority ──
+
+/**
+ * Default datacenter priority for create_pod_auto fallback.
+ *
+ * Order is based on observed RunPod stock pool sizes (largest first):
+ * - US-GA-1, US-CA-2: largest US capacity pools, most consistent stock
+ * - EU-SE-1, EU-CZ-1: largest EU pools
+ * - AP-JP-1: medium pool, variable
+ * - US-TX-3, EU-RO-1: smaller pools, easily exhausted but kept as last resort
+ *
+ * Used only when networkVolumeId is NOT provided (NV constrains the DC).
+ */
+export const DEFAULT_DC_PRIORITY: string[] = [
+  "US-GA-1",
+  "US-CA-2",
+  "EU-SE-1",
+  "EU-CZ-1",
+  "AP-JP-1",
+  "US-TX-3",
+  "EU-RO-1",
+];
+
+/**
+ * Format a (dc × gpu) failure matrix into a human-readable diagnostic block.
+ * Used when create_pod_auto exhausts all DC × GPU combinations.
+ */
+export function formatDcGpuFailureMatrix(
+  attempts: Array<{ dc: string; gpu: string; error: string }>
+): string {
+  if (attempts.length === 0) return "";
+  const byDc = new Map<string, Array<{ gpu: string; error: string }>>();
+  for (const a of attempts) {
+    if (!byDc.has(a.dc)) byDc.set(a.dc, []);
+    byDc.get(a.dc)!.push({ gpu: a.gpu, error: a.error });
+  }
+  const lines: string[] = [];
+  for (const [dc, rows] of byDc) {
+    lines.push(`  [${dc}]`);
+    for (const r of rows) {
+      const truncated = r.error.length > 120 ? r.error.slice(0, 117) + "..." : r.error;
+      lines.push(`    - ${r.gpu}: ${truncated}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 // ── create_pod_auto GPU selection ──
 
 export interface GpuSelectionOptions {

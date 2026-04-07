@@ -21053,45 +21053,73 @@ var RunPodClient = class {
   constructor(config2) {
     this.config = config2;
   }
-  async restRequest(method, path, body) {
-    const res = await fetch(`${this.config.restBaseUrl}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.config.apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: body ? JSON.stringify(body) : void 0
-    });
-    if (!res.ok) {
-      const text2 = await res.text();
-      throw new Error(`RunPod REST API ${method} ${path}: ${res.status} ${text2}`);
-    }
-    return res.json();
-  }
-  async graphqlRequest(query, variables) {
-    const res = await fetch(this.config.graphqlUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.config.apiKey}`
-      },
-      body: JSON.stringify({ query, variables })
-    });
-    if (!res.ok) {
-      const text2 = await res.text();
-      throw new Error(`RunPod GraphQL API: ${res.status} ${text2}`);
-    }
-    const json = await res.json();
-    if (json.errors?.length) {
-      if (json.data) {
-        const uniqueMessages = [...new Set(json.errors.map((e) => e.message))];
-        process.stderr.write(`RunPod GraphQL partial error (data still returned): ${uniqueMessages.join("; ")}
-`);
-      } else {
-        throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+  async restRequest(method, path, body, opts) {
+    const timeoutMs = opts?.timeoutMs ?? 3e4;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signals = [timeoutSignal];
+    if (opts?.signal) signals.push(opts.signal);
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+    try {
+      const res = await fetch(`${this.config.restBaseUrl}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: body ? JSON.stringify(body) : void 0,
+        signal
+      });
+      if (!res.ok) {
+        const text2 = await res.text();
+        throw new Error(`RunPod REST API ${method} ${path}: ${res.status} ${text2}`);
       }
+      const raw = await res.text();
+      if (!raw) return void 0;
+      return JSON.parse(raw);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error(`RunPod REST API ${method} ${path}: request timed out after ${timeoutMs / 1e3}s`);
+      }
+      throw e;
     }
-    return json.data;
+  }
+  async graphqlRequest(query, variables, opts) {
+    const timeoutMs = opts?.timeoutMs ?? 3e4;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signals = [timeoutSignal];
+    if (opts?.signal) signals.push(opts.signal);
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+    try {
+      const res = await fetch(this.config.graphqlUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.apiKey}`
+        },
+        body: JSON.stringify({ query, variables }),
+        signal
+      });
+      if (!res.ok) {
+        const text2 = await res.text();
+        throw new Error(`RunPod GraphQL API: ${res.status} ${text2}`);
+      }
+      const json = await res.json();
+      if (json.errors?.length) {
+        if (json.data) {
+          const uniqueMessages = [...new Set(json.errors.map((e) => e.message))];
+          process.stderr.write(`RunPod GraphQL partial error (data still returned): ${uniqueMessages.join("; ")}
+`);
+        } else {
+          throw new Error(`RunPod GraphQL: ${json.errors.map((e) => e.message).join(", ")}`);
+        }
+      }
+      return json.data;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error(`RunPod GraphQL API: request timed out after ${timeoutMs / 1e3}s`);
+      }
+      throw e;
+    }
   }
   /** Normalize pod portMappings on read */
   normalizePod(pod) {
@@ -21118,6 +21146,7 @@ var RunPodClient = class {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: opts.ports ?? ["22/tcp"],
       supportPublicIp: opts.supportPublicIp ?? true,
+      cloudType: opts.cloudType ?? "ALL",
       env: { ...opts.env }
     };
     if (opts.sshPublicKey) {
@@ -21127,7 +21156,7 @@ var RunPodClient = class {
     if (opts.dockerArgs) body.dockerArgs = opts.dockerArgs;
     if (opts.dockerStartCmd) body.dockerStartCmd = opts.dockerStartCmd;
     if (opts.dataCenterIds) body.dataCenterIds = opts.dataCenterIds;
-    const pod = await this.restRequest("POST", "/pods", body);
+    const pod = await this.restRequest("POST", "/pods", body, { timeoutMs: 6e4 });
     return this.normalizePod(pod);
   }
   async deletePod(podId) {
@@ -21169,13 +21198,13 @@ var RunPodClient = class {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: (opts.ports ?? ["22/tcp"]).join(","),
       env: envArray,
-      cloudType: "SECURE",
+      cloudType: opts.cloudType ?? "ALL",
       supportPublicIp: opts.supportPublicIp ?? true
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;
     if (opts.dockerArgs) input.dockerArgs = opts.dockerArgs;
     if (opts.dataCenterIds?.length) input.dataCenterIds = opts.dataCenterIds;
-    const data = await this.graphqlRequest(query, { input });
+    const data = await this.graphqlRequest(query, { input }, { timeoutMs: 6e4 });
     return data.podRentInterruptable;
   }
   // ── GPU Types ──
@@ -21246,7 +21275,21 @@ var RunPodClient = class {
   // ── SSH Helpers (return args arrays for spawn, not shell strings) ──
   getSshArgs(pod) {
     if (!pod.publicIp || !pod.portMappings?.["22"]) return null;
-    const args = ["ssh", "-o", "StrictHostKeyChecking=no", "-p", String(pod.portMappings["22"])];
+    const args = [
+      "ssh",
+      "-o",
+      "StrictHostKeyChecking=no",
+      "-o",
+      "ConnectTimeout=15",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ServerAliveInterval=15",
+      "-o",
+      "ServerAliveCountMax=3",
+      "-p",
+      String(pod.portMappings["22"])
+    ];
     if (this.config.sshKeyPath) args.push("-i", this.config.sshKeyPath);
     args.push(`root@${pod.publicIp}`);
     return args;
@@ -21257,11 +21300,11 @@ var RunPodClient = class {
   }
   getRsyncArgs(pod, localPath, remotePath, direction) {
     if (!pod.publicIp || !pod.portMappings?.["22"]) return null;
-    const sshCmd = ["-o", "StrictHostKeyChecking=no", "-p", String(pod.portMappings["22"])];
+    const sshCmd = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes", "-p", String(pod.portMappings["22"])];
     if (this.config.sshKeyPath) sshCmd.push("-i", this.config.sshKeyPath);
     const sshArg = `ssh ${sshCmd.join(" ")}`;
     const remote = `root@${pod.publicIp}:${remotePath}`;
-    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
+    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
       return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }
@@ -21285,22 +21328,44 @@ var RunPodClient = class {
       });
     });
   }
-  async waitForPod(podId, timeoutMs = 3e5, intervalMs = 1e4) {
+  async waitForPod(podId, timeoutMs = 3e5, intervalMs = 1e4, onProgress) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const pod = await this.getPod(podId);
+      const elapsed = Math.round((Date.now() - start) / 1e3);
       if (pod.desiredStatus === "RUNNING" && pod.publicIp && pod.portMappings?.["22"]) {
+        onProgress?.(`[${elapsed}s] Pod RUNNING, probing SSH at ${pod.publicIp}:${pod.portMappings["22"]}...`);
         const sshReady = await this.tcpProbe(pod.publicIp, pod.portMappings["22"]);
         if (sshReady) return pod;
-      }
-      if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "ERROR") {
+        onProgress?.(`[${elapsed}s] SSH not ready yet, retrying...`);
+      } else if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "ERROR") {
         throw new Error(`Pod ${podId} entered terminal state: ${pod.desiredStatus}`);
+      } else {
+        onProgress?.(`[${elapsed}s] Pod status: ${pod.desiredStatus}, waiting...`);
       }
       await new Promise((r) => setTimeout(r, intervalMs));
     }
     throw new Error(`Pod ${podId} did not become ready within ${timeoutMs / 1e3}s`);
   }
 };
+
+// src/tool-helpers.ts
+function text(s) {
+  return { content: [{ type: "text", text: s }] };
+}
+function errorResult(e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+}
+function safeTool(handler) {
+  return async (args, extra) => {
+    try {
+      return await handler(args, extra);
+    } catch (e) {
+      return errorResult(e);
+    }
+  };
+}
 
 // src/gpu-utils.ts
 function safeInt(value, fallback = 0) {
@@ -21393,6 +21458,102 @@ function getOnDemandPrice(gpu) {
   return gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? gpu.securePrice ?? null;
 }
 
+// src/pod-ops.ts
+function filterStalePods(pods, graceHours, now = Date.now()) {
+  const graceMs = graceHours * 60 * 60 * 1e3;
+  const skipPattern = /keep|persist/i;
+  const stale = [];
+  const skipped = [];
+  for (const pod of pods) {
+    if (pod.desiredStatus !== "EXITED") {
+      skipped.push({ pod, reason: `status=${pod.desiredStatus}` });
+      continue;
+    }
+    if (skipPattern.test(pod.name)) {
+      skipped.push({ pod, reason: "name contains keep/persist" });
+      continue;
+    }
+    if (!pod.lastStatusChange) {
+      skipped.push({ pod, reason: "no lastStatusChange timestamp" });
+      continue;
+    }
+    const idleMs = now - new Date(pod.lastStatusChange).getTime();
+    if (idleMs < graceMs) {
+      skipped.push({ pod, reason: `idle ${(idleMs / 36e5).toFixed(1)}h < grace ${graceHours}h` });
+      continue;
+    }
+    stale.push({ pod, idleHours: Math.round(idleMs / 36e5) });
+  }
+  return { stale, skipped };
+}
+var DEFAULT_DC_PRIORITY = [
+  "US-GA-1",
+  "US-CA-2",
+  "EU-SE-1",
+  "EU-CZ-1",
+  "AP-JP-1",
+  "US-TX-3",
+  "EU-RO-1"
+];
+function formatDcGpuFailureMatrix(attempts) {
+  if (attempts.length === 0) return "";
+  const byDc = /* @__PURE__ */ new Map();
+  for (const a of attempts) {
+    if (!byDc.has(a.dc)) byDc.set(a.dc, []);
+    byDc.get(a.dc).push({ gpu: a.gpu, error: a.error });
+  }
+  const lines = [];
+  for (const [dc, rows] of byDc) {
+    lines.push(`  [${dc}]`);
+    for (const r of rows) {
+      const truncated = r.error.length > 120 ? r.error.slice(0, 117) + "..." : r.error;
+      lines.push(`    - ${r.gpu}: ${truncated}`);
+    }
+  }
+  return lines.join("\n");
+}
+function selectGpuCandidates(gpuTypes, options) {
+  const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
+  const candidates = [];
+  const errors = [];
+  for (const gpuId of options.gpuPreference) {
+    const gpu = gpuMap.get(gpuId);
+    if (!gpu) continue;
+    if (gpu.memoryInGb < options.minVram) continue;
+    const stock = getStockStatus(gpu);
+    if (!isInStock(gpu)) continue;
+    const ondemandPrice = getOnDemandPrice(gpu) ?? 1;
+    const minBid = getSpotPrice(gpu) ?? 0;
+    const bidPrice = options.spot ? Math.min(options.maxBidPerGpu, ondemandPrice * 0.8) : void 0;
+    if (options.spot && bidPrice != null && minBid > 0 && bidPrice < minBid) {
+      errors.push(`${gpu.displayName}: Bid $${bidPrice.toFixed(3)}/hr below minimum $${minBid}/hr, skipped`);
+      continue;
+    }
+    const overprovisionWarning = isOverprovisioned(gpu.memoryInGb, options.minVram) ? `
+Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you requested ${options.minVram}GB minimum.
+  Consider a smaller GPU to save cost, or increase your workload to utilize the extra VRAM.
+` : "";
+    candidates.push({ gpu, gpuId, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning });
+  }
+  return { candidates, errors };
+}
+async function deletePodWithStop(client2, podId, timeoutMs = 6e4) {
+  const pod = await client2.getPod(podId);
+  let wasRunning = false;
+  if (pod.desiredStatus === "RUNNING") {
+    wasRunning = true;
+    await client2.stopPod(podId);
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 3e3));
+      const current = await client2.getPod(podId);
+      if (current.desiredStatus !== "RUNNING") break;
+    }
+  }
+  await client2.deletePod(podId);
+  return { wasRunning };
+}
+
 // src/index.ts
 var API_KEY = process.env.RUNPOD_API_KEY;
 var SETUP_MSG = "RUNPOD_API_KEY is not configured. To set up:\n\n1. Get your API key from https://www.runpod.io/console/user/settings\n2. Add to your shell profile (~/.bashrc or ~/.zshrc):\n   export RUNPOD_API_KEY=rp_xxxxxx\n3. (Optional) For SSH/rsync features:\n   export SSH_KEY_PATH=~/.ssh/id_ed25519\n4. Restart Claude Code for changes to take effect.";
@@ -21411,24 +21572,8 @@ function requireClient() {
 }
 var server = new McpServer({
   name: "runpod-tools",
-  version: "0.1.0"
+  version: "0.2.0"
 });
-function text(s) {
-  return { content: [{ type: "text", text: s }] };
-}
-function errorResult(e) {
-  const msg = e instanceof Error ? e.message : String(e);
-  return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
-}
-function safeTool(handler) {
-  return async (args) => {
-    try {
-      return await handler(args);
-    } catch (e) {
-      return errorResult(e);
-    }
-  };
-}
 function podSummary(pod) {
   const c = requireClient();
   const ssh = c.getSshCommandString(pod);
@@ -21477,6 +21622,7 @@ server.tool(
     ports: external_exports.array(external_exports.string()).default(["22/tcp"]),
     env: external_exports.record(external_exports.string()).optional().describe("Environment variables"),
     dockerArgs: external_exports.string().optional(),
+    cloudType: external_exports.enum(["ALL", "SECURE", "COMMUNITY"]).default("ALL").describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0.")
   },
   safeTool(async (args) => {
@@ -21494,7 +21640,8 @@ server.tool(
       sshPublicKey: args.sshPublicKey,
       ports: args.ports,
       env: podEnv,
-      dockerArgs: args.dockerArgs
+      dockerArgs: args.dockerArgs,
+      cloudType: args.cloudType
     };
     if (args.spot && args.bidPerGpu) {
       const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
@@ -21527,99 +21674,102 @@ server.tool(
     volumeInGb: external_exports.number().default(20),
     sshPublicKey: external_exports.string().optional(),
     env: external_exports.record(external_exports.string()).optional(),
-    networkVolumeId: external_exports.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter."),
+    networkVolumeId: external_exports.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter (dcPriority is ignored)."),
+    dcPriority: external_exports.array(external_exports.string()).optional().describe(
+      "Datacenter priority list for fallback when stock is tight. Tries each DC in order with each GPU type until a pod is created. Ignored when networkVolumeId is set (NV constrains the DC). Defaults to a built-in priority based on observed RunPod stock pool sizes (largest first): US-GA-1, US-CA-2, EU-SE-1, EU-CZ-1, AP-JP-1, US-TX-3, EU-RO-1."
+    ),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
+    cloudType: external_exports.enum(["ALL", "SECURE", "COMMUNITY"]).default("ALL").describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
     dryRun: external_exports.boolean().default(false).describe("Preview GPU selection and cost estimate without creating a pod. Note: GPU availability may change between dry run and actual creation.")
   },
   safeTool(async (args) => {
     const c = requireClient();
     const gpuTypes = await c.listGpuTypes();
-    const gpuMap = new Map(gpuTypes.map((g) => [g.id, g]));
-    const errors = [];
-    let dataCenterIds;
+    let nvDataCenterId;
     let volumeNote = "";
     if (args.networkVolumeId) {
       const vol = await c.getNetworkVolume(args.networkVolumeId);
       if (!vol) return text(`Network volume ${args.networkVolumeId} not found.`);
-      dataCenterIds = [vol.dataCenterId];
+      nvDataCenterId = vol.dataCenterId;
       volumeNote = `
 Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
     }
-    for (const gpuId of args.gpuPreference) {
-      const gpu = gpuMap.get(gpuId);
-      if (!gpu) continue;
-      if (gpu.memoryInGb < args.minVram) continue;
-      const stock = getStockStatus(gpu);
-      if (!isInStock(gpu)) continue;
-      const ondemandPrice = getOnDemandPrice(gpu) ?? 1;
-      const minBid = getSpotPrice(gpu) ?? 0;
-      const bidPrice = args.spot ? Math.min(args.maxBidPerGpu, ondemandPrice * 0.8) : void 0;
-      if (args.spot && bidPrice != null && minBid > 0 && bidPrice < minBid) {
-        errors.push(`${gpu.displayName}: Bid $${bidPrice.toFixed(3)}/hr below minimum $${minBid}/hr, skipped`);
-        continue;
-      }
-      const overprovisionWarning = isOverprovisioned(gpu.memoryInGb, args.minVram) ? `
-Overprovisioned: ${gpu.displayName} has ${gpu.memoryInGb}GB VRAM but you requested ${args.minVram}GB minimum.
-  Consider a smaller GPU to save cost, or increase your workload to utilize the extra VRAM.
-` : "";
-      if (args.dryRun) {
-        const priceInfo = args.spot && bidPrice ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)` : `On-demand: $${ondemandPrice}/hr`;
-        const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
-        return text(
-          `## Dry Run \u2014 Preview Only (no pod created)
+    const dcsToTry = nvDataCenterId ? [nvDataCenterId] : args.dcPriority && args.dcPriority.length > 0 ? args.dcPriority : DEFAULT_DC_PRIORITY;
+    const { candidates, errors } = selectGpuCandidates(gpuTypes, {
+      gpuPreference: args.gpuPreference,
+      minVram: args.minVram,
+      gpuCount: args.gpuCount,
+      spot: args.spot,
+      maxBidPerGpu: args.maxBidPerGpu
+    });
+    if (args.dryRun && candidates.length > 0) {
+      const { gpu, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning } = candidates[0];
+      const priceInfo = args.spot && bidPrice ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)` : `On-demand: $${ondemandPrice}/hr`;
+      const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
+      const dcNote = nvDataCenterId ? `
+Datacenter: ${nvDataCenterId} (forced by network volume)` : `
+DC fallback order: ${dcsToTry.join(" \u2192 ")}`;
+      return text(
+        `## Dry Run \u2014 Preview Only (no pod created)
 
 GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})
 ${priceInfo}
 Estimated monthly: $${monthlyCost.toFixed(0)}
 Image: ${args.imageName}
-GPU count: ${args.gpuCount}${overprovisionWarning}${volumeNote}
+GPU count: ${args.gpuCount}${dcNote}${overprovisionWarning}${volumeNote}
 
-Note: GPU availability may change between dry run and actual creation.
+Note: per-DC stock cannot be probed without creating a pod. Real run will iterate DCs in the order shown.
 
 ## Next Steps
 \u2192 create_pod_auto with same parameters and dryRun: false`
-        );
-      }
-      try {
-        const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
-        const opts = {
-          name: args.name,
-          imageName: args.imageName,
-          gpuTypeIds: [gpuId],
-          gpuCount: args.gpuCount,
-          interruptible: args.spot,
-          containerDiskInGb: args.containerDiskInGb,
-          volumeInGb: args.volumeInGb,
-          volumeMountPath: "/workspace",
-          sshPublicKey: args.sshPublicKey,
-          ports: ["22/tcp"],
-          env: podEnv,
-          networkVolumeId: args.networkVolumeId,
-          dataCenterIds
-        };
-        if (args.spot && bidPrice) {
-          const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
-          return text(
-            `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})
+      );
+    }
+    const failureMatrix = [];
+    for (const dc of dcsToTry) {
+      for (const { gpu, gpuId, stock, ondemandPrice, bidPrice, overprovisionWarning } of candidates) {
+        try {
+          const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
+          const opts = {
+            name: args.name,
+            imageName: args.imageName,
+            gpuTypeIds: [gpuId],
+            gpuCount: args.gpuCount,
+            interruptible: args.spot,
+            containerDiskInGb: args.containerDiskInGb,
+            volumeInGb: args.volumeInGb,
+            volumeMountPath: "/workspace",
+            sshPublicKey: args.sshPublicKey,
+            ports: ["22/tcp"],
+            env: podEnv,
+            networkVolumeId: args.networkVolumeId,
+            dataCenterIds: [dc],
+            cloudType: args.cloudType
+          };
+          if (args.spot && bidPrice) {
+            const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+            return text(
+              `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})
 Spot bid: $${bidPrice}/hr
 Pod ID: ${result.id}${overprovisionWarning}${volumeNote}
 
 ## Next Steps
 \u2192 wait_for_pod(podId: "${result.id}")`
-          );
-        }
-        const pod = await c.createPod(opts);
-        return text(
-          `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
+            );
+          }
+          const pod = await c.createPod(opts);
+          const dcLabel = nvDataCenterId ? dc : `${dc} (price: $${ondemandPrice}/hr)`;
+          return text(
+            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
 ${podSummary(pod)}
 
 ## Next Steps
 \u2192 wait_for_pod(podId: "${pod.id}")`
-        );
-      } catch (e) {
-        if (isAuthError(e)) return errorResult(e);
-        errors.push(`${gpu.displayName}${stock === "Low" ? " (Low stock)" : ""}: ${e.message}`);
-        continue;
+          );
+        } catch (e) {
+          if (isAuthError(e)) return errorResult(e);
+          failureMatrix.push({ dc, gpu: gpu.displayName, error: e.message });
+          continue;
+        }
       }
     }
     const available = gpuTypes.filter((g) => g.memoryInGb >= args.minVram && getStockStatus(g) !== "Out of Stock").sort((a, b) => {
@@ -21627,24 +21777,35 @@ ${podSummary(pod)}
       const bp = getSpotPrice(b) ?? Infinity;
       return ap - bp;
     }).slice(0, 10);
-    const errMsg = errors.length ? `
+    const matrixText = formatDcGpuFailureMatrix(failureMatrix);
+    const matrixBlock = matrixText ? `
 
-Errors encountered:
+Failure matrix (${failureMatrix.length} attempts across ${dcsToTry.length} DC \xD7 ${candidates.length} GPU):
+${matrixText}` : "";
+    const selectionErrors = errors.length ? `
+
+Selection errors:
 ${errors.join("\n")}` : "";
-    const nvConstraint = dataCenterIds ? `
+    const nvHint = nvDataCenterId ? `
 
-\u26A0 Network volume constrains pods to datacenter ${dataCenterIds[0]}.${volumeNote}
-GPU availability in this datacenter may be limited. Alternatives shown below are global stock \u2014 NOT guaranteed in your datacenter.` : "";
+\u26A0 Network volume ${args.networkVolumeId} constrains pods to ${nvDataCenterId}.${volumeNote}
+If this DC is dry, options:
+  1. Wait and retry \u2014 RunPod stock fluctuates.
+  2. Create a new network volume in a different DC (create_network_volume), upload data again, and retry.
+  3. Run without networkVolumeId to use dcPriority fallback (${DEFAULT_DC_PRIORITY.slice(0, 3).join(", ")}, ...).` : `
+
+DC fallback order tried: ${dcsToTry.join(" \u2192 ")}
+All combinations exhausted. Try again later or override dcPriority with a different list.`;
     return text(
-      `No preferred GPU available.${nvConstraint}
+      `No pod could be created.${nvHint}
 
-Cheapest alternatives (global stock):
+Cheapest alternatives (global stock \u2014 NOT guaranteed in any specific DC):
 
 ` + available.map((g) => {
         const price = getSpotPrice(g);
         const st = getStockStatus(g);
         return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
-      }).join("\n") + errMsg
+      }).join("\n") + matrixBlock + selectionErrors
     );
   })
 );
@@ -21683,23 +21844,49 @@ server.tool(
   "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes.",
   { podId: external_exports.string() },
   safeTool(async ({ podId }) => {
+    const { wasRunning } = await deletePodWithStop(requireClient(), podId);
+    return text(`Pod ${podId} deleted.${wasRunning ? ` (was running \u2192 auto-stopped first)` : ""}`);
+  })
+);
+server.tool(
+  "cleanup_stale_pods",
+  "Find and delete EXITED pods that have been idle longer than graceHours. Pods with 'keep' or 'persist' in their name are skipped. Use dryRun=true (default) to preview what would be deleted.",
+  {
+    graceHours: external_exports.number().default(2).describe("Hours since last status change before a pod is considered stale"),
+    dryRun: external_exports.boolean().default(true).describe("If true, only list stale pods without deleting")
+  },
+  safeTool(async ({ graceHours, dryRun }) => {
     const c = requireClient();
-    const pod = await c.getPod(podId);
-    const steps = [];
-    if (pod.desiredStatus === "RUNNING") {
-      await c.stopPod(podId);
-      steps.push("Stopped running pod");
-      const start = Date.now();
-      const timeout = 6e4;
-      while (Date.now() - start < timeout) {
-        await new Promise((r) => setTimeout(r, 3e3));
-        const current = await c.getPod(podId);
-        if (current.desiredStatus !== "RUNNING") break;
+    const pods = await c.listPods();
+    const { stale, skipped } = filterStalePods(pods, graceHours);
+    if (!stale.length) {
+      return text(`No stale pods found.
+
+Skipped: ${skipped.length} pod(s)${skipped.length ? "\n" + skipped.map((s) => `  - ${s.pod.name}: ${s.reason}`).join("\n") : ""}`);
+    }
+    if (dryRun) {
+      const lines = stale.map(
+        (s) => `  - ${s.pod.name} (${s.pod.id}) \u2014 idle ${s.idleHours}h, ${s.pod.gpu?.displayName ?? "unknown GPU"}, $${s.pod.costPerHr ?? "?"}/hr`
+      );
+      return text(`[DRY RUN] Would delete ${stale.length} stale pod(s):
+${lines.join("\n")}
+
+Re-run with dryRun=false to delete.`);
+    }
+    const deleted = [];
+    const failed = [];
+    for (const s of stale) {
+      try {
+        await c.deletePod(s.pod.id);
+        deleted.push(`${s.pod.name} (idle ${s.idleHours}h)`);
+      } catch (e) {
+        failed.push(`${s.pod.name} (idle ${s.idleHours}h): ${e.message}`);
       }
     }
-    await c.deletePod(podId);
-    steps.push("Deleted pod");
-    return text(`Pod ${podId} deleted.${steps.length > 1 ? ` (was running \u2192 auto-stopped first)` : ""}`);
+    return text(`Deleted ${deleted.length} stale pod(s):
+${deleted.map((d) => `  - ${d}`).join("\n")}${failed.length ? `
+
+Failed: ${failed.join(", ")}` : ""}`);
   })
 );
 server.tool(
@@ -21710,8 +21897,15 @@ server.tool(
     timeoutSeconds: external_exports.number().default(300).describe("Max wait time in seconds"),
     intervalSeconds: external_exports.number().default(10).describe("Poll interval in seconds")
   },
-  safeTool(async ({ podId, timeoutSeconds, intervalSeconds }) => {
-    const pod = await requireClient().waitForPod(podId, timeoutSeconds * 1e3, intervalSeconds * 1e3);
+  safeTool(async ({ podId, timeoutSeconds, intervalSeconds }, extra) => {
+    const onProgress = extra?.sendNotification ? (message) => {
+      extra.sendNotification({
+        method: "notifications/message",
+        params: { level: "info", logger: "wait_for_pod", data: message }
+      }).catch(() => {
+      });
+    } : void 0;
+    const pod = await requireClient().waitForPod(podId, timeoutSeconds * 1e3, intervalSeconds * 1e3, onProgress);
     return text(`Pod is ready!
 
 ${podSummary(pod)}`);

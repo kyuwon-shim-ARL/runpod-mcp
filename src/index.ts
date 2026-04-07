@@ -7,7 +7,7 @@ import type { Pod } from "./types.js";
 import { safeTool, text, errorResult } from "./tool-helpers.js";
 import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop } from "./pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix } from "./pod-ops.js";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 
@@ -162,7 +162,13 @@ server.tool(
     volumeInGb: z.number().default(20),
     sshPublicKey: z.string().optional(),
     env: z.record(z.string()).optional(),
-    networkVolumeId: z.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter."),
+    networkVolumeId: z.string().optional().describe("Attach existing network volume. When provided, the pod is automatically created in the volume's datacenter (dcPriority is ignored)."),
+    dcPriority: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Datacenter priority list for fallback when stock is tight. Tries each DC in order with each GPU type until a pod is created. Ignored when networkVolumeId is set (NV constrains the DC). Defaults to a built-in priority based on observed RunPod stock pool sizes (largest first): US-GA-1, US-CA-2, EU-SE-1, EU-CZ-1, AP-JP-1, US-TX-3, EU-RO-1."
+      ),
     optimizePytorch: z
       .boolean()
       .default(false)
@@ -180,15 +186,23 @@ server.tool(
     const c = requireClient();
     const gpuTypes = await c.listGpuTypes();
 
-    // Resolve datacenter affinity from network volume
-    let dataCenterIds: string[] | undefined;
+    // Resolve datacenter affinity from network volume.
+    // If NV is provided, the pod MUST run in NV's DC — dcPriority is ignored.
+    let nvDataCenterId: string | undefined;
     let volumeNote = "";
     if (args.networkVolumeId) {
       const vol = await c.getNetworkVolume(args.networkVolumeId);
       if (!vol) return text(`Network volume ${args.networkVolumeId} not found.`);
-      dataCenterIds = [vol.dataCenterId];
+      nvDataCenterId = vol.dataCenterId;
       volumeNote = `\nNetwork Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
     }
+
+    // DC iteration list:
+    //   - NV present  → only NV's DC (single)
+    //   - NV absent   → user-supplied dcPriority OR built-in default
+    const dcsToTry: string[] = nvDataCenterId
+      ? [nvDataCenterId]
+      : (args.dcPriority && args.dcPriority.length > 0 ? args.dcPriority : DEFAULT_DC_PRIORITY);
 
     const { candidates, errors } = selectGpuCandidates(gpuTypes, {
       gpuPreference: args.gpuPreference,
@@ -198,67 +212,80 @@ server.tool(
       maxBidPerGpu: args.maxBidPerGpu,
     });
 
-    for (const { gpu, gpuId, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning } of candidates) {
-      // Dry run: return selection info without creating pod
-      if (args.dryRun) {
-        const priceInfo = args.spot && bidPrice
-          ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)`
-          : `On-demand: $${ondemandPrice}/hr`;
-        const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
-        return text(
-          `## Dry Run — Preview Only (no pod created)\n\n` +
-            `GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})\n` +
-            `${priceInfo}\n` +
-            `Estimated monthly: $${monthlyCost.toFixed(0)}\n` +
-            `Image: ${args.imageName}\n` +
-            `GPU count: ${args.gpuCount}${overprovisionWarning}${volumeNote}\n\n` +
-            `Note: GPU availability may change between dry run and actual creation.\n\n` +
-            `## Next Steps\n→ create_pod_auto with same parameters and dryRun: false`
-        );
-      }
+    // Dry run: return preview from the first viable candidate WITHOUT iterating DCs.
+    // (We can't probe per-DC stock without actually creating, so dry run is best-effort.)
+    if (args.dryRun && candidates.length > 0) {
+      const { gpu, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning } = candidates[0];
+      const priceInfo = args.spot && bidPrice
+        ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)`
+        : `On-demand: $${ondemandPrice}/hr`;
+      const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
+      const dcNote = nvDataCenterId
+        ? `\nDatacenter: ${nvDataCenterId} (forced by network volume)`
+        : `\nDC fallback order: ${dcsToTry.join(" → ")}`;
+      return text(
+        `## Dry Run — Preview Only (no pod created)\n\n` +
+          `GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})\n` +
+          `${priceInfo}\n` +
+          `Estimated monthly: $${monthlyCost.toFixed(0)}\n` +
+          `Image: ${args.imageName}\n` +
+          `GPU count: ${args.gpuCount}${dcNote}${overprovisionWarning}${volumeNote}\n\n` +
+          `Note: per-DC stock cannot be probed without creating a pod. Real run will iterate DCs in the order shown.\n\n` +
+          `## Next Steps\n→ create_pod_auto with same parameters and dryRun: false`
+      );
+    }
 
-      try {
-        const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
+    // DC × GPU fallback loop. Outer = DC priority, inner = GPU preference.
+    // Per-attempt failures are recorded into a matrix for diagnostic output.
+    const failureMatrix: Array<{ dc: string; gpu: string; error: string }> = [];
 
-        const opts = {
-          name: args.name,
-          imageName: args.imageName,
-          gpuTypeIds: [gpuId],
-          gpuCount: args.gpuCount,
-          interruptible: args.spot,
-          containerDiskInGb: args.containerDiskInGb,
-          volumeInGb: args.volumeInGb,
-          volumeMountPath: "/workspace",
-          sshPublicKey: args.sshPublicKey,
-          ports: ["22/tcp"] as string[],
-          env: podEnv,
-          networkVolumeId: args.networkVolumeId,
-          dataCenterIds,
-          cloudType: args.cloudType,
-        };
+    for (const dc of dcsToTry) {
+      for (const { gpu, gpuId, stock, ondemandPrice, bidPrice, overprovisionWarning } of candidates) {
+        try {
+          const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
 
-        if (args.spot && bidPrice) {
-          const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+          const opts = {
+            name: args.name,
+            imageName: args.imageName,
+            gpuTypeIds: [gpuId],
+            gpuCount: args.gpuCount,
+            interruptible: args.spot,
+            containerDiskInGb: args.containerDiskInGb,
+            volumeInGb: args.volumeInGb,
+            volumeMountPath: "/workspace",
+            sshPublicKey: args.sshPublicKey,
+            ports: ["22/tcp"] as string[],
+            env: podEnv,
+            networkVolumeId: args.networkVolumeId,
+            dataCenterIds: [dc],
+            cloudType: args.cloudType,
+          };
+
+          if (args.spot && bidPrice) {
+            const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+            return text(
+              `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})\n` +
+                `Spot bid: $${bidPrice}/hr\n` +
+                `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\n` +
+                `## Next Steps\n→ wait_for_pod(podId: "${result.id}")`
+            );
+          }
+
+          const pod = await c.createPod(opts);
+          const dcLabel = nvDataCenterId ? dc : `${dc} (price: $${ondemandPrice}/hr)`;
           return text(
-            `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})\n` +
-              `Spot bid: $${bidPrice}/hr\n` +
-              `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\n` +
-              `## Next Steps\n→ wait_for_pod(podId: "${result.id}")`
+            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}\n\n` +
+              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`
           );
+        } catch (e) {
+          if (isAuthError(e)) return errorResult(e);
+          failureMatrix.push({ dc, gpu: gpu.displayName, error: (e as Error).message });
+          continue;
         }
-
-        const pod = await c.createPod(opts);
-        return text(
-          `Auto-selected GPU: ${gpu.displayName} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}\n\n` +
-            `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")`
-        );
-      } catch (e) {
-        if (isAuthError(e)) return errorResult(e);
-        errors.push(`${gpu.displayName}${stock === "Low" ? " (Low stock)" : ""}: ${(e as Error).message}`);
-        continue;
       }
     }
 
+    // Exhausted: build diagnostic output.
     const available = gpuTypes
       .filter((g) => g.memoryInGb >= args.minVram && getStockStatus(g) !== "Out of Stock")
       .sort((a, b) => {
@@ -268,18 +295,29 @@ server.tool(
       })
       .slice(0, 10);
 
-    const errMsg = errors.length ? `\n\nErrors encountered:\n${errors.join("\n")}` : "";
-    const nvConstraint = dataCenterIds
-      ? `\n\n⚠ Network volume constrains pods to datacenter ${dataCenterIds[0]}.${volumeNote}\nGPU availability in this datacenter may be limited. Alternatives shown below are global stock — NOT guaranteed in your datacenter.`
+    const matrixText = formatDcGpuFailureMatrix(failureMatrix);
+    const matrixBlock = matrixText
+      ? `\n\nFailure matrix (${failureMatrix.length} attempts across ${dcsToTry.length} DC × ${candidates.length} GPU):\n${matrixText}`
       : "";
+    const selectionErrors = errors.length ? `\n\nSelection errors:\n${errors.join("\n")}` : "";
+    const nvHint = nvDataCenterId
+      ? `\n\n⚠ Network volume ${args.networkVolumeId} constrains pods to ${nvDataCenterId}.${volumeNote}\n` +
+        `If this DC is dry, options:\n` +
+        `  1. Wait and retry — RunPod stock fluctuates.\n` +
+        `  2. Create a new network volume in a different DC (create_network_volume), upload data again, and retry.\n` +
+        `  3. Run without networkVolumeId to use dcPriority fallback (${DEFAULT_DC_PRIORITY.slice(0, 3).join(", ")}, ...).`
+      : `\n\nDC fallback order tried: ${dcsToTry.join(" → ")}\n` +
+        `All combinations exhausted. Try again later or override dcPriority with a different list.`;
+
     return text(
-      `No preferred GPU available.${nvConstraint}\n\nCheapest alternatives (global stock):\n\n` +
+      `No pod could be created.${nvHint}\n\nCheapest alternatives (global stock — NOT guaranteed in any specific DC):\n\n` +
         available.map((g) => {
           const price = getSpotPrice(g);
           const st = getStockStatus(g);
           return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
         }).join("\n") +
-        errMsg
+        matrixBlock +
+        selectionErrors
     );
   })
 );

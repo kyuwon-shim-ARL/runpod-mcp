@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { filterStalePods, selectGpuCandidates, deletePodWithStop } from "../pod-ops.js";
+import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix } from "../pod-ops.js";
 import type { Pod, GpuType } from "../types.js";
 
 // ── Helper factories ──
@@ -167,6 +167,53 @@ describe("orchestration: GPU selection → pod creation flow", () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0].overprovisionWarning).toContain("Overprovisioned");
     expect(candidates[0].overprovisionWarning).toContain("80GB");
+  });
+});
+
+// ── DC priority fallback (create_pod_auto helpers) ──
+
+describe("DEFAULT_DC_PRIORITY", () => {
+  it("contains expected DCs in priority order (largest pools first)", () => {
+    expect(DEFAULT_DC_PRIORITY[0]).toBe("US-GA-1");
+    expect(DEFAULT_DC_PRIORITY[1]).toBe("US-CA-2");
+    expect(DEFAULT_DC_PRIORITY).toContain("EU-SE-1");
+    expect(DEFAULT_DC_PRIORITY).toContain("AP-JP-1");
+    // US-TX-3 and EU-RO-1 are smaller pools — must be near the end
+    const txIdx = DEFAULT_DC_PRIORITY.indexOf("US-TX-3");
+    const gaIdx = DEFAULT_DC_PRIORITY.indexOf("US-GA-1");
+    expect(txIdx).toBeGreaterThan(gaIdx);
+  });
+
+  it("has no duplicates", () => {
+    const set = new Set(DEFAULT_DC_PRIORITY);
+    expect(set.size).toBe(DEFAULT_DC_PRIORITY.length);
+  });
+});
+
+describe("formatDcGpuFailureMatrix", () => {
+  it("returns empty string for empty input", () => {
+    expect(formatDcGpuFailureMatrix([])).toBe("");
+  });
+
+  it("groups attempts by DC and shows GPU + error per row", () => {
+    const out = formatDcGpuFailureMatrix([
+      { dc: "US-TX-3", gpu: "RTX 4090", error: "no stock" },
+      { dc: "US-TX-3", gpu: "A40", error: "could not find any pods" },
+      { dc: "AP-JP-1", gpu: "RTX 4090", error: "500 server error" },
+    ]);
+    expect(out).toContain("[US-TX-3]");
+    expect(out).toContain("[AP-JP-1]");
+    expect(out).toContain("RTX 4090");
+    expect(out).toContain("no stock");
+    // US-TX-3 group should appear before AP-JP-1 (insertion order)
+    expect(out.indexOf("[US-TX-3]")).toBeLessThan(out.indexOf("[AP-JP-1]"));
+  });
+
+  it("truncates very long error messages", () => {
+    const longErr = "x".repeat(500);
+    const out = formatDcGpuFailureMatrix([{ dc: "EU-RO-1", gpu: "A100", error: longErr }]);
+    expect(out).toContain("...");
+    expect(out.length).toBeLessThan(500);
   });
 });
 
