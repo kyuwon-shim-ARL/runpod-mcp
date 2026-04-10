@@ -1,0 +1,110 @@
+{
+  "_comment": [
+    "pipeline_spec.json — /gpu-exec 스킬 파이프라인 명세",
+    "mode: 'runpod' (GPU 원격 실행) | 'local' (로컬 장기 작업)",
+    "generate_pipeline.py --spec this_file 로 monitor.sh + gate_eval.py 생성"
+  ],
+
+  "pipeline_id": "exp-036-phaseABC",
+  "mode": "runpod",
+  "max_runtime_hours": 20,
+
+  "phases": [
+    {
+      "id": "train_activity",
+
+      "script": "scripts/train_chemprop_mcc.sh",
+      "_script_note": "스크립트 마지막 줄 필수: mv ${DONE_DIR}/.done.tmp ${DONE_DIR}/.done",
+      "_script_example": [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        "# ... training code ...",
+        "# 반드시 마지막 줄에 sentinel 생성",
+        "mv \"${DONE_DIR}/.done.tmp\" \"${DONE_DIR}/.done\""
+      ],
+
+      "sentinel_dir": "/workspace/project",
+      "_sentinel_note": "RunPod 원격 경로 (local 모드에서는 PROJECT_DIR 기준 상대경로 또는 절대경로)",
+
+      "upload": {
+        "local_paths": ["src/", "scripts/", "data/chemprop/"],
+        "remote_dest": "/workspace/project",
+        "_note": "local 모드에서는 이 블록 무시됨"
+      },
+
+      "outputs": [
+        "models/chemprop_activity/best_model.pt",
+        "results/train_activity_metrics.json"
+      ],
+      "_outputs_note": "DOWNLOADING 단계에서 RunPod → 로컬로 rsync. local 모드는 이미 로컬에 있으므로 무시.",
+
+      "gate": {
+        "metrics_file": "results/train_activity_metrics.json",
+        "_metrics_file_note": "PROJECT_DIR 기준 상대경로",
+        "condition": "rho>=0.30 AND auc_prc>=0.40 AND precision_at_recall>=0.30",
+        "_condition_note": [
+          "지원 연산자: >=, <=, ==, !=, >, <",
+          "지원 논리: AND (OR 미지원)",
+          "메트릭 키 형식: \\w+ (영숫자+밑줄만, 공백 불가 — 'val_loss' O, 'val loss' X)"
+        ],
+        "on_fail": "halt",
+        "_on_fail_note": "'halt' = 파이프라인 중단 + 이메일 알림 (현재 유일한 옵션)"
+      }
+    },
+
+    {
+      "id": "train_selectivity",
+      "_comment": "두 번째 phase 예시 — 첫 번째 gate pass 후 자동 진행",
+
+      "script": "scripts/train_selectivity.sh",
+      "sentinel_dir": "/workspace/project",
+
+      "upload": {
+        "local_paths": ["scripts/", "data/selectivity/"],
+        "remote_dest": "/workspace/project"
+      },
+
+      "outputs": ["models/selectivity/best_model.pt"],
+
+      "gate": {
+        "metrics_file": "results/selectivity_metrics.json",
+        "condition": "auc>=0.80",
+        "on_fail": "halt"
+      }
+    }
+  ],
+
+  "notifications": {
+    "email": "user@example.com",
+    "on": ["phase_complete", "gate_fail", "pipeline_done", "error"],
+    "_note": "send-email CLI (~/bin/send-email) 필요. 이메일 미설정 시 빈 문자열로 놔두면 알림 스킵."
+  },
+
+  "runpod": {
+    "gpu_type_id": "NVIDIA A100 80GB PCIe",
+    "image_name": "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
+    "network_volume_id": "FILL_ME",
+    "_note": "mode='local' 시 이 블록 생략 가능 (없으면 빈 문자열로 처리)"
+  },
+
+  "_local_mode_example": {
+    "_comment": "mode=local 최소 예시 (RunPod 없이 로컬 장기 작업)",
+    "pipeline_id": "local-long-train-001",
+    "mode": "local",
+    "max_runtime_hours": 48,
+    "phases": [
+      {
+        "id": "preprocess",
+        "script": "scripts/preprocess.sh",
+        "sentinel_dir": "/home/user/project/outputs",
+        "outputs": ["outputs/processed_data.csv"],
+        "gate": {
+          "metrics_file": "outputs/preprocess_metrics.json",
+          "condition": "rows>=1000",
+          "on_fail": "halt"
+        }
+      }
+    ],
+    "notifications": {"email": "user@example.com", "on": ["pipeline_done", "gate_fail", "error"]}
+  }
+}
