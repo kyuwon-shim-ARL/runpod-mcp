@@ -273,7 +273,9 @@ async function main() {
   console.log(`[${new Date().toISOString()}] Watchdog complete: ${checked} pods checked, ${idle} idle, ${stopped} stopped`);
 }
 
-main().catch((e) => {
-  console.error("Watchdog error:", e);
-  process.exit(1);
-});
+if (!process.env.VITEST) {
+  main().catch((e) => {
+    console.error("Watchdog error:", e);
+    process.exit(1);
+  });
+}
