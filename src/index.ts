@@ -1307,6 +1307,169 @@ server.tool(
   })
 );
 
+// ── plan_gpu_job ──
+server.tool(
+  "plan_gpu_job",
+  "Pre-flight planning for a GPU job. Given a job description, recommends GPU, estimates total cost, determines if a staging pod + network volume are needed, and optionally generates a /gpu-exec pipeline_spec.json stub. Call this BEFORE create_pod_auto to avoid idle billing and wrong GPU selection.",
+  {
+    purpose: z.string().describe("What you're training/running (e.g. 'Fine-tune LLaMA 3 8B on 22GB dataset')"),
+    datasetGb: z.number().optional().describe("Dataset size in GB to transfer to the pod"),
+    modelSizeGb: z.number().optional().describe("Approximate model VRAM requirement in GB (used to filter GPUs)"),
+    gpuCount: z.number().default(1).describe("Desired number of GPUs for the training pod"),
+    expectedHours: z.number().optional().describe("Estimated training duration in hours"),
+    gpuPreference: z.array(z.string()).optional().describe("Preferred GPU types in order. Defaults to RTX 3090 / 4090 / A40 / A5000"),
+    outputSpecPath: z.string().optional().describe("If set, write a /gpu-exec pipeline_spec.json stub to this path"),
+  },
+  safeTool(async (args) => {
+    const DEFAULT_MIN_VRAM_GB = 12;
+    const NV_COST_PER_GB_MONTH = 0.07;
+
+    const c = requireClient();
+    const allGpuTypes = await c.listGpuTypes();
+
+    const minVram = args.modelSizeGb ?? DEFAULT_MIN_VRAM_GB;
+    const prefList = args.gpuPreference ?? ["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000"];
+
+    // Filter: on-demand price available + meets VRAM requirement
+    const eligible = allGpuTypes.filter(g => getOnDemandPrice(g) != null && g.memoryInGb >= minVram);
+
+    // Sort: prefer gpuPreference order, then ascending price
+    eligible.sort((a, b) => {
+      const ai = prefList.indexOf(a.displayName);
+      const bi = prefList.indexOf(b.displayName);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
+      return (getOnDemandPrice(a) ?? 999) - (getOnDemandPrice(b) ?? 999);
+    });
+
+    const recommended = eligible[0];
+    const partialMode = !recommended;
+
+    // NV sizing
+    const datasetGb = args.datasetGb ?? 0;
+    const estimatedOutputGb = args.modelSizeGb != null ? args.modelSizeGb * 2 : 5;
+    const nvRaw = Math.ceil((datasetGb + estimatedOutputGb) * 1.3);
+    const nvGb = Math.max(50, nvRaw);
+    const stagingNeeded = datasetGb > 0.5;
+
+    // Cost helpers
+    const fmtCost = (n: number) => `~$${n.toFixed(2)}`;
+    const gpuPrice = recommended ? (getOnDemandPrice(recommended) ?? 0) : 0;
+    const cheapest1gpu = eligible.length > 0 ? (getOnDemandPrice(eligible[0]) ?? 0) : 0;
+
+    const stagingHours = stagingNeeded ? Math.max(1, Math.ceil(datasetGb / 50)) : 0;
+    const stagingCost = stagingNeeded ? stagingHours * cheapest1gpu : 0;
+    const validationCost = gpuPrice * 1;
+    const trainingCost = args.expectedHours != null ? gpuPrice * args.expectedHours * args.gpuCount : null;
+    const nvCost = nvGb * NV_COST_PER_GB_MONTH;
+
+    // Build output
+    const lines: string[] = [];
+
+    lines.push(`## GPU Job Plan: ${args.purpose}`);
+    lines.push(``);
+
+    if (partialMode) {
+      lines.push(`⚠️ **PARTIAL PLAN** — No on-demand GPU meets VRAM requirement (${minVram}GB).`);
+      lines.push(`Try reducing \`modelSizeGb\` or check \`list_gpu_types\` for available options.`);
+    } else {
+      lines.push(`### Recommended GPU`);
+      lines.push(`**${recommended.displayName}** (${recommended.memoryInGb}GB VRAM) × ${args.gpuCount} — $${gpuPrice}/hr each`);
+      lines.push(`Reason: cheapest on-demand GPU meeting ${minVram}GB VRAM requirement`);
+    }
+
+    lines.push(``);
+    lines.push(`### Cost Estimate`);
+    lines.push(`| Item | Detail | Cost |`);
+    lines.push(`|------|--------|------|`);
+    if (stagingNeeded) {
+      lines.push(`| Staging pod (data transfer) | ${stagingHours}hr × $${cheapest1gpu.toFixed(2)}/hr × 1 GPU | ${fmtCost(stagingCost)} |`);
+    }
+    if (!partialMode) {
+      lines.push(`| Validation pod (1-GPU test) | 1hr × $${gpuPrice.toFixed(2)}/hr | ${fmtCost(validationCost)} |`);
+      lines.push(`| Training pod | ${args.expectedHours != null ? `${args.expectedHours}hr × $${gpuPrice.toFixed(2)}/hr × ${args.gpuCount} GPU` : "expectedHours not provided"} | ${trainingCost != null ? fmtCost(trainingCost) : "N/A"} |`);
+    }
+    lines.push(`| Network Volume (${nvGb}GB) | $${NV_COST_PER_GB_MONTH}/GB/mo | ${fmtCost(nvCost)}/mo |`);
+    if (!partialMode && trainingCost != null) {
+      const total = stagingCost + validationCost + trainingCost;
+      lines.push(`| **Total (excl. NV)** | | **${fmtCost(total)}** |`);
+    }
+
+    lines.push(``);
+    lines.push(`### Staging Pattern`);
+    if (stagingNeeded) {
+      lines.push(`⚠️ Dataset ${datasetGb}GB > 500MB — **staging pod required** to avoid paying GPU rates during upload.`);
+      lines.push(`1. \`create_network_volume(${nvGb}GB)\` — ceil((${datasetGb} + ${estimatedOutputGb}) × 1.3) = ${nvRaw}GB → min 50GB`);
+      lines.push(`2. \`create_pod_auto(cheapest 1-GPU, networkVolumeId)\` → upload data → delete pod`);
+      lines.push(`3. \`create_pod_auto(${recommended?.displayName ?? "target GPU"} × ${args.gpuCount}, networkVolumeId)\` → train → delete pod`);
+    } else {
+      lines.push(`✅ Dataset ${datasetGb > 0 ? `${datasetGb}GB` : "not specified"} — direct upload on training pod is fine (< 500MB threshold).`);
+    }
+
+    lines.push(``);
+    lines.push(`### NV Sizing`);
+    lines.push(`\`ceil((datasetGb=${datasetGb} + estimatedOutputGb=${estimatedOutputGb}) × 1.3)\` = ${nvRaw}GB → **${nvGb}GB** (min 50GB)`);
+    lines.push(`Cost: ~$${(nvGb * NV_COST_PER_GB_MONTH).toFixed(2)}/mo`);
+
+    lines.push(``);
+    lines.push(`### Pre-flight Checklist`);
+    lines.push(`[ ] 1. 로컬 전처리 완료 (tokenization, feature extraction 등 GPU 불필요한 작업)`);
+    lines.push(`[ ] 2. 학습 코드 로컬 테스트 통과 (import, forward pass, 설정 파일 확인)`);
+    lines.push(`[ ] 3. 체크포인트 저장 경로 설정 (/workspace/checkpoints/ 또는 NV 경로)`);
+    lines.push(`[ ] 4. NV 크기 확인: ${nvGb}GB 준비`);
+    if (args.gpuCount >= COST_GATE_GPU_COUNT) {
+      lines.push(`[ ] 5. **1-GPU 검증 테스트 완료** (gpuCount=${args.gpuCount} — 고비용 팟 전 필수)`);
+    }
+
+    lines.push(``);
+    lines.push(`### Next Steps`);
+    lines.push(`1. 체크리스트 완료 후: \`create_pod_auto(dryRun: true, gpuCount: ${args.gpuCount}, ...)\` 로 GPU 선택 재확인`);
+    if (args.outputSpecPath) {
+      lines.push(`2. /gpu-exec 파이프라인: \`pipeline_spec.json\` stub → \`${args.outputSpecPath}\``);
+    } else {
+      lines.push(`2. /gpu-exec 파이프라인이 필요하면 \`outputSpecPath\` 파라미터로 \`pipeline_spec.json\` stub 생성 가능`);
+    }
+
+    // Write pipeline_spec stub if requested
+    if (args.outputSpecPath) {
+      const specPath = isAbsolute(args.outputSpecPath) ? args.outputSpecPath : resolve(process.cwd(), args.outputSpecPath);
+      const stub = {
+        pipeline_id: `plan-${Date.now()}`,
+        mode: "runpod",
+        gpu: recommended?.displayName ?? "FILL_IN",
+        gpu_count: args.gpuCount,
+        network_volume_gb: nvGb,
+        phases: [
+          ...(stagingNeeded ? [{
+            id: "upload",
+            purpose: "Data transfer",
+            gpu: "cheapest-1gpu",
+            steps: [`Upload dataset (${datasetGb}GB) to /workspace/data/`]
+          }] : []),
+          {
+            id: "train",
+            purpose: args.purpose,
+            gpu: recommended?.displayName ?? "FILL_IN",
+            gpu_count: args.gpuCount,
+            steps: ["Run training script", "Save checkpoint to /workspace/checkpoints/"],
+            gate: "FILL_IN: e.g. {\"metric\": \"val_loss\", \"threshold\": 0.5, \"op\": \"<\"}"
+          }
+        ]
+      };
+      try {
+        await mkdir(dirname(specPath), { recursive: true });
+        await writeFile(specPath, JSON.stringify(stub, null, 2), "utf-8");
+        lines.push(`\n✅ pipeline_spec.json stub 생성됨: \`${specPath}\``);
+      } catch (e) {
+        lines.push(`\n⚠️ pipeline_spec.json 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    return text(lines.join("\n"));
+  })
+);
+
 // ══════════════════════════════════════════
 //  START
 // ══════════════════════════════════════════
