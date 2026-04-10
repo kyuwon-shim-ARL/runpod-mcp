@@ -1,5 +1,46 @@
 # runpod-mcp: Claude Code Project Instructions
 
+## COST SAFETY RULES (최우선 적용 — 다른 규칙보다 상위)
+
+GPU 시간 = 돈. 훈련에만 써야 한다.
+
+### 팟 생성 순서 (반드시 지킬 것)
+
+```
+1. 로컬 서버에서 전처리 완료  ← GPU 불필요한 작업 전부 여기서
+2. 전송 전용 팟 생성 (1-GPU 최저가, ~$0.1-0.6/hr) → 데이터 전송 → 팟 삭제
+   ├─ 데이터 > 50GB: containerDiskInGb=200, rootfs에 직접 (NV quota trap 회피)
+   └─ 데이터 ≤ 50GB: NV 50GB 생성 → 팟 마운트 → 전송 → 팟만 삭제, NV 보존
+3. 로컬 or 1-GPU로 검증 테스트 (VRAM, 속도, 코드 정상 동작 확인)
+4. 검증 통과 후 실제 GPU 팟 생성 (4-GPU 등 고비용)
+5. 훈련 → 결과 수집 → 팟 즉시 삭제 (stop 금지 — 과금 계속됨)
+```
+
+### 절대 금지 (위반 시 즉시 수정)
+
+- **4-GPU 팟(gpuCount ≥ 2)에서 데이터 전송** — $1.36/hr으로 9시간 전송 = $12 낭비 (T14/T15 사고 이력)
+- **GPU 팟 먼저 생성 후 데이터 준비** — idle 과금 (T3 사고 이력)
+- **pod stop** — 항상 delete (stop은 과금 계속됨)
+- **검증 없이 바로 4-GPU 팟** — 코드 버그로 고비용 팟 낭비
+
+### costSafetyConfirmed 사용 규칙
+
+`create_pod_auto`에서 gpuCount >= 2 + dryRun: false 호출 시 `costSafetyConfirmed: true` 없으면 사전 차단됨.
+- `costSafetyConfirmed: true`는 **사용자가 체크리스트를 직접 확인한 후 명시적으로 재호출을 요청할 때만** 전달.
+- **Claude가 사용자 동의 없이 자동으로 true를 설정하여 차단을 우회하는 것은 엄격히 금지.**
+
+### MIGRATION_THRESHOLD (gpu_cost_compare 결과 기준)
+
+- 온디맨드 기준 **20%+ 저렴한 대안** → 마이그레이션 강력 권유 (스팟 제외 — NEVER spot 규칙)
+- 근거: Pod 삭제+재생성 소요 ~15분 = 전환 비용 약 $0.1-0.3. 20% 미만 절약이면 전환 비용이 절약분을 상쇄.
+- 성능 차이(속도)와 데이터 이전 비용을 함께 고지. 최종 결정은 사용자.
+
+### 예외 (사용자가 명시적으로 요청한 경우만)
+
+사용자가 "바로 4-GPU로 해줘" 등을 명시하면: 위험을 경고한 뒤 진행. 경고 없이 진행 금지.
+
+---
+
 ## GPU Optimization Workflow
 
 When a user is doing ML training on RunPod, follow this optimization pattern:
@@ -42,8 +83,13 @@ User requests GPU work
 │       │       └─ Started but low VRAM → Increase batch size or use smaller GPU
 │       │
 │       ├─ UNDERUTILIZED (30-59%)
-│       │   └─ Suggest: increase batch size (provide perSampleMb for recommendation)
-│       │       Then: call gpu_cost_compare for cheaper alternatives
+│       │   ├─ NV 미바운드 (networkVolumeId 없음) → gpu_cost_compare 즉시 호출 [필수]
+│       │   │     비교 풀: 온디맨드만 (스팟 제외 — NEVER spot 규칙)
+│       │   │     결과: 현재 대비 MIGRATION_THRESHOLD(20%)+ 저렴한 대안 → 마이그레이션 강력 권유
+│       │   │     (사용자 결정. 데이터 이전 비용·속도 차이 함께 고지)
+│       │   ├─ NV 바운드 (networkVolumeId 있음) → gpu_cost_compare 선택적 권고
+│       │   │     (GPU 변경 시 NV DC 제약으로 NV 재생성 필요함을 명시)
+│       │   └─ 병행: increase batch size (provide perSampleMb for recommendation)
 │       │
 │       ├─ MODERATE (60-74%)
 │       │   └─ Acceptable. Suggest batch size increase if easy.

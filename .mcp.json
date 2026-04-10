@@ -2,7 +2,7 @@
   "mcpServers": {
     "runpod": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/runpod-mcp.mjs"],
+      "args": ["/home/kyuwon/projects/runpod-mcp/dist/runpod-mcp.mjs"],
       "env": {
         "RUNPOD_API_KEY": "${RUNPOD_API_KEY}",
         "SSH_KEY_PATH": "${SSH_KEY_PATH}"

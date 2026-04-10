@@ -11,6 +11,9 @@ import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
 import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
 
+const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
+const COST_GATE_HOURLY_USD = 1.0;    // ondemandPrice * gpuCount >= this triggers gate
+
 const API_KEY = process.env.RUNPOD_API_KEY;
 
 const SETUP_MSG =
@@ -173,7 +176,7 @@ server.tool(
 // ── create_pod_auto ──
 server.tool(
   "create_pod_auto",
-  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.",
+  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.\n⚠️ costSafetyConfirmed는 사용자가 직접 확인한 경우에만 true로 설정하세요. Claude가 자동으로 true를 설정하는 것은 엄격히 금지됩니다.",
   {
     name: z.string().describe("Pod name"),
     imageName: z.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"),
@@ -208,8 +211,58 @@ server.tool(
       .boolean()
       .default(false)
       .describe("Preview GPU selection and cost estimate without creating a pod. Note: GPU availability may change between dry run and actual creation."),
+    costSafetyConfirmed: z
+      .boolean()
+      .optional()
+      .describe("Set to true only after the user has reviewed the cost safety checklist. Required for gpuCount >= 2 with dryRun: false."),
   },
   safeTool(async (args) => {
+    // Cost safety gate: multi-GPU pods require explicit user confirmation.
+    // Tries MCP Elicitation first (Claude Code >= v2.1.76); falls back to boolean gate for older clients.
+    if (args.gpuCount >= COST_GATE_GPU_COUNT && !args.dryRun) {
+      const mcpServer = (server as any).server;
+      const hasElicitation = mcpServer?._clientCapabilities?.elicitation !== undefined;
+      const booleanFallback = () => !args.costSafetyConfirmed
+        ? text(
+            `⚠️ COST SAFETY CHECK (gpuCount=${args.gpuCount})\n` +
+            `고비용 팟 생성 전 확인하세요:\n` +
+            `[ ] 1. 데이터/코드가 이미 준비됨 (로컬 전처리 or 전송 팟 완료)\n` +
+            `[ ] 2. 1-GPU로 검증 테스트 완료됨 (VRAM·속도·코드 정상 동작)\n\n` +
+            `확인 완료 후 동일 파라미터에 costSafetyConfirmed: true를 추가해 재호출하세요.`
+          )
+        : null;
+
+      if (hasElicitation) {
+        try {
+          const elicitResult = await mcpServer.elicitInput({
+            message: `⚠️ COST SAFETY CHECK (gpuCount=${args.gpuCount})\n고비용 팟 생성 전 확인하세요:\n[ ] 1. 데이터/코드가 이미 준비됨 (로컬 전처리 or 전송 팟 완료)\n[ ] 2. 1-GPU로 검증 테스트 완료됨 (VRAM·속도·코드 정상 동작)\n\n위 항목을 확인했으면 승인하세요.`,
+            requestedSchema: {
+              type: 'object' as const,
+              properties: {
+                confirmed: {
+                  type: 'boolean' as const,
+                  title: '비용 안전 체크리스트 확인 완료',
+                  description: '위 항목을 모두 확인했습니다',
+                  default: false
+                }
+              },
+              required: ['confirmed']
+            }
+          });
+          const approved = elicitResult?.action === 'accept' && elicitResult?.content?.confirmed === true;
+          if (!approved) {
+            return text(`🚫 취소됨. 체크리스트 확인 후 재시도하세요.\n(elicitation action: ${elicitResult?.action ?? 'null'})`);
+          }
+        } catch {
+          const blocked = booleanFallback();
+          if (blocked) return blocked;
+        }
+      } else {
+        const blocked = booleanFallback();
+        if (blocked) return blocked;
+      }
+    }
+
     const c = requireClient();
     const gpuTypes = await c.listGpuTypes();
 
@@ -251,6 +304,7 @@ server.tool(
         ? `\nDatacenter: ${nvDataCenterId} (forced by network volume)`
         : `\nDC fallback order: ${dcsToTry.join(" → ")}`;
       return text(
+        (args.gpuCount >= 2 ? `⚠️ COST SAFETY REMINDER: 실제 생성(dryRun: false) 시 사전 차단이 발동됩니다.\n\n` : ``) +
         `## Dry Run — Preview Only (no pod created)\n\n` +
           `GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})\n` +
           `${priceInfo}\n` +
@@ -386,7 +440,7 @@ server.tool(
   { podId: z.string() },
   safeTool(async ({ podId }) => {
     await requireClient().stopPod(podId);
-    return text(`Pod ${podId} stop requested.`);
+    return text(`⚠️ 주의: stop은 과금이 계속됩니다. 훈련이 완료되었으면 delete_pod를 사용하세요.\n\nPod ${podId} stop requested.`);
   })
 );
 
