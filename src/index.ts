@@ -1318,6 +1318,8 @@ server.tool(
     gpuCount: z.number().default(1).describe("Desired number of GPUs for the training pod"),
     expectedHours: z.number().optional().describe("Estimated training duration in hours"),
     gpuPreference: z.array(z.string()).optional().describe("Preferred GPU types in order. Defaults to RTX 3090 / 4090 / A40 / A5000"),
+    seedCount: z.number().default(1).describe("Number of random seeds to run (e.g. 3 for seed 42/123/456). When > 1, shows parallel pod pattern instead of sequential — same cost, N× faster."),
+    armCount: z.number().default(1).describe("Number of experimental arms/conditions (e.g. 2 for T14 vs T15). Total pods = armCount × seedCount."),
     outputSpecPath: z.string().optional().describe("If set, write a /gpu-exec pipeline_spec.json stub to this path"),
   },
   safeTool(async (args) => {
@@ -1420,6 +1422,50 @@ server.tool(
     lines.push(`[ ] 4. NV 크기 확인: ${nvGb}GB 준비`);
     if (args.gpuCount >= COST_GATE_GPU_COUNT) {
       lines.push(`[ ] 5. **1-GPU 검증 테스트 완료** (gpuCount=${args.gpuCount} — 고비용 팟 전 필수)`);
+    }
+
+    lines.push(``);
+    // Seed parallelization section
+    if (args.seedCount > 1) {
+      const totalPods = args.seedCount * args.armCount;
+      const defaultSeeds = [42, 123, 456, 789, 999];
+      const seeds = defaultSeeds.slice(0, args.seedCount);
+
+      lines.push(``);
+      lines.push(`### ⚠️ Seed 병렬화 필수 (seedCount=${args.seedCount})`);
+      lines.push(`**순차 실행 금지 — 같은 비용에 ${args.seedCount}배 느려짐.**`);
+      lines.push(`arm당 seed ${args.seedCount}개는 ${args.seedCount}팟 동시 생성. DDP 불필요, 단순 병렬.`);
+      lines.push(``);
+
+      // Sequential vs parallel comparison
+      lines.push(`| 방식 | 소요 시간 | 비용 |`);
+      lines.push(`|------|----------|------|`);
+      if (args.expectedHours != null) {
+        const seqHours = args.expectedHours * args.seedCount;
+        const parHours = args.expectedHours;
+        const seqCost = gpuPrice * seqHours * args.gpuCount;
+        const parCost = gpuPrice * parHours * args.gpuCount * args.seedCount;
+        lines.push(`| 순차 실행 (${args.seedCount} seed × 1팟) | ${seqHours}hr | ${fmtCost(seqCost)} |`);
+        lines.push(`| **병렬 실행 (${args.seedCount}팟 동시)** | **${parHours}hr** | **${fmtCost(parCost)}** |`);
+      } else {
+        lines.push(`| 순차 실행 | ${args.seedCount}× 소요 시간 | 동일 비용 |`);
+        lines.push(`| **병렬 실행** | **1× 소요 시간** | **동일 비용** |`);
+      }
+
+      lines.push(``);
+      lines.push(`**총 팟 수:** ${totalPods}개 (${args.armCount}arm × ${args.seedCount}seed)`);
+      lines.push(``);
+
+      // Per-seed pod creation pattern
+      lines.push(`**팟 생성 패턴${args.armCount > 1 ? ` (arm 1개 기준, × ${args.armCount} 반복)` : ""}:**`);
+      seeds.forEach((seed, i) => {
+        lines.push(`\`create_pod_auto({ env: { SEED: "${seed}" }, ... })  # seed ${i + 1}/${args.seedCount}\``);
+      });
+
+      if (args.armCount > 1) {
+        lines.push(``);
+        lines.push(`> arm이 ${args.armCount}개이면 위 패턴을 arm별로 반복 → 총 **${totalPods}팟 동시** 실행`);
+      }
     }
 
     lines.push(``);

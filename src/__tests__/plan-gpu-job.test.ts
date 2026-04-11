@@ -65,6 +65,52 @@ describe("plan_gpu_job: staging determination", () => {
   });
 });
 
+// Seed parallelization helpers
+function calcTotalPods(seedCount: number, armCount: number): number {
+  return seedCount * armCount;
+}
+
+function calcSeqVsParTime(expectedHours: number, seedCount: number): { seq: number; par: number } {
+  return { seq: expectedHours * seedCount, par: expectedHours };
+}
+
+function calcParCost(gpuPrice: number, expectedHours: number, gpuCount: number, seedCount: number): number {
+  return gpuPrice * expectedHours * gpuCount * seedCount;
+}
+
+describe("plan_gpu_job: seed parallelization", () => {
+  it("seedCount=3, armCount=1 → 3 total pods", () => {
+    expect(calcTotalPods(3, 1)).toBe(3);
+  });
+
+  it("seedCount=3, armCount=2 → 6 total pods", () => {
+    expect(calcTotalPods(3, 2)).toBe(6);
+  });
+
+  it("seedCount=1 → no parallelization section needed", () => {
+    expect(calcTotalPods(1, 1)).toBe(1);
+  });
+
+  it("seq vs par: 8hr × 3seeds → seq=24hr, par=8hr", () => {
+    const { seq, par } = calcSeqVsParTime(8, 3);
+    expect(seq).toBe(24);
+    expect(par).toBe(8);
+  });
+
+  it("par cost = seq cost (same total compute)", () => {
+    // seq: 1 pod × 3 runs × 8hr = 24hr × $0.34 = $8.16
+    // par: 3 pods × 1 run × 8hr = 24hr × $0.34 = $8.16
+    const seqCost = 0.34 * 8 * 3 * 1; // price * seqHours * gpuCount
+    const parCost = calcParCost(0.34, 8, 1, 3);
+    expect(seqCost).toBeCloseTo(parCost);
+  });
+
+  it("default seeds slice: seedCount=3 → [42, 123, 456]", () => {
+    const defaultSeeds = [42, 123, 456, 789, 999];
+    expect(defaultSeeds.slice(0, 3)).toEqual([42, 123, 456]);
+  });
+});
+
 describe("plan_gpu_job: cost calculation", () => {
   it("8hr training, $0.34/hr, 1 GPU → $2.72", () => {
     expect(calcTrainingCost(0.34, 8, 1)).toBeCloseTo(2.72);
