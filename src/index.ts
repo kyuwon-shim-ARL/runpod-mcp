@@ -2,7 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { RunPodClient, spawnAsync } from "./api.js";
 import type { Pod } from "./types.js";
@@ -215,8 +216,40 @@ server.tool(
       .boolean()
       .optional()
       .describe("Set to true only after the user has reviewed the cost safety checklist. Required for gpuCount >= 2 with dryRun: false."),
+    nvReadinessToken: z
+      .string()
+      .optional()
+      .describe("Token from verify_data_on_nv. Required when gpuCount >= 2 AND networkVolumeId is set (ensures data was verified on NV before launching expensive multi-GPU pod)."),
   },
   safeTool(async (args) => {
+    // NV readiness token check: multi-GPU + NV requires prior verify_data_on_nv call
+    if (args.gpuCount >= COST_GATE_GPU_COUNT && args.networkVolumeId && !args.dryRun) {
+      if (!args.nvReadinessToken) {
+        return text(
+          `⚠️ NV READINESS TOKEN REQUIRED (gpuCount=${args.gpuCount}, networkVolumeId=${args.networkVolumeId})\n` +
+          `고비용 다중-GPU 팟 생성 전 데이터 검증이 필요합니다:\n` +
+          `1. 스테이징 팟에서 데이터 전송 완료\n` +
+          `2. verify_data_on_nv(podId, requiredPaths) 호출 → 토큰 발급\n` +
+          `3. 발급된 토큰을 nvReadinessToken 파라미터에 전달해 재호출하세요.`
+        );
+      }
+      // Validate token
+      try {
+        const tokenPath = `${NV_READY_DIR}/nv_ready_${args.networkVolumeId}.json`;
+        const tokenRaw = await readFile(tokenPath, "utf-8");
+        const tokenData = JSON.parse(tokenRaw) as { token: string; nvId: string; verifiedAt: string };
+        if (tokenData.token !== args.nvReadinessToken) {
+          return text(`❌ NV readiness token mismatch for volume ${args.networkVolumeId}. Re-run verify_data_on_nv to get a fresh token.`);
+        }
+        const ageHours = (Date.now() - new Date(tokenData.verifiedAt).getTime()) / 3_600_000;
+        if (ageHours > TOKEN_TTL_HOURS) {
+          return text(`❌ NV readiness token expired (${ageHours.toFixed(1)}h old, TTL=${TOKEN_TTL_HOURS}h). Re-run verify_data_on_nv.`);
+        }
+      } catch {
+        return text(`❌ NV readiness token file not found for volume ${args.networkVolumeId}. Run verify_data_on_nv first.`);
+      }
+    }
+
     // Cost safety gate: multi-GPU pods require explicit user confirmation.
     // Tries MCP Elicitation first (Claude Code >= v2.1.76); falls back to boolean gate for older clients.
     if (args.gpuCount >= COST_GATE_GPU_COUNT && !args.dryRun) {
@@ -1468,6 +1501,21 @@ server.tool(
       }
     }
 
+    // Container disk warning
+    const DEFAULT_CONTAINER_DISK_GB = 30;
+    const diskEstimateGb = ((args.modelSizeGb ?? 5) + datasetGb * 0.1 + 2) * args.gpuCount;
+    const diskThreshold = DEFAULT_CONTAINER_DISK_GB * 0.7;
+    lines.push(``);
+    lines.push(`### Container Disk`);
+    if (diskEstimateGb > diskThreshold) {
+      const recommendedDisk = Math.ceil(diskEstimateGb * 1.5);
+      lines.push(`⚠️ **Container disk warning**: estimated experiment output ~${diskEstimateGb.toFixed(1)}GB (model + tmp + logs × gpuCount=${args.gpuCount}) exceeds 70% of RunPod default ${DEFAULT_CONTAINER_DISK_GB}GB disk.`);
+      lines.push(`→ Set \`containerDiskInGb: ${recommendedDisk}\` in create_pod_auto`);
+      lines.push(`→ Formula: (modelSizeGb=${args.modelSizeGb ?? 5} + datasetGb×0.1=${(datasetGb * 0.1).toFixed(1)} + 2) × gpuCount=${args.gpuCount} = ${diskEstimateGb.toFixed(1)}GB`);
+    } else {
+      lines.push(`✅ Estimated disk usage ~${diskEstimateGb.toFixed(1)}GB — within 70% of default ${DEFAULT_CONTAINER_DISK_GB}GB container disk.`);
+    }
+
     lines.push(``);
     lines.push(`### Next Steps`);
     lines.push(`1. 체크리스트 완료 후: \`create_pod_auto(dryRun: true, gpuCount: ${args.gpuCount}, ...)\` 로 GPU 선택 재확인`);
@@ -1510,6 +1558,385 @@ server.tool(
       } catch (e) {
         lines.push(`\n⚠️ pipeline_spec.json 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+
+    return text(lines.join("\n"));
+  })
+);
+
+// ══════════════════════════════════════════
+//  COST SAFETY PHASE 1 TOOLS
+// ══════════════════════════════════════════
+
+const NV_READY_DIR = ".omc/gpu-exec";
+const TOKEN_TTL_HOURS = 72;
+
+// ── verify_data_on_nv ──
+server.tool(
+  "verify_data_on_nv",
+  "Verify that a dataset has been successfully transferred to a Network Volume by " +
+  "SSHing to a mounted staging pod and checking file existence + sizes. Returns a " +
+  "readiness token (valid 72h) that create_pod_auto requires when gpuCount >= 2 + networkVolumeId. " +
+  "Call this BEFORE deleting the staging pod — token requires pod to still be RUNNING.",
+  {
+    podId: z.string().describe("ID of the RUNNING staging pod with the NV mounted"),
+    requiredPaths: z.array(z.string()).describe(
+      "Paths to verify on /workspace/ (e.g. ['data/train.jsonl', 'data/val.jsonl'])"
+    ),
+    minTotalGb: z.number().optional().describe(
+      "Minimum total size in GB across all paths. Fails if smaller (catches truncation)."
+    ),
+  },
+  safeTool(async ({ podId, requiredPaths, minTotalGb }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    if (!pod) return text(`❌ Pod ${podId} not found. verify_data_on_nv requires the staging pod to still be RUNNING. Call this tool BEFORE deleting the staging pod.`);
+
+    const nvId = pod.networkVolumeId;
+    if (!nvId) return text(`❌ Pod ${podId} has no Network Volume attached. Cannot issue NV readiness token.`);
+
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text(`❌ Pod ${podId} is not ready for SSH. Run wait_for_pod first.`);
+
+    const lines: string[] = [`## verify_data_on_nv — ${podId}`];
+    let totalBytes = 0;
+    const pathResults: string[] = [];
+
+    for (const p of requiredPaths) {
+      const cmd = `ls -la /workspace/${p} 2>/dev/null && du -sb /workspace/${p} 2>/dev/null | awk '{print $1}'`;
+      const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", cmd], { timeout: 30_000 });
+      if (result.status !== 0 || !result.stdout.trim()) {
+        pathResults.push(`❌ /workspace/${p} — not found or inaccessible`);
+      } else {
+        const sizeMatch = result.stdout.match(/(\d+)\s*$/m);
+        const bytes = sizeMatch ? parseInt(sizeMatch[1], 10) : 0;
+        totalBytes += bytes;
+        const sizeGb = (bytes / 1073741824).toFixed(2);
+        pathResults.push(`✅ /workspace/${p} — ${sizeGb}GB`);
+      }
+    }
+
+    const failedPaths = pathResults.filter(r => r.startsWith("❌"));
+    if (failedPaths.length > 0) {
+      lines.push(...pathResults);
+      return text(lines.join("\n") + "\n\n❌ Verification FAILED — missing files detected.");
+    }
+
+    const totalGb = totalBytes / 1073741824;
+    if (minTotalGb != null && totalGb < minTotalGb) {
+      lines.push(...pathResults);
+      lines.push(`\n❌ Data truncation detected: expected ≥${minTotalGb}GB, found ${totalGb.toFixed(2)}GB`);
+      return text(lines.join("\n"));
+    }
+
+    // Write token
+    const token = randomUUID();
+    const tokenData = { token, nvId, podId, verifiedAt: new Date().toISOString(), totalGb: parseFloat(totalGb.toFixed(3)), paths: requiredPaths };
+    await mkdir(NV_READY_DIR, { recursive: true });
+    await writeFile(`${NV_READY_DIR}/nv_ready_${nvId}.json`, JSON.stringify(tokenData, null, 2), "utf-8");
+
+    lines.push(...pathResults);
+    lines.push(`\n✅ NV ${nvId} verified: ${totalGb.toFixed(2)}GB across ${requiredPaths.length} paths.`);
+    lines.push(`Token valid 72h. Pass to create_pod_auto as nvReadinessToken.`);
+    lines.push(`Token: ${token}`);
+    return text(lines.join("\n"));
+  })
+);
+
+// ── run_preflight ──
+server.tool(
+  "run_preflight",
+  "Run pre-flight checks on a RUNNING pod before starting an expensive experiment. " +
+  "Checks disk space, requirements.txt pinning, file existence, system tools, and Python import smoke tests. " +
+  "Based on real incident postmortem: 6/8 bugs catchable in <5 min with this tool. " +
+  "Call after pod setup, before launching training.",
+  {
+    podId: z.string().describe("Pod ID to SSH into for checks"),
+    requirementsPath: z.string().optional().describe("Local path to requirements.txt — checks ML-critical package pinning"),
+    requiredFiles: z.array(z.string()).optional().describe("Paths on /workspace/ that must exist (model files, data, configs)"),
+    requiredTools: z.array(z.string()).optional().describe("System tools that must be in PATH on pod (e.g. ['cpptraj', 'gmx_MMPBSA'])"),
+    importSmokes: z.array(z.string()).optional().describe("Python import statements to test on pod (e.g. ['from chemprop.featurizers import SimpleMoleculeMolGraphFeaturizer'])"),
+    minDiskFreeGb: z.number().default(10).describe("Minimum free disk space on /workspace/ in GB"),
+    strict: z.boolean().default(false).describe("If true, treat any WARNING as FAIL"),
+  },
+  safeTool(async ({ podId, requirementsPath, requiredFiles, requiredTools, importSmokes, minDiskFreeGb, strict }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    if (!pod) return text(`❌ Pod ${podId} not found.`);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text(`❌ Pod ${podId} not ready for SSH. Run wait_for_pod first.`);
+
+    const CRITICAL_ML = ["peft", "transformers", "torch", "torchaudio", "torchvision", "bitsandbytes", "accelerate", "datasets"];
+    const results: Array<{ label: string; status: "✅" | "⚠️" | "❌"; detail: string }> = [];
+    let hasFail = false;
+    let hasWarn = false;
+
+    // 1. Disk check
+    const dfResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", `df -BG /workspace | awk 'NR==2{print $4}' | tr -d G`], { timeout: 15_000 });
+    const freeGb = dfResult.status === 0 ? parseInt(dfResult.stdout.trim(), 10) : -1;
+    if (freeGb < 0) {
+      results.push({ label: "Disk free", status: "❌", detail: "Could not query disk space" });
+      hasFail = true;
+    } else if (freeGb < minDiskFreeGb) {
+      results.push({ label: "Disk free", status: "❌", detail: `Only ${freeGb}GB free — need ≥${minDiskFreeGb}GB` });
+      hasFail = true;
+    } else {
+      results.push({ label: "Disk free", status: "✅", detail: `${freeGb}GB free (min: ${minDiskFreeGb}GB)` });
+    }
+
+    // 2. requirements.txt pinning check (local file)
+    if (requirementsPath) {
+      try {
+        const content = await readFile(requirementsPath, "utf-8");
+        const lines = content.split("\n").filter(l => l.trim() && !l.trim().startsWith("#"));
+        const issues: string[] = [];
+        for (const line of lines) {
+          const match = line.match(/^([a-zA-Z0-9_-]+)(.*)$/);
+          if (!match) continue;
+          const pkg = match[1].toLowerCase();
+          if (!CRITICAL_ML.includes(pkg)) continue;
+          const spec = match[2].trim();
+          if (!spec) {
+            issues.push(`${pkg} (no version spec)`);
+          } else if (/^>=/.test(spec) && !spec.includes(",<")) {
+            issues.push(`${pkg}${spec} (unbounded — no upper bound)`);
+          }
+        }
+        if (issues.length > 0) {
+          results.push({ label: "requirements.txt", status: "⚠️", detail: `Unbounded: ${issues.join(", ")}` });
+          hasWarn = true;
+        } else {
+          results.push({ label: "requirements.txt", status: "✅", detail: "All critical ML packages pinned" });
+        }
+      } catch {
+        results.push({ label: "requirements.txt", status: "❌", detail: `File not found: ${requirementsPath}` });
+        hasFail = true;
+      }
+    }
+
+    // 3. File existence on pod
+    if (requiredFiles && requiredFiles.length > 0) {
+      const checkCmd = requiredFiles.map(f => `ls /workspace/${f} 2>/dev/null && echo "OK:${f}" || echo "MISSING:${f}"`).join("; ");
+      const fileResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", checkCmd], { timeout: 20_000 });
+      const out = fileResult.stdout;
+      const missing = requiredFiles.filter(f => out.includes(`MISSING:${f}`));
+      if (missing.length > 0) {
+        results.push({ label: "Required files", status: "❌", detail: `Missing: ${missing.join(", ")}` });
+        hasFail = true;
+      } else {
+        results.push({ label: "Required files", status: "✅", detail: `${requiredFiles.length} file(s) present` });
+      }
+    }
+
+    // 4. System tools
+    if (requiredTools && requiredTools.length > 0) {
+      const toolCmd = requiredTools.map(t => `which ${t} 2>/dev/null && echo "FOUND:${t}" || echo "MISSING:${t}"`).join("; ");
+      const toolResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", toolCmd], { timeout: 15_000 });
+      const out = toolResult.stdout;
+      const missing = requiredTools.filter(t => out.includes(`MISSING:${t}`));
+      if (missing.length > 0) {
+        results.push({ label: "System tools", status: "❌", detail: `Not in PATH: ${missing.join(", ")}` });
+        hasFail = true;
+      } else {
+        results.push({ label: "System tools", status: "✅", detail: requiredTools.join(", ") });
+      }
+    }
+
+    // 5. Python import smoke tests
+    if (importSmokes && importSmokes.length > 0) {
+      for (const imp of importSmokes) {
+        const smokeCmd = `python3 -c "${imp.replace(/"/g, '\\"')}" 2>&1 && echo "__IMPORT_OK__" || echo "__IMPORT_FAIL__"`;
+        const smokeResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", smokeCmd], { timeout: 30_000 });
+        if (smokeResult.stdout.includes("__IMPORT_OK__")) {
+          results.push({ label: `Import: ${imp.split(" ")[1]}`, status: "✅", detail: "OK" });
+        } else {
+          const errLine = smokeResult.stdout.split("\n").find(l => l.includes("Error") || l.includes("error")) ?? "import failed";
+          results.push({ label: `Import: ${imp.split(" ")[1]}`, status: "❌", detail: errLine.trim() });
+          hasFail = true;
+        }
+      }
+    }
+
+    const lines: string[] = [`## Pre-flight Results — ${podId}`];
+    for (const r of results) {
+      lines.push(`${r.status} ${r.label}: ${r.detail}`);
+    }
+    lines.push("─".repeat(50));
+
+    const totalChecks = results.length;
+    const passed = results.filter(r => r.status === "✅").length;
+    const failed = results.filter(r => r.status === "❌").length;
+    const warned = results.filter(r => r.status === "⚠️").length;
+
+    const overallFail = hasFail || (strict && hasWarn);
+    lines.push(`RESULT: ${overallFail ? "❌ FAIL" : "✅ PASS"} (${passed}/${totalChecks} checks passed${warned > 0 ? `, ${warned} warning(s)` : ""}, ${failed} failure(s))`);
+    return text(lines.join("\n"));
+  })
+);
+
+// ── watch_running_pods ──
+server.tool(
+  "watch_running_pods",
+  "Launch a background bash watcher (scripts/pod_watcher.sh) that polls specific RUNNING pods every N minutes via SSH. " +
+  "Auto-stops pods with GPU compute utilization < idleThresholdPct for consecutive checks. " +
+  "Writes events to .omc/gpu-exec/events.jsonl. PID saved to .omc/gpu-exec/watcher.pid. " +
+  "Call stop_watching_pods() to stop. Call get_pipeline_events() to read status.",
+  {
+    podIds: z.array(z.string()).min(1).describe("Pod IDs to watch (required — at least 1)"),
+    intervalMinutes: z.number().default(5).describe("Poll interval in minutes"),
+    idleThresholdPct: z.number().default(20).describe("GPU compute utilization % below which pod is considered idle"),
+    idleConsecutiveChecks: z.number().default(2).describe("Consecutive idle checks before auto-stop"),
+    mode: z.enum(["full", "error-only"]).default("full").describe(
+      "full: log HEALTH_CHECK event every interval. " +
+      "error-only: only log IDLE_WARNING/AUTO_STOPPED/ERROR/WATCHER_EXITED — reduces noise for long runs (23+ hours)."
+    ),
+    expectedCompletionAt: z.string().optional().describe(
+      "ISO8601 timestamp of expected training completion. " +
+      "Watcher switches to 1-minute check interval in the 30 minutes before this time."
+    ),
+  },
+  safeTool(async ({ podIds, intervalMinutes, idleThresholdPct, idleConsecutiveChecks, mode, expectedCompletionAt }) => {
+    const pidFile = `${NV_READY_DIR}/watcher.pid`;
+
+    // Check for existing watcher
+    try {
+      const existingPid = (await readFile(pidFile, "utf-8")).trim();
+      const checkResult = await spawnAsync("kill", ["-0", existingPid], { timeout: 5_000 });
+      if (checkResult.status === 0) {
+        return text(`❌ Watcher already running (PID ${existingPid}). Call stop_watching_pods() first.`);
+      }
+    } catch {
+      // No pid file or process not found — OK to proceed
+    }
+
+    await mkdir(NV_READY_DIR, { recursive: true });
+
+    const scriptPath = `${process.cwd()}/scripts/pod_watcher.sh`;
+    const args = [
+      "--pods", podIds.join(","),
+      "--interval", String(intervalMinutes),
+      "--idle-pct", String(idleThresholdPct),
+      "--idle-checks", String(idleConsecutiveChecks),
+      "--mode", mode,
+    ];
+    if (expectedCompletionAt) args.push("--expected-completion", expectedCompletionAt);
+
+    const eventsFile = `${NV_READY_DIR}/events.jsonl`;
+    // Spawn detached (nohup-style)
+    const spawn = await spawnAsync(
+      "bash",
+      ["-c", `nohup bash ${scriptPath} ${args.join(" ")} >> ${eventsFile} 2>&1 & echo $!`],
+      { timeout: 5_000 }
+    );
+
+    if (spawn.status !== 0) {
+      return text(`❌ Failed to start watcher: ${spawn.stderr}`);
+    }
+
+    const pid = spawn.stdout.trim();
+    await writeFile(pidFile, pid, "utf-8");
+
+    const completionNote = expectedCompletionAt ? ` Expected completion: ${expectedCompletionAt}.` : "";
+    return text(
+      `✅ Watcher started (PID ${pid}) for pods: [${podIds.join(", ")}]. Mode: ${mode}.${completionNote}\n` +
+      `Events → ${eventsFile}\n` +
+      `Call get_pipeline_events() for updates, stop_watching_pods() to stop.`
+    );
+  })
+);
+
+// ── stop_watching_pods ──
+server.tool(
+  "stop_watching_pods",
+  "Stop the background pod watcher launched by watch_running_pods.",
+  {},
+  safeTool(async () => {
+    const pidFile = `${NV_READY_DIR}/watcher.pid`;
+    let pid: string;
+    try {
+      pid = (await readFile(pidFile, "utf-8")).trim();
+    } catch {
+      return text("No watcher running (PID file not found).");
+    }
+
+    // kill + waitpid(5s) + SIGKILL fallback
+    await spawnAsync("kill", [pid], { timeout: 5_000 });
+
+    // Wait up to 5s for process to exit
+    let exited = false;
+    for (let i = 0; i < 10; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      const check = await spawnAsync("kill", ["-0", pid], { timeout: 2_000 });
+      if (check.status !== 0) { exited = true; break; }
+    }
+
+    if (!exited) {
+      await spawnAsync("kill", ["-9", pid], { timeout: 5_000 });
+    }
+
+    try { await writeFile(pidFile, "", "utf-8"); } catch { /* ignore */ }
+    // Remove pid file
+    await spawnAsync("rm", ["-f", pidFile], { timeout: 5_000 });
+
+    return text(`Watcher stopped (PID ${pid}).`);
+  })
+);
+
+// ── get_pipeline_events ──
+server.tool(
+  "get_pipeline_events",
+  "Read and summarize events from the background pod watcher. Returns per-pod GPU utilization trend, " +
+  "auto-stop events, and cost warnings. Highlights WATCHER_EXITED with manual stop instructions. " +
+  "If WATCHER_EXITED is detected, repeats warning on every call (sticky) until watcher is restarted.",
+  {
+    podId: z.string().optional().describe("Filter events to a specific pod ID (omit for all pods)"),
+    tail: z.number().default(50).describe("Last N events to return"),
+  },
+  safeTool(async ({ podId, tail }) => {
+    const eventsFile = `${NV_READY_DIR}/events.jsonl`;
+    let raw: string;
+    try {
+      raw = await readFile(eventsFile, "utf-8");
+    } catch {
+      return text("No events file found. Start a watcher with watch_running_pods() first.");
+    }
+
+    const allLines = raw.split("\n").filter(l => l.trim());
+    const filtered = podId
+      ? allLines.filter(l => {
+          try { return JSON.parse(l).podId === podId; } catch { return false; }
+        })
+      : allLines;
+
+    const recent = filtered.slice(-tail);
+    const parsed = recent.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    // Check for WATCHER_EXITED (sticky warning)
+    const exitedEvents = parsed.filter((e: any) => e.event === "WATCHER_EXITED");
+    const lastExited = exitedEvents[exitedEvents.length - 1] as any;
+
+    const lines: string[] = [`## Pipeline Events${podId ? ` — ${podId}` : ""} (last ${tail})`];
+
+    if (lastExited) {
+      lines.push(`\n🚨 **WATCHER EXITED** — Pod ${lastExited.podId ?? "unknown"} may still be running and accruing cost.`);
+      lines.push(`   Reason: ${lastExited.reason ?? "GraphQL stop failure"}`);
+      lines.push(`   → Manual action required: call delete_pod("${lastExited.podId ?? "<podId>"}") or stop_pod() immediately.`);
+      lines.push(``);
+    }
+
+    // Format events
+    for (const e of parsed as any[]) {
+      const ts = e.ts ?? "";
+      const event = e.event ?? "UNKNOWN";
+      const pod = e.podId ?? "";
+      const gpu = e.gpuPct != null ? ` GPU:${e.gpuPct}%` : "";
+      const idle = e.idleCheck != null ? ` idle:${e.idleCheck}` : "";
+      const detail = e.detail ? ` — ${e.detail}` : "";
+      lines.push(`${ts} [${event}]${pod ? ` pod:${pod}` : ""}${gpu}${idle}${detail}`);
+    }
+
+    if (parsed.length === 0) {
+      lines.push("(no events)");
     }
 
     return text(lines.join("\n"));

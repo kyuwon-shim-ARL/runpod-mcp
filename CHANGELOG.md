@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-16
+
+### Added
+- `verify_data_on_nv` — SSH-verifies dataset presence on a Network Volume staging pod; issues a 72h readiness token saved to `.omc/gpu-exec/nv_ready_{nvId}.json`. Catches file-missing and data-truncation (minTotalGb check) before the staging pod is deleted.
+- `run_preflight` — pre-flight SSH checks on a running pod: disk free space, requirements.txt ML-package pinning (unbounded `>=` detection for peft/transformers/torch etc.), required file existence, system tool availability, and Python import smoke tests. Based on postmortem: 6/8 incident bugs catchable in <5 min.
+- `watch_running_pods` — spawns `scripts/pod_watcher.sh` as a background process; polls GPU utilization via SSH + nvidia-smi every N minutes; auto-stops idle pods (gpuUtil < threshold for consecutive checks); supports `error-only` mode for long runs; `expectedCompletionAt` switches to 1-min interval in the final 30 minutes.
+- `stop_watching_pods` — kills the background watcher (SIGTERM + 5s waitpid + SIGKILL fallback).
+- `get_pipeline_events` — reads `.omc/gpu-exec/events.jsonl`; sticky `WATCHER_EXITED` warning (repeats on every call until watcher is restarted) with manual pod-stop instructions.
+- `create_pod_auto`: `nvReadinessToken` parameter — when `gpuCount >= 2` + `networkVolumeId` is set, requires a valid token from `verify_data_on_nv` (TTL 72h). Blocks with `FILE_NOT_FOUND`, `TOKEN_MISMATCH`, or `EXPIRED` to prevent costly multi-GPU pods starting with missing/stale data.
+- `plan_gpu_job`: container disk warning — estimates output as `(modelSizeGb + datasetGb×0.1 + 2) × gpuCount` and warns when >70% of RunPod's default 30GB container disk.
+- `scripts/pod_watcher.sh` — 224-line bash watcher; PID guard; orphan-PID auto-cleanup; GraphQL stop with 1 retry + `WATCHER_EXITED` on failure; RUNPOD_API_KEY inherited via nohup.
+- 43 new test cases (251 → 294 total): token TTL/truncation, nvReadinessToken gate, requirements pinning, disk-free, WATCHER_EXITED, disk-warning boundaries.
+
+### Driven by
+- T14/T15 incidents: 4-GPU pods ($1.36/hr) used for data transfer; GPU idle after training undetected for hours.
+
 ## [0.4.0] - 2026-04-08
 
 ### Added
