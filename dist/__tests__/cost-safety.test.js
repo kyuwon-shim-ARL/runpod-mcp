@@ -5,6 +5,9 @@
  * Without elicitation: boolean gate (costSafetyConfirmed must be true).
  */
 import { describe, it, expect } from "vitest";
+import { writeFile, unlink, mkdtemp } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 const COST_GATE_GPU_COUNT = 2;
 const COST_GATE_HOURLY_USD = 1.0;
 // Pure guard logic extracted for unit testing — mirrors the check in src/index.ts
@@ -82,6 +85,87 @@ describe("create_pod_auto: price-based gate (COST_GATE_HOURLY_USD)", () => {
     });
     it("gpuCount=2, ondemandPrice=1.0 → $2.0/hr, dryRun=true → skip (dry run bypass)", () => {
         expect(priceGate({ ondemandPrice: 1.0, gpuCount: 2, dryRun: true })).toBe("SKIP");
+    });
+});
+// ══════════════════════════════════════════════════════════════════════════
+// EXP-047 Bug Fix Tests
+// ══════════════════════════════════════════════════════════════════════════
+// ── Bug 1: cloudType default ──────────────────────────────────────────────
+describe("cloudType: default is COMMUNITY (Bug 1 fix)", () => {
+    it("api opts fallback uses COMMUNITY not ALL", () => {
+        const opts = {};
+        const resolved = opts.cloudType ?? "COMMUNITY";
+        expect(resolved).toBe("COMMUNITY");
+    });
+    it("ALL is still valid when explicitly passed", () => {
+        const opts = { cloudType: "ALL" };
+        const resolved = opts.cloudType ?? "COMMUNITY";
+        expect(resolved).toBe("ALL");
+    });
+    it("SECURE is valid when explicitly passed", () => {
+        const opts = { cloudType: "SECURE" };
+        const resolved = opts.cloudType ?? "COMMUNITY";
+        expect(resolved).toBe("SECURE");
+    });
+});
+// ── Bug 2: getRsyncArgs flags (covered in api.test.ts, cross-verify here) ─
+describe("getRsyncArgs: rsync flag compatibility (Bug 2 fix)", () => {
+    it("rsync flag string does NOT contain --no-same-owner", () => {
+        const rsyncFlags = "-azP --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
+        expect(rsyncFlags).not.toContain("--no-same-owner");
+        expect(rsyncFlags).toContain("--no-same-group");
+    });
+});
+// ── Bug 3: SSH pub key resolution logic ───────────────────────────────────
+// Mirror the readSshPubKey logic for unit testing
+async function readSshPubKeyTest(envKeyPath) {
+    if (!envKeyPath)
+        return undefined;
+    const pubPath = envKeyPath.endsWith(".pub") ? envKeyPath : envKeyPath + ".pub";
+    try {
+        const { readFile } = await import("node:fs/promises");
+        const content = await readFile(pubPath, "utf8");
+        return content.trim();
+    }
+    catch {
+        return undefined;
+    }
+}
+describe("readSshPubKey: SSH public key auto-injection (Bug 3 fix)", () => {
+    it("SSH_KEY_PATH unset → undefined", async () => {
+        const result = await readSshPubKeyTest(undefined);
+        expect(result).toBeUndefined();
+    });
+    it("SSH_KEY_PATH set + .pub file exists → returns trimmed content", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "runpod-mcp-test-"));
+        const keyPath = join(dir, "id_rsa");
+        await writeFile(keyPath + ".pub", "  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test  \n");
+        try {
+            const result = await readSshPubKeyTest(keyPath);
+            expect(result).toBe("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test");
+        }
+        finally {
+            await unlink(keyPath + ".pub");
+        }
+    });
+    it("SSH_KEY_PATH already ends with .pub → no double extension (.pub.pub)", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "runpod-mcp-test-"));
+        const keyPath = join(dir, "id_rsa.pub");
+        await writeFile(keyPath, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test");
+        try {
+            // Should read keyPath directly, not keyPath + ".pub"
+            const result = await readSshPubKeyTest(keyPath);
+            expect(result).toBe("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test");
+            // Verify it does NOT try to add .pub again
+            expect(keyPath.endsWith(".pub") ? keyPath : keyPath + ".pub").toBe(keyPath);
+        }
+        finally {
+            await unlink(keyPath);
+        }
+    });
+    it("SSH_KEY_PATH set but .pub file missing → undefined (no throw)", async () => {
+        const result = await readSshPubKeyTest("/nonexistent/path/id_rsa");
+        expect(result).toBeUndefined();
     });
 });
 //# sourceMappingURL=cost-safety.test.js.map

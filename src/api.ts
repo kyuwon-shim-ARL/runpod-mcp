@@ -196,7 +196,7 @@ export class RunPodClient {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: opts.ports ?? ["22/tcp"],
       supportPublicIp: opts.supportPublicIp ?? true,
-      cloudType: opts.cloudType ?? "ALL",
+      cloudType: opts.cloudType ?? "COMMUNITY",
       env: { ...opts.env },
     };
 
@@ -259,7 +259,7 @@ export class RunPodClient {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: (opts.ports ?? ["22/tcp"]).join(","),
       env: envArray,
-      cloudType: opts.cloudType ?? "ALL",
+      cloudType: opts.cloudType ?? "COMMUNITY",
       supportPublicIp: opts.supportPublicIp ?? true,
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;
@@ -372,7 +372,9 @@ export class RunPodClient {
     const sshArg = `ssh ${sshCmd.join(" ")}`;
 
     const remote = `root@${pod.publicIp}:${remotePath}`;
-    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
+    // --no-same-owner: removed — unsupported in rsync 3.1.3/CentOS 8 (EXP-046 incident)
+    // --no-same-group: kept — supported in rsync 3.1.x, prevents group chown errors on download
+    const rsyncFlags = "-azP --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
       return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }

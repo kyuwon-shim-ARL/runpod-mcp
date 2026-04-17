@@ -208,9 +208,9 @@ describe("cloudType parameter (T3)", () => {
             name: "test",
             imageName: "test",
             gpuTypeIds: ["test"],
-            cloudType: "ALL",
+            cloudType: "COMMUNITY",
         };
-        expect(opts.cloudType).toBe("ALL");
+        expect(opts.cloudType).toBe("COMMUNITY");
     });
     it("cloudType COMMUNITY is valid", () => {
         const opts = { cloudType: "COMMUNITY" };

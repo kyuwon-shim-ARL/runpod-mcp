@@ -74,7 +74,7 @@ describe("E2E: pod lifecycle (create → get → delete)", () => {
       name: "test-pod",
       imageName: "pytorch/pytorch:latest",
       gpuTypeIds: ["NVIDIA GeForce RTX 3090"],
-      cloudType: "ALL",
+      cloudType: "COMMUNITY",
     });
     expect(pod.id).toBe("pod-new123");
     expect(pod.desiredStatus).toBe("RUNNING");

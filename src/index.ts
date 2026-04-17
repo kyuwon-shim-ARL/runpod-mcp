@@ -71,6 +71,22 @@ function isAuthError(e: unknown): boolean {
   return /\b(401|403|unauthorized|forbidden|authentication)\b/i.test(msg);
 }
 
+/**
+ * Reads the SSH public key from SSH_KEY_PATH env var.
+ * Handles .pub extension deduplication and silently returns undefined on any error.
+ */
+async function readSshPubKey(): Promise<string | undefined> {
+  const keyPath = process.env.SSH_KEY_PATH;
+  if (!keyPath) return undefined;
+  const pubPath = keyPath.endsWith(".pub") ? keyPath : keyPath + ".pub";
+  try {
+    const content = await readFile(pubPath, "utf8");
+    return content.trim();
+  } catch {
+    return undefined; // ENOENT, EACCES: silent fallback
+  }
+}
+
 
 // ══════════════════════════════════════════
 //  TOOLS
@@ -112,14 +128,19 @@ server.tool(
     dockerArgs: z.string().optional(),
     cloudType: z
       .enum(["ALL", "SECURE", "COMMUNITY"])
-      .default("ALL")
-      .describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
+      .default("COMMUNITY")
+      .describe("Cloud type filter: COMMUNITY (default, cheaper/shared), SECURE (dedicated), or ALL"),
     optimizePytorch: z
       .boolean()
       .default(false)
       .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
   },
   safeTool(async (args) => {
+    const autoSshKey = await readSshPubKey();
+    const sshWarnText = (process.env.SSH_KEY_PATH && !autoSshKey)
+      ? "\n\n⚠️ SSH_KEY_PATH 설정됨 but 공개키 읽기 실패 — 직접 SSH/SCP 불가, execute_ssh_command(프록시) 사용"
+      : "";
+    const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
     const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
 
     const opts = {
@@ -132,7 +153,7 @@ server.tool(
       volumeInGb: args.volumeInGb,
       volumeMountPath: args.volumeMountPath,
       networkVolumeId: args.networkVolumeId,
-      sshPublicKey: args.sshPublicKey,
+      ...(resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {}),
       ports: args.ports,
       env: podEnv,
       dockerArgs: args.dockerArgs,
@@ -158,7 +179,7 @@ server.tool(
       const result = await requireClient().createSpotPod({ ...opts, bidPerGpu: args.bidPerGpu });
       const stub = buildStub(result.id, args.bidPerGpu);
       return text(
-        `Spot pod created!\nID: ${result.id}\n\n` +
+        `Spot pod created!\nID: ${result.id}${sshWarnText}\n\n` +
           `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
           `## Next Steps\n→ wait_for_pod(podId: "${result.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
       );
@@ -167,7 +188,7 @@ server.tool(
     const pod = await requireClient().createPod(opts);
     const stub = buildStub(pod.id, null);
     return text(
-      `Pod created!\n${podSummary(pod)}\n\n` +
+      `Pod created!\n${podSummary(pod)}${sshWarnText}\n\n` +
         `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
         `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
     );
@@ -206,8 +227,8 @@ server.tool(
       .describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
     cloudType: z
       .enum(["ALL", "SECURE", "COMMUNITY"])
-      .default("ALL")
-      .describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
+      .default("COMMUNITY")
+      .describe("Cloud type filter: COMMUNITY (default, cheaper/shared), SECURE (dedicated), or ALL"),
     dryRun: z
       .boolean()
       .default(false)
@@ -297,6 +318,14 @@ server.tool(
     }
 
     const c = requireClient();
+
+    // Auto-inject SSH public key from SSH_KEY_PATH env if not explicitly provided
+    const autoSshKey = await readSshPubKey();
+    const sshWarnText = (process.env.SSH_KEY_PATH && !autoSshKey)
+      ? "\n⚠️ SSH_KEY_PATH 설정됨 but 공개키 읽기 실패 — 직접 SSH/SCP 불가, execute_ssh_command(프록시) 사용"
+      : "";
+    const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
+
     const gpuTypes = await c.listGpuTypes();
 
     // Resolve datacenter affinity from network volume.
@@ -367,7 +396,7 @@ server.tool(
             containerDiskInGb: args.containerDiskInGb,
             volumeInGb: args.volumeInGb,
             volumeMountPath: "/workspace",
-            sshPublicKey: args.sshPublicKey,
+            ...(resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {}),
             ports: ["22/tcp"] as string[],
             env: podEnv,
             networkVolumeId: args.networkVolumeId,
@@ -394,7 +423,7 @@ server.tool(
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})\n` +
                 `Spot bid: $${bidPrice}/hr\n` +
-                `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}\n\n` +
+                `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}${sshWarnText}\n\n` +
                 `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
                 `## Next Steps\n→ wait_for_pod(podId: "${result.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
             );
@@ -417,7 +446,7 @@ server.tool(
               : null,
           });
           return text(
-            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}\n${podSummary(pod)}\n\n` +
+            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}\n${podSummary(pod)}\n\n` +
               `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
               `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
           );
