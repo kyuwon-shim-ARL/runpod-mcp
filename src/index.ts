@@ -1700,6 +1700,49 @@ server.tool(
     let hasFail = false;
     let hasWarn = false;
 
+    // 0. CUDA availability check (always runs — bash -c safe, base64 encoded)
+    {
+      const cudaScript = [
+        "import subprocess, torch",
+        "ok = torch.cuda.is_available()",
+        "if ok:",
+        "  try:",
+        "    drv = subprocess.check_output(['nvidia-smi','--query-gpu=driver_version','--format=csv,noheader'],text=True).strip()",
+        "  except FileNotFoundError:",
+        "    drv = 'nvidia-smi-missing'",
+        "  print(f'CUDA:OK cuda_build={torch.version.cuda} driver={drv} torch={torch.__version__}')",
+        "else:",
+        "  print(f'CUDA:FAIL torch={torch.__version__} cuda_build={torch.version.cuda}')",
+      ].join("\n");
+      const cudaB64 = Buffer.from(cudaScript).toString("base64");
+      const cudaCheckCmd = `bash -c 'echo ${cudaB64} | base64 -d | python3'`;
+      const cudaResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", cudaCheckCmd], { timeout: 60_000 });
+
+      if (cudaResult.status === null) {
+        results.push({ label: "CUDA", status: "⚠️", detail: "CUDA check timed out (60s) — pod may be cold-starting. Re-run run_preflight." });
+        hasWarn = true;
+      } else {
+        const lines = (cudaResult.stdout ?? "").split("\n");
+        const cudaLine = lines.find(l => l.startsWith("CUDA:OK") || l.startsWith("CUDA:FAIL")) ?? "";
+        const stderrFull = cudaResult.stderr ?? "";
+        const isModuleErr = stderrFull.includes("ModuleNotFoundError") || stderrFull.includes("No module named");
+        const stderrDisplay = stderrFull.substring(0, 200);
+
+        if (cudaLine.startsWith("CUDA:FAIL")) {
+          results.push({ label: "CUDA", status: "❌", detail: cudaLine });
+          hasFail = true;
+        } else if (cudaResult.status !== 0 || !cudaLine) {
+          const detail = isModuleErr
+            ? `torch not installed: ${stderrDisplay}`
+            : `check failed (exit ${cudaResult.status}): ${stderrDisplay || cudaLine}`;
+          results.push({ label: "CUDA", status: "❌", detail });
+          hasFail = true;
+        } else {
+          results.push({ label: "CUDA", status: "✅", detail: cudaLine.replace("CUDA:OK ", "") });
+        }
+      }
+    }
+
     // 1. Disk check
     const dfResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", `df -BG /workspace | awk 'NR==2{print $4}' | tr -d G`], { timeout: 15_000 });
     const freeGb = dfResult.status === 0 ? parseInt(dfResult.stdout.trim(), 10) : -1;

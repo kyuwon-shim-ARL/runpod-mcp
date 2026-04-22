@@ -357,3 +357,88 @@ describe("plan_gpu_job: container disk warning", () => {
     expect(r.warn).toBe(true);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// run_preflight — CUDA availability check (EXP-047)
+// Mirrors the result-processing logic in src/index.ts run_preflight tool.
+// ══════════════════════════════════════════════════════════════════════════
+
+type CudaSpawnResult = { status: number | null; stdout: string; stderr: string };
+type CudaCheckResult = { label: "CUDA"; status: "✅" | "⚠️" | "❌"; detail: string };
+
+function processCudaResult(r: CudaSpawnResult): { result: CudaCheckResult; isFail: boolean; isWarn: boolean } {
+  if (r.status === null) {
+    return {
+      result: { label: "CUDA", status: "⚠️", detail: "CUDA check timed out (60s) — pod may be cold-starting. Re-run run_preflight." },
+      isFail: false,
+      isWarn: true,
+    };
+  }
+  const lines = (r.stdout ?? "").split("\n");
+  const cudaLine = lines.find(l => l.startsWith("CUDA:OK") || l.startsWith("CUDA:FAIL")) ?? "";
+  const stderrFull = r.stderr ?? "";
+  const isModuleErr = stderrFull.includes("ModuleNotFoundError") || stderrFull.includes("No module named");
+  const stderrDisplay = stderrFull.substring(0, 200);
+
+  if (cudaLine.startsWith("CUDA:FAIL")) {
+    return { result: { label: "CUDA", status: "❌", detail: cudaLine }, isFail: true, isWarn: false };
+  } else if (r.status !== 0 || !cudaLine) {
+    const detail = isModuleErr
+      ? `torch not installed: ${stderrDisplay}`
+      : `check failed (exit ${r.status}): ${stderrDisplay || cudaLine}`;
+    return { result: { label: "CUDA", status: "❌", detail }, isFail: true, isWarn: false };
+  } else {
+    return { result: { label: "CUDA", status: "✅", detail: cudaLine.replace("CUDA:OK ", "") }, isFail: false, isWarn: false };
+  }
+}
+
+describe("run_preflight: CUDA availability check", () => {
+  // Case 1: GPU visible — normal happy path
+  it("CUDA:OK stdout → ✅, isFail=false", () => {
+    const r = processCudaResult({ status: 0, stdout: "CUDA:OK cuda_build=12.4 driver=550.54 torch=2.3.0", stderr: "" });
+    expect(r.result.status).toBe("✅");
+    expect(r.result.detail).toBe("cuda_build=12.4 driver=550.54 torch=2.3.0");
+    expect(r.isFail).toBe(false);
+    expect(r.isWarn).toBe(false);
+  });
+
+  // Case 2: pip install overwrote CUDA torch (the actual incident trigger)
+  it("CUDA:FAIL stdout → ❌, isFail=true", () => {
+    const r = processCudaResult({ status: 0, stdout: "CUDA:FAIL torch=2.11.0+cu130 cuda_build=13.0", stderr: "" });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("CUDA:FAIL");
+    expect(r.isFail).toBe(true);
+  });
+
+  // Case 3: torch not installed at all (pip install not yet run, or failed)
+  it("status=1 + ModuleNotFoundError in stderr → ❌ 'torch not installed'", () => {
+    const r = processCudaResult({ status: 1, stdout: "", stderr: "ModuleNotFoundError: No module named 'torch'" });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("torch not installed");
+    expect(r.isFail).toBe(true);
+  });
+
+  // Case 4: SSH timeout / cold pod — non-blocking warning
+  it("status=null (timeout) → ⚠️, isWarn=true, isFail=false", () => {
+    const r = processCudaResult({ status: null, stdout: "", stderr: "" });
+    expect(r.result.status).toBe("⚠️");
+    expect(r.result.detail).toContain("timed out");
+    expect(r.isFail).toBe(false);
+    expect(r.isWarn).toBe(true);
+  });
+
+  // Case 5: nvidia-smi absent but CUDA available (Python handles FileNotFoundError → drv='nvidia-smi-missing')
+  it("nvidia-smi missing but CUDA:OK → ✅, detail includes 'nvidia-smi-missing'", () => {
+    const r = processCudaResult({ status: 0, stdout: "CUDA:OK cuda_build=12.4 driver=nvidia-smi-missing torch=2.3.0", stderr: "" });
+    expect(r.result.status).toBe("✅");
+    expect(r.result.detail).toContain("nvidia-smi-missing");
+    expect(r.isFail).toBe(false);
+  });
+
+  // SSH banner / conda init noise before CUDA line — line parser must skip it
+  it("SSH banner before CUDA:OK → ✅ (line parser skips noise)", () => {
+    const stdout = "Welcome to RunPod!\nLast login: Mon Apr 22\nCUDA:OK cuda_build=12.4 driver=550.54 torch=2.3.0";
+    const r = processCudaResult({ status: 0, stdout, stderr: "" });
+    expect(r.result.status).toBe("✅");
+  });
+});

@@ -46,8 +46,15 @@ GPU 시간 = 돈. 훈련에만 써야 한다.
 When a user is doing ML training on RunPod, follow this optimization pattern:
 
 ### Tool Sequencing
-1. `create_pod_auto` → `wait_for_pod` → `upload_files` → `execute_ssh_command` (always in this order)
-2. After training starts (1-2 min), call `gpu_health_check` to measure utilization
+1. `create_pod_auto` → `wait_for_pod` → `upload_files`
+   → `execute_ssh_command` (setup: apt install, pip install 등)
+   → **`run_preflight`** ← pip install 후 CUDA 포함 환경 재확인 (필수)
+   → `execute_ssh_command` (training launch)
+2. Training launch 직후 **`gpu_sample_burst`** 호출 (필수)
+   - OMC 환경: `ScheduleWakeup(delaySeconds=120)` 설정 → wakeup 시 `gpu_sample_burst` 호출
+   - 직접(OMC 없는 환경): `execute_ssh_command("sleep 120")` 완료 후 `gpu_sample_burst` 호출
+   → `CONSISTENTLY_IDLE` → 즉시 중단 + 로그 확인 (CPU fallback 의심)
+   → `STABLE_OPTIMAL` / `IMPROVING` → `watch_running_pods`로 모니터링 인계
 3. If underutilized, call `gpu_health_check` with `perSampleMb` for batch size recommendation
 4. Call `gpu_cost_compare` if GPU is underutilized to find cheaper alternatives
 5. **Re-call `gpu_health_check` every 5-10 min during long training runs** to detect degradation or idle drift
