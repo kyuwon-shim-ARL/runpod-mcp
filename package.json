@@ -1,6 +1,6 @@
 {
   "name": "runpod-tools-mcp",
-  "version": "0.5.0",
+  "version": "0.5.3",
   "description": "MCP server for RunPod GPU pod management - full lifecycle, SSH, file transfer, GPU stock checking",
   "keywords": [
     "mcp",

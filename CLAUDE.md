@@ -46,15 +46,27 @@ GPU 시간 = 돈. 훈련에만 써야 한다.
 When a user is doing ML training on RunPod, follow this optimization pattern:
 
 ### Tool Sequencing
-1. `create_pod_auto` → `wait_for_pod` → `upload_files`
+**팟 생성 전 (rootfs 사이징 필수):**
+랜덤 액세스 훈련(이미지/molecule/셔플 데이터)은 NV가 rootfs보다 **~18× 느리다** (e049 측정: 43 vs 775 files/sec). NV에 데이터를 두고 훈련 돌리면 epoch I/O가 10분+ 걸린다. 데이터를 rootfs로 복사 후 훈련해야 한다. **rootfs는 팟 생성 후 절대 못 늘린다** → `plan_gpu_job` 호출 시 `randomAccessTrainingGb` 전달, 권장 `containerDiskInGb` 받아서 사용.
+
+```
+plan_gpu_job(randomAccessTrainingGb=N) → containerDiskInGb 권장값 출력
+→ create_pod_auto(containerDiskInGb=권장값) — 랜덤 액세스 훈련은 데이터 크기*1.3 + 30GB 시스템 오버헤드 필요
+```
+
+**팟 생성 후 워크플로우:**
+1. `create_pod_auto` → `wait_for_pod` → `upload_files` (NV로)
    → `execute_ssh_command` (setup: apt install, pip install 등)
-   → **`run_preflight`** ← pip install 후 CUDA 포함 환경 재확인 (필수)
-   → `execute_ssh_command` (training launch)
+   → `execute_ssh_command` (`mkdir -p /root/data && cp -r --reflink=auto /workspace/<dataset> /root/data/`) — NV→rootfs 복사 (랜덤 액세스 훈련 시 필수)
+   → **`run_preflight(trainDataPath="/root/data/<dataset>", expectedRandomAccessGb=N)`** ← CUDA + NV→rootfs 위치 + 사이즈 검증 (필수)
+   → `execute_ssh_command` (training launch — 스크립트가 `/root/data/<dataset>` 읽도록 설정)
 2. Training launch 직후 **`gpu_sample_burst`** 호출 (필수)
    - OMC 환경: `ScheduleWakeup(delaySeconds=120)` 설정 → wakeup 시 `gpu_sample_burst` 호출
    - 직접(OMC 없는 환경): `execute_ssh_command("sleep 120")` 완료 후 `gpu_sample_burst` 호출
-   → `CONSISTENTLY_IDLE` → 즉시 중단 + 로그 확인 (CPU fallback 의심)
+   → `CONSISTENTLY_IDLE` → 즉시 중단 + 로그 확인 (CPU fallback 또는 NV 스트리밍 의심)
    → `STABLE_OPTIMAL` / `IMPROVING` → `watch_running_pods`로 모니터링 인계
+
+**예외 (run_preflight allowNvStreaming:true):** 훈련이 순수 sequential read만 한다면 (드물다 — 대부분의 ML은 random shuffle) NV 직접 사용 가능. 이 경우만 opt-out.
 3. If underutilized, call `gpu_health_check` with `perSampleMb` for batch size recommendation
 4. Call `gpu_cost_compare` if GPU is underutilized to find cheaper alternatives
 5. **Re-call `gpu_health_check` every 5-10 min during long training runs** to detect degradation or idle drift

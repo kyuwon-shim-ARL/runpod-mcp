@@ -442,3 +442,187 @@ describe("run_preflight: CUDA availability check", () => {
     expect(r.result.status).toBe("✅");
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// run_preflight — NV → rootfs migration check (EXP-048)
+// Mirrors the inline analyzeNvMigration logic in src/index.ts run_preflight tool.
+// Background: e049 measured NV random read at ~43 files/sec vs rootfs ~775 files/sec
+// (~18× slower). For random-access training (image/molecule/shuffled datasets),
+// data MUST be on rootfs. rootfs CANNOT be expanded after pod creation.
+// ══════════════════════════════════════════════════════════════════════════
+
+type NvCheckInputs = {
+  nvAttached: boolean;
+  trainDataPath?: string;
+  trainMount: string;
+  rootMount: string;
+  rootfsFreeGb: number;
+  rootfsTotalGb: number;
+  trainDataGb: number;
+  expectedRandomAccessGb?: number;
+  allowNvStreaming: boolean;
+};
+type NvCheckResult = { label: "NV→rootfs"; status: "✅" | "⚠️" | "❌"; detail: string };
+
+function analyzeNvMigration(i: NvCheckInputs): { result: NvCheckResult; isFail: boolean; isWarn: boolean } {
+  if (!i.nvAttached) {
+    return {
+      result: { label: "NV→rootfs", status: "✅", detail: `No NV attached — rootfs only (${i.rootfsFreeGb}/${i.rootfsTotalGb}GB free)` },
+      isFail: false, isWarn: false,
+    };
+  }
+  if (!i.trainDataPath && !i.allowNvStreaming) {
+    return {
+      result: { label: "NV→rootfs", status: "❌", detail: `HALT — NV attached but trainDataPath not specified. ASK USER for path and dataset size.` },
+      isFail: true, isWarn: false,
+    };
+  }
+  if (!i.trainDataPath && i.allowNvStreaming) {
+    return {
+      result: { label: "NV→rootfs", status: "⚠️", detail: `NV streaming opted in (allowNvStreaming:true).` },
+      isFail: false, isWarn: true,
+    };
+  }
+  if (i.trainMount === "MISSING") {
+    return {
+      result: { label: "NV→rootfs", status: "❌", detail: `trainDataPath does not exist on pod: ${i.trainDataPath}` },
+      isFail: true, isWarn: false,
+    };
+  }
+  if (i.trainMount !== i.rootMount) {
+    const sufficient = i.trainDataGb === 0 || i.rootfsFreeGb >= i.trainDataGb + 5;
+    if (!sufficient) {
+      const recDisk = Math.ceil(i.trainDataGb * 1.3 + 30);
+      return {
+        result: { label: "NV→rootfs", status: "❌", detail: `Data on NV AND rootfs too small (${i.rootfsFreeGb}GB free). Recreate with containerDiskInGb≥${recDisk}.` },
+        isFail: true, isWarn: false,
+      };
+    }
+    return {
+      result: { label: "NV→rootfs", status: "❌", detail: `Data on NV (mount=${i.trainMount}) — must copy to rootfs first. Run: mkdir -p /root/data && cp -r --reflink=auto ${i.trainDataPath} /root/data/` },
+      isFail: true, isWarn: false,
+    };
+  }
+  if (i.expectedRandomAccessGb != null && i.rootfsFreeGb < i.expectedRandomAccessGb + 10) {
+    const recDisk = Math.ceil(i.expectedRandomAccessGb * 1.3 + 30);
+    return {
+      result: { label: "NV→rootfs", status: "❌", detail: `rootfs has only ${i.rootfsFreeGb}GB free, need ≥${i.expectedRandomAccessGb + 10}GB. Recreate with containerDiskInGb≥${recDisk}.` },
+      isFail: true, isWarn: false,
+    };
+  }
+  return {
+    result: { label: "NV→rootfs", status: "✅", detail: `Data on rootfs (mount=${i.trainMount}) (${i.rootfsFreeGb}/${i.rootfsTotalGb}GB free)` },
+    isFail: false, isWarn: false,
+  };
+}
+
+const baseInputs: NvCheckInputs = {
+  nvAttached: false,
+  trainMount: "",
+  rootMount: "/",
+  rootfsFreeGb: 100,
+  rootfsTotalGb: 200,
+  trainDataGb: 0,
+  allowNvStreaming: false,
+};
+
+describe("run_preflight: NV → rootfs migration check", () => {
+  it("Case 1: no NV attached → ✅", () => {
+    const r = analyzeNvMigration(baseInputs);
+    expect(r.result.status).toBe("✅");
+    expect(r.result.detail).toContain("No NV attached");
+    expect(r.isFail).toBe(false);
+  });
+
+  it("Case 2: NV attached, no trainDataPath, no opt-out → ❌ HALT", () => {
+    const r = analyzeNvMigration({ ...baseInputs, nvAttached: true });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("HALT");
+    expect(r.result.detail).toContain("ASK USER");
+    expect(r.isFail).toBe(true);
+  });
+
+  it("Case 3: NV attached, no trainDataPath, allowNvStreaming → ⚠️ warn", () => {
+    const r = analyzeNvMigration({ ...baseInputs, nvAttached: true, allowNvStreaming: true });
+    expect(r.result.status).toBe("⚠️");
+    expect(r.result.detail).toContain("opted in");
+    expect(r.isFail).toBe(false);
+    expect(r.isWarn).toBe(true);
+  });
+
+  it("Case 4: trainDataPath does not exist (TRAIN_MOUNT=MISSING) → ❌", () => {
+    const r = analyzeNvMigration({
+      ...baseInputs, nvAttached: true, trainDataPath: "/workspace/missing", trainMount: "MISSING",
+    });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("does not exist");
+    expect(r.isFail).toBe(true);
+  });
+
+  it("Case 5: data on NV (different mount), rootfs has space → ❌ with cp recommendation", () => {
+    const r = analyzeNvMigration({
+      ...baseInputs, nvAttached: true,
+      trainDataPath: "/workspace/dataset", trainMount: "/workspace",
+      trainDataGb: 30, rootfsFreeGb: 100,
+    });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("Data on NV");
+    expect(r.result.detail).toContain("cp -r --reflink=auto /workspace/dataset /root/data/");
+    expect(r.isFail).toBe(true);
+  });
+
+  it("Case 6: data on NV, rootfs too small → ❌ with containerDiskInGb recommendation", () => {
+    const r = analyzeNvMigration({
+      ...baseInputs, nvAttached: true,
+      trainDataPath: "/workspace/dataset", trainMount: "/workspace",
+      trainDataGb: 100, rootfsFreeGb: 50, // need 105 (100+5), have 50
+    });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("rootfs too small");
+    expect(r.result.detail).toContain("containerDiskInGb≥160"); // ceil(100*1.3 + 30) = 160
+    expect(r.isFail).toBe(true);
+  });
+
+  it("Case 7: data on rootfs, expectedRandomAccessGb fits → ✅", () => {
+    const r = analyzeNvMigration({
+      ...baseInputs, nvAttached: true,
+      trainDataPath: "/root/data/dataset", trainMount: "/",
+      trainDataGb: 30, rootfsFreeGb: 100,
+      expectedRandomAccessGb: 50,
+    });
+    expect(r.result.status).toBe("✅");
+    expect(r.result.detail).toContain("Data on rootfs");
+    expect(r.isFail).toBe(false);
+  });
+
+  it("Case 8: data on rootfs, expectedRandomAccessGb exceeds free space → ❌", () => {
+    const r = analyzeNvMigration({
+      ...baseInputs, nvAttached: true,
+      trainDataPath: "/root/data/dataset", trainMount: "/",
+      rootfsFreeGb: 50,
+      expectedRandomAccessGb: 100, // need 100+10 = 110, have 50
+    });
+    expect(r.result.status).toBe("❌");
+    expect(r.result.detail).toContain("rootfs has only 50GB free");
+    expect(r.result.detail).toContain("containerDiskInGb≥160"); // ceil(100*1.3 + 30) = 160
+    expect(r.isFail).toBe(true);
+  });
+
+  it("Case 9: data on rootfs, no expectedRandomAccessGb → ✅", () => {
+    const r = analyzeNvMigration({
+      ...baseInputs, nvAttached: true,
+      trainDataPath: "/root/data", trainMount: "/",
+    });
+    expect(r.result.status).toBe("✅");
+    expect(r.result.detail).toContain("Data on rootfs");
+    expect(r.isFail).toBe(false);
+  });
+
+  it("Case 10: NV detection — workspaceMount differs from rootMount", () => {
+    // Verify that the nvAttached precondition is what enables the NV path
+    const noNv = analyzeNvMigration({ ...baseInputs, nvAttached: false });
+    const withNv = analyzeNvMigration({ ...baseInputs, nvAttached: true });
+    expect(noNv.result.status).toBe("✅");
+    expect(withNv.result.status).toBe("❌"); // HALT
+  });
+});

@@ -1382,6 +1382,7 @@ server.tool(
     gpuPreference: z.array(z.string()).optional().describe("Preferred GPU types in order. Defaults to RTX 3090 / 4090 / A40 / A5000"),
     seedCount: z.number().default(1).describe("Number of random seeds to run (e.g. 3 for seed 42/123/456). When > 1, shows parallel pod pattern instead of sequential — same cost, N× faster."),
     armCount: z.number().default(1).describe("Number of experimental arms/conditions (e.g. 2 for T14 vs T15). Total pods = armCount × seedCount."),
+    randomAccessTrainingGb: z.number().optional().describe("Size (GB) of dataset that needs random access during training (image datasets, shuffled molecule sets, etc.). When provided, plan_gpu_job recommends containerDiskInGb large enough to copy data from NV to rootfs. NV random read is ~18× slower than rootfs (43 vs 775 files/sec), so random-access training MUST run on rootfs. rootfs CANNOT be expanded after pod creation."),
     outputSpecPath: z.string().optional().describe("If set, write a /gpu-exec pipeline_spec.json stub to this path"),
   },
   safeTool(async (args) => {
@@ -1477,13 +1478,36 @@ server.tool(
     lines.push(`Cost: ~$${(nvGb * NV_COST_PER_GB_MONTH).toFixed(2)}/mo`);
 
     lines.push(``);
+    lines.push(`### rootfs 사이징 (NV → rootfs 복사 필수)`);
+    if (args.randomAccessTrainingGb != null && args.randomAccessTrainingGb > 0) {
+      const ra = args.randomAccessTrainingGb;
+      const recDisk = Math.ceil(ra * 1.3 + 30); // data*1.3 (copy + work) + 30GB system
+      lines.push(`⚠️ **랜덤 액세스 훈련 ${ra}GB 감지** — NV는 rootfs보다 ~18× 느림 (43 vs 775 files/sec)`);
+      lines.push(`훈련 데이터를 NV에서 rootfs로 복사 후 훈련해야 함. **rootfs는 팟 생성 후 못 늘림**.`);
+      lines.push(``);
+      lines.push(`**권장**: \`containerDiskInGb=${recDisk}\` (data ${ra}GB × 1.3 + 30GB system overhead)`);
+      lines.push(`팟 생성 직후: \`mkdir -p /root/data && cp -r --reflink=auto /workspace/<dataset> /root/data/\``);
+      lines.push(`훈련 스크립트는 \`/root/data/<dataset>\` 를 읽도록 설정.`);
+      lines.push(`run_preflight 호출 시 \`trainDataPath="/root/data/<dataset>"\`, \`expectedRandomAccessGb=${ra}\` 전달.`);
+    } else if (datasetGb >= 50) {
+      lines.push(`⚠️ 대형 데이터셋 (${datasetGb}GB). 랜덤 액세스 훈련(이미지, 셔플된 데이터셋 등)이라면:`);
+      lines.push(`- NV는 rootfs보다 ~18× 느림 — 데이터를 rootfs로 복사 후 훈련 필요`);
+      lines.push(`- rootfs는 팟 생성 후 못 늘림 → \`containerDiskInGb\` 사전 계산 필수`);
+      lines.push(`- **랜덤 액세스 훈련이라면** \`randomAccessTrainingGb\` 파라미터를 추가해 정확한 사이즈 권장값을 받으세요`);
+      lines.push(`- 순수 sequential 읽기(rare)면 NV 직접 가능 — run_preflight에서 \`allowNvStreaming:true\``);
+    } else {
+      lines.push(`✅ 데이터셋 ${datasetGb}GB — rootfs 기본값으로 충분. 랜덤 액세스 훈련이라도 작은 데이터는 부담 적음.`);
+    }
+
+    lines.push(``);
     lines.push(`### Pre-flight Checklist`);
     lines.push(`[ ] 1. 로컬 전처리 완료 (tokenization, feature extraction 등 GPU 불필요한 작업)`);
     lines.push(`[ ] 2. 학습 코드 로컬 테스트 통과 (import, forward pass, 설정 파일 확인)`);
     lines.push(`[ ] 3. 체크포인트 저장 경로 설정 (/workspace/checkpoints/ 또는 NV 경로)`);
     lines.push(`[ ] 4. NV 크기 확인: ${nvGb}GB 준비`);
+    lines.push(`[ ] 5. **rootfs 사이즈 확인** (랜덤 액세스 데이터 + 시스템 오버헤드 — 생성 후 못 늘림)`);
     if (args.gpuCount >= COST_GATE_GPU_COUNT) {
-      lines.push(`[ ] 5. **1-GPU 검증 테스트 완료** (gpuCount=${args.gpuCount} — 고비용 팟 전 필수)`);
+      lines.push(`[ ] 6. **1-GPU 검증 테스트 완료** (gpuCount=${args.gpuCount} — 고비용 팟 전 필수)`);
     }
 
     lines.push(``);
@@ -1687,8 +1711,11 @@ server.tool(
     importSmokes: z.array(z.string()).optional().describe("Python import statements to test on pod (e.g. ['from chemprop.featurizers import SimpleMoleculeMolGraphFeaturizer'])"),
     minDiskFreeGb: z.number().default(10).describe("Minimum free disk space on /workspace/ in GB"),
     strict: z.boolean().default(false).describe("If true, treat any WARNING as FAIL"),
+    trainDataPath: z.string().optional().describe("Absolute path on pod where the training script READS data from (e.g. '/workspace/dataset' or '/root/data'). REQUIRED for GPU pods with NV attached unless allowNvStreaming:true. NV random read is ~18x slower than rootfs (43 vs 775 files/sec). Verifies data has been copied from NV to rootfs."),
+    expectedRandomAccessGb: z.number().optional().describe("Size (GB) of dataset that needs random access during training. Used to verify rootfs has enough free space. rootfs CANNOT be expanded after pod creation — must be sized at creation time via containerDiskInGb."),
+    allowNvStreaming: z.boolean().default(false).describe("Opt-out: skip the NV→rootfs migration HALT. Only set true if training does PURELY sequential reads (rare for ML; image/molecule/text shuffled training all need random access)."),
   },
-  safeTool(async ({ podId, requirementsPath, requiredFiles, requiredTools, importSmokes, minDiskFreeGb, strict }) => {
+  safeTool(async ({ podId, requirementsPath, requiredFiles, requiredTools, importSmokes, minDiskFreeGb, strict, trainDataPath, expectedRandomAccessGb, allowNvStreaming }) => {
     const c = requireClient();
     const pod = await c.getPod(podId);
     if (!pod) return text(`❌ Pod ${podId} not found.`);
@@ -1739,6 +1766,132 @@ server.tool(
           hasFail = true;
         } else {
           results.push({ label: "CUDA", status: "✅", detail: cudaLine.replace("CUDA:OK ", "") });
+        }
+      }
+    }
+
+    // 0.5. NV → rootfs migration check (HALT if data on NV)
+    // Background: NV random read ~43 files/sec, rootfs (NVMe) ~775 files/sec — 18x slower.
+    // For random-access training (image/molecule/shuffled datasets), data MUST be on rootfs.
+    // rootfs CANNOT be expanded after pod creation — must be sized at creation via containerDiskInGb.
+    {
+      // Defense-in-depth path sanitization (base64 wrap below also prevents shell injection)
+      const trainPathSafe = (trainDataPath ?? "").replace(/['\\\n\r]/g, "");
+      const inspectShell = [
+        `R=$(stat -c %m / 2>/dev/null || echo '/')`,
+        `W=$(stat -c %m /workspace 2>/dev/null || echo 'MISSING')`,
+        trainPathSafe ? `T=$(stat -c %m '${trainPathSafe}' 2>/dev/null || echo 'MISSING')` : `T=''`,
+        `FREE=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}' || echo '0')`,
+        `TOTAL=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G","",$2); print $2}' || echo '0')`,
+        trainPathSafe ? `DATA=$(du -sBG '${trainPathSafe}' 2>/dev/null | awk '{gsub("G","",$1); print $1}' || echo '0')` : `DATA=''`,
+        `echo "R=$R|W=$W|T=$T|FREE=$FREE|TOTAL=$TOTAL|DATA=$DATA"`,
+      ].join(";");
+      const inspectB64 = Buffer.from(inspectShell).toString("base64");
+      const inspectCmd = `bash -c 'echo ${inspectB64} | base64 -d | bash'`;
+      const inspectResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", inspectCmd], { timeout: 30_000 });
+
+      if (inspectResult.status === null) {
+        results.push({ label: "NV→rootfs", status: "⚠️", detail: "Mount inspection timed out (30s) — pod may be cold-starting. Re-run run_preflight." });
+        hasWarn = true;
+      } else if (inspectResult.status !== 0) {
+        results.push({ label: "NV→rootfs", status: "⚠️", detail: `Mount inspection failed (exit ${inspectResult.status}) — skipping NV check. stderr: ${(inspectResult.stderr ?? "").substring(0, 150)}` });
+        hasWarn = true;
+      } else {
+        // Parse: R=<mount>|W=<mount>|T=<mount>|FREE=<gb>|TOTAL=<gb>|DATA=<gb>
+        const lastLine = (inspectResult.stdout ?? "").trim().split("\n").pop() ?? "";
+        const parts: Record<string, string> = {};
+        for (const kv of lastLine.split("|")) {
+          const eq = kv.indexOf("=");
+          if (eq > 0) parts[kv.substring(0, eq)] = kv.substring(eq + 1);
+        }
+        const rootMount = parts.R || "/";
+        const workspaceMount = parts.W || "MISSING";
+        const trainMount = parts.T || "";
+        const rootfsFreeGb = parseInt(parts.FREE || "0", 10) || 0;
+        const rootfsTotalGb = parseInt(parts.TOTAL || "0", 10) || 0;
+        const trainDataGb = parseInt(parts.DATA || "0", 10) || 0;
+        const nvAttached = workspaceMount !== "MISSING" && workspaceMount !== rootMount;
+
+        // ── Decision tree ──────────────────────────────────────────
+        if (!nvAttached) {
+          results.push({ label: "NV→rootfs", status: "✅", detail: `No NV attached — rootfs only (${rootfsFreeGb}/${rootfsTotalGb}GB free)` });
+        } else if (!trainDataPath && !allowNvStreaming) {
+          // HALT: Pod has NV, no path specified, no opt-out → require user input
+          results.push({
+            label: "NV→rootfs",
+            status: "❌",
+            detail:
+              `HALT — NV attached at ${workspaceMount} but trainDataPath not specified. ` +
+              `NV random read ~18x slower than rootfs (43 vs 775 files/sec). ` +
+              `ASK USER: (1) which path will the training script READ data from? ` +
+              `(2) dataset size in GB needing random access? ` +
+              `Then re-run with trainDataPath="<path>" and expectedRandomAccessGb=<N>. ` +
+              `Opt-out (rare, sequential reads only): allowNvStreaming:true. ` +
+              `Note: rootfs has ${rootfsFreeGb}/${rootfsTotalGb}GB free — cannot grow after pod creation.`,
+          });
+          hasFail = true;
+        } else if (!trainDataPath && allowNvStreaming) {
+          results.push({
+            label: "NV→rootfs",
+            status: "⚠️",
+            detail: `NV streaming opted in (allowNvStreaming:true). Random reads will be ~18x slower than rootfs. Verify training pattern is sequential.`,
+          });
+          hasWarn = true;
+        } else if (trainMount === "MISSING") {
+          results.push({
+            label: "NV→rootfs",
+            status: "❌",
+            detail: `trainDataPath does not exist on pod: ${trainDataPath}. Check the path or upload data first.`,
+          });
+          hasFail = true;
+        } else if (trainMount !== rootMount) {
+          // Data on NV — fail with copy recommendation
+          const dataInfo = trainDataGb > 0 ? `${trainDataGb}GB` : "unknown size";
+          const targetPath = `/root/data`;
+          const recCmd = `mkdir -p ${targetPath} && cp -r --reflink=auto ${trainDataPath} ${targetPath}/`;
+          const sufficient = trainDataGb === 0 || rootfsFreeGb >= trainDataGb + 5;
+          if (!sufficient) {
+            const recDisk = Math.ceil(trainDataGb * 1.3 + 30);
+            results.push({
+              label: "NV→rootfs",
+              status: "❌",
+              detail:
+                `Data on NV (mount=${trainMount}, ${dataInfo}) AND rootfs too small (${rootfsFreeGb}GB free, need ≥${trainDataGb + 5}GB). ` +
+                `rootfs CANNOT be grown on running pod — recreate pod with containerDiskInGb≥${recDisk}.`,
+            });
+          } else {
+            results.push({
+              label: "NV→rootfs",
+              status: "❌",
+              detail:
+                `Data on NV (mount=${trainMount}, ${dataInfo}) — must copy to rootfs first. ` +
+                `NV random read ~18x slower than rootfs. ` +
+                `Run on pod: ${recCmd}. ` +
+                `Then re-point training script to ${targetPath}/<basename> and re-run preflight.`,
+            });
+          }
+          hasFail = true;
+        } else if (expectedRandomAccessGb != null && rootfsFreeGb < expectedRandomAccessGb + 10) {
+          // Data on rootfs but rootfs too small for the planned data
+          const recDisk = Math.ceil(expectedRandomAccessGb * 1.3 + 30);
+          results.push({
+            label: "NV→rootfs",
+            status: "❌",
+            detail:
+              `Data on rootfs ✓ but rootfs has only ${rootfsFreeGb}GB free, need ≥${expectedRandomAccessGb + 10}GB ` +
+              `(expectedRandomAccessGb=${expectedRandomAccessGb} + 10GB headroom). ` +
+              `rootfs CANNOT be grown on running pod — recreate with containerDiskInGb≥${recDisk}.`,
+          });
+          hasFail = true;
+        } else {
+          const sizeNote = expectedRandomAccessGb != null
+            ? ` (rootfs ${rootfsFreeGb}/${rootfsTotalGb}GB free, expected ${expectedRandomAccessGb}GB)`
+            : ` (rootfs ${rootfsFreeGb}/${rootfsTotalGb}GB free)`;
+          results.push({
+            label: "NV→rootfs",
+            status: "✅",
+            detail: `Data on rootfs (mount=${trainMount})${sizeNote}`,
+          });
         }
       }
     }
