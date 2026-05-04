@@ -65,6 +65,22 @@ plan_gpu_job(randomAccessTrainingGb=N) → containerDiskInGb 권장값 출력
    - 직접(OMC 없는 환경): `execute_ssh_command("sleep 120")` 완료 후 `gpu_sample_burst` 호출
    → `CONSISTENTLY_IDLE` → 즉시 중단 + 로그 확인 (CPU fallback 또는 NV 스트리밍 의심)
    → `STABLE_OPTIMAL` / `IMPROVING` → `watch_running_pods`로 모니터링 인계
+3. 훈련 완료 후 **아티팩트 보존** (필수):
+   - **NV 있는 경우**: `execute_ssh_command("rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK")`
+     → 출력에서 `RSYNC_OK` 확인 필수 (partial transfer 방지) → `delete_pod(artifactsSavedConfirmed: true)`
+   - **NV 없는 경우**: `download_files(remotePath="/workspace", localPath="./outputs/")` → `delete_pod(artifactsSavedConfirmed: true)`
+   - ⚠️ `RSYNC_OK` 또는 `download_files` 완료 확인 전 `delete_pod` 호출 금지
+
+**아티팩트 보존 규칙 (입출력 디렉토리)**
+- 훈련 입력 (랜덤 액세스): `/root/data/` (rootfs — NV보다 18× 빠름)
+- 체크포인트 write (훈련 중): `/root/outputs/` (rootfs — write 빈도 높아 NV 병목 방지)
+  - `containerDiskInGb` 계산 시 체크포인트 예상 크기 포함 필수 → `plan_gpu_job(checkpointBudgetGb=N)` 전달
+- 훈련 완료 직후: `rsync /root/outputs/ /workspace/outputs/` (NV 영속화, RSYNC_OK 확인)
+- NV 없는 경우: `download_files` → `delete_pod(artifactsSavedConfirmed: true)`
+
+**ARTIFACT SAFETY (costSafetyConfirmed 동일 규칙)**
+Claude는 사용자 명시 없이 `artifactsSavedConfirmed: true` 자동 설정 금지.
+NV 없는 팟에서 `delete_pod` 호출 전 반드시 download 완료를 사용자에게 확인할 것.
 
 **예외 (run_preflight allowNvStreaming:true):** 훈련이 순수 sequential read만 한다면 (드물다 — 대부분의 ML은 random shuffle) NV 직접 사용 가능. 이 경우만 opt-out.
 3. If underutilized, call `gpu_health_check` with `perSampleMb` for batch size recommendation

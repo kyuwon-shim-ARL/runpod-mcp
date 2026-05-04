@@ -532,29 +532,52 @@ server.tool(
 server.tool(
   "delete_pod",
   "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes. Returns an estimated total cost (uptime × cost_per_hr) for closing the pod metadata record.",
-  { podId: z.string() },
-  safeTool(async ({ podId }) => {
+  {
+    podId: z.string(),
+    artifactsSavedConfirmed: z.boolean().optional().describe(
+      "Required when pod has no network volume. Set true only after confirming model weights/results are downloaded locally. " +
+      "Claude must NOT set this automatically without explicit user confirmation. (Same rule as costSafetyConfirmed.)"
+    ),
+  },
+  safeTool(async ({ podId, artifactsSavedConfirmed }) => {
     const c = requireClient();
     // Capture cost-relevant info BEFORE deletion (the pod is gone after).
     let costEstimate: ReturnType<typeof estimatePodCost> = null;
     let podName: string | undefined;
+    let hasNv = false;
     try {
       const pod = await c.getPod(podId);
       podName = pod.name;
       costEstimate = estimatePodCost(pod.costPerHr, pod.lastStartedAt);
+      hasNv = !!(pod as { networkVolumeId?: string }).networkVolumeId;
     } catch {
       // Pod may already be unreachable; proceed with deletion attempt anyway.
+    }
+
+    // Artifact gate: block deletion when NV is absent and user hasn't confirmed download.
+    if (!hasNv && artifactsSavedConfirmed !== true) {
+      return text(
+        `⛔ ARTIFACT GATE: Pod "${podName ?? podId}" has no network volume — container disk data will be permanently lost.\n\n` +
+        `Before deleting:\n` +
+        `  1. download_files(podId: "${podId}", remotePath: "/workspace", localPath: "./outputs/")\n` +
+        `     OR confirm outputs are already saved elsewhere.\n` +
+        `  2. Re-call: delete_pod(podId: "${podId}", artifactsSavedConfirmed: true)\n\n` +
+        `⚠️ Claude must NOT set artifactsSavedConfirmed:true automatically. Requires explicit user confirmation. (Same rule as costSafetyConfirmed.)`
+      );
     }
 
     const { wasRunning } = await deletePodWithStop(c, podId);
 
     const stoppedNote = wasRunning ? " (was running → auto-stopped first)" : "";
+    const nvNote = hasNv
+      ? `\n💡 NV pod: /workspace outputs persist after deletion. Data outside /workspace (container disk) is gone.`
+      : "";
     const costNote = costEstimate
       ? `\n\n[Cost estimate] Uptime ${costEstimate.hours.toFixed(2)}h × rate → $${costEstimate.cost.toFixed(2)}` +
         `\nUpdate the pod metadata: read .omc/pods/<file>.yaml → set deleted_at and cost_actual_usd → save_pod_metadata → git commit "chore(pod): close ${podName ?? podId}"`
       : "\n\n[Cost estimate] Unavailable (no costPerHr or lastStartedAt). Set cost_actual_usd manually if you tracked it.";
 
-    return text(`Pod ${podId} deleted.${stoppedNote}${costNote}`);
+    return text(`Pod ${podId} deleted.${stoppedNote}${nvNote}${costNote}`);
   })
 );
 
@@ -575,12 +598,26 @@ server.tool(
       return text(`No stale pods found.\n\nSkipped: ${skipped.length} pod(s)${skipped.length ? "\n" + skipped.map(s => `  - ${s.pod.name}: ${s.reason}`).join("\n") : ""}`);
     }
 
+    const noNvPods = stale.filter(s => !(s.pod as { networkVolumeId?: string }).networkVolumeId);
+
     if (dryRun) {
-      const lines = stale.map(s =>
-        `  - ${s.pod.name} (${s.pod.id}) — idle ${s.idleHours}h, ${s.pod.gpu?.displayName ?? "unknown GPU"}, $${s.pod.costPerHr ?? "?"}/hr`
-      );
-      return text(`[DRY RUN] Would delete ${stale.length} stale pod(s):\n${lines.join("\n")}\n\nRe-run with dryRun=false to delete.`);
+      const lines = stale.map(s => {
+        const hasNv = !!(s.pod as { networkVolumeId?: string }).networkVolumeId;
+        const artifactWarn = hasNv ? "" : ` ⚠️ NO NV — container disk data will be lost`;
+        return `  - ${s.pod.name} (${s.pod.id}) — idle ${s.idleHours}h, ${s.pod.gpu?.displayName ?? "unknown GPU"}, $${s.pod.costPerHr ?? "?"}/hr${artifactWarn}`;
+      });
+      const nvWarning = noNvPods.length
+        ? `\n\n⚠️ ARTIFACT WARNING: ${noNvPods.length} pod(s) have no network volume — container disk data will be permanently lost on deletion:\n` +
+          noNvPods.map(s => `  - ${s.pod.name}: use delete_pod(artifactsSavedConfirmed:true) after downloading outputs`).join("\n")
+        : "";
+      return text(`[DRY RUN] Would delete ${stale.length} stale pod(s):\n${lines.join("\n")}${nvWarning}\n\nRe-run with dryRun=false to delete.`);
     }
+
+    // Warn about NV-less pods before batch deletion (no hard block to preserve automation).
+    const preWarning = noNvPods.length
+      ? `⚠️ ARTIFACT WARNING: ${noNvPods.length} pod(s) with no network volume will lose container disk data:\n` +
+        noNvPods.map(s => `  - ${s.pod.name}`).join("\n") + "\nProceeding with deletion...\n\n"
+      : "";
 
     const deleted: string[] = [];
     const failed: string[] = [];
@@ -593,7 +630,7 @@ server.tool(
       }
     }
 
-    return text(`Deleted ${deleted.length} stale pod(s):\n${deleted.map(d => `  - ${d}`).join("\n")}${failed.length ? `\n\nFailed: ${failed.join(", ")}` : ""}`);
+    return text(`${preWarning}Deleted ${deleted.length} stale pod(s):\n${deleted.map(d => `  - ${d}`).join("\n")}${failed.length ? `\n\nFailed: ${failed.join(", ")}` : ""}`);
   })
 );
 
@@ -1383,6 +1420,7 @@ server.tool(
     seedCount: z.number().default(1).describe("Number of random seeds to run (e.g. 3 for seed 42/123/456). When > 1, shows parallel pod pattern instead of sequential — same cost, N× faster."),
     armCount: z.number().default(1).describe("Number of experimental arms/conditions (e.g. 2 for T14 vs T15). Total pods = armCount × seedCount."),
     randomAccessTrainingGb: z.number().optional().describe("Size (GB) of dataset that needs random access during training (image datasets, shuffled molecule sets, etc.). When provided, plan_gpu_job recommends containerDiskInGb large enough to copy data from NV to rootfs. NV random read is ~18× slower than rootfs (43 vs 775 files/sec), so random-access training MUST run on rootfs. rootfs CANNOT be expanded after pod creation."),
+    checkpointBudgetGb: z.number().default(5).describe("Expected checkpoint storage during training (GB). Written to rootfs (/root/outputs/) during training, then rsync'd to NV on completion. Included in containerDiskInGb recommendation. Default 5GB covers typical model checkpoints."),
     outputSpecPath: z.string().optional().describe("If set, write a /gpu-exec pipeline_spec.json stub to this path"),
   },
   safeTool(async (args) => {
@@ -1503,12 +1541,16 @@ server.tool(
     lines.push(`### Pre-flight Checklist`);
     lines.push(`[ ] 1. 로컬 전처리 완료 (tokenization, feature extraction 등 GPU 불필요한 작업)`);
     lines.push(`[ ] 2. 학습 코드 로컬 테스트 통과 (import, forward pass, 설정 파일 확인)`);
-    lines.push(`[ ] 3. 체크포인트 저장 경로 설정 (/workspace/checkpoints/ 또는 NV 경로)`);
+    lines.push(`[ ] 3. 체크포인트 저장 경로 설정 → **/root/outputs/** (rootfs, 훈련 중 write 빠름)`);
     lines.push(`[ ] 4. NV 크기 확인: ${nvGb}GB 준비`);
-    lines.push(`[ ] 5. **rootfs 사이즈 확인** (랜덤 액세스 데이터 + 시스템 오버헤드 — 생성 후 못 늘림)`);
+    lines.push(`[ ] 5. **rootfs 사이즈 확인** (랜덤 액세스 데이터 + 체크포인트 ${args.checkpointBudgetGb}GB + 시스템 오버헤드 — 생성 후 못 늘림)`);
     if (args.gpuCount >= COST_GATE_GPU_COUNT) {
       lines.push(`[ ] 6. **1-GPU 검증 테스트 완료** (gpuCount=${args.gpuCount} — 고비용 팟 전 필수)`);
     }
+    lines.push(``);
+    lines.push(`### Post-Training (아티팩트 보존)`);
+    lines.push(`[ ] 훈련 완료 후 (NV 있음): \`rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK\` → RSYNC_OK 확인 → \`delete_pod(artifactsSavedConfirmed: true)\``);
+    lines.push(`[ ] 훈련 완료 후 (NV 없음): \`download_files\` → \`delete_pod(artifactsSavedConfirmed: true)\``);
 
     lines.push(``);
     // Seed parallelization section
@@ -1556,15 +1598,15 @@ server.tool(
 
     // Container disk warning
     const DEFAULT_CONTAINER_DISK_GB = 30;
-    const diskEstimateGb = ((args.modelSizeGb ?? 5) + datasetGb * 0.1 + 2) * args.gpuCount;
+    const diskEstimateGb = ((args.modelSizeGb ?? 5) + datasetGb * 0.1 + args.checkpointBudgetGb + 2) * args.gpuCount;
     const diskThreshold = DEFAULT_CONTAINER_DISK_GB * 0.7;
     lines.push(``);
     lines.push(`### Container Disk`);
     if (diskEstimateGb > diskThreshold) {
       const recommendedDisk = Math.ceil(diskEstimateGb * 1.5);
-      lines.push(`⚠️ **Container disk warning**: estimated experiment output ~${diskEstimateGb.toFixed(1)}GB (model + tmp + logs × gpuCount=${args.gpuCount}) exceeds 70% of RunPod default ${DEFAULT_CONTAINER_DISK_GB}GB disk.`);
+      lines.push(`⚠️ **Container disk warning**: estimated experiment output ~${diskEstimateGb.toFixed(1)}GB (model + tmp + checkpoints + logs × gpuCount=${args.gpuCount}) exceeds 70% of RunPod default ${DEFAULT_CONTAINER_DISK_GB}GB disk.`);
       lines.push(`→ Set \`containerDiskInGb: ${recommendedDisk}\` in create_pod_auto`);
-      lines.push(`→ Formula: (modelSizeGb=${args.modelSizeGb ?? 5} + datasetGb×0.1=${(datasetGb * 0.1).toFixed(1)} + 2) × gpuCount=${args.gpuCount} = ${diskEstimateGb.toFixed(1)}GB`);
+      lines.push(`→ Formula: (modelSizeGb=${args.modelSizeGb ?? 5} + datasetGb×0.1=${(datasetGb * 0.1).toFixed(1)} + checkpointBudgetGb=${args.checkpointBudgetGb} + 2) × gpuCount=${args.gpuCount} = ${diskEstimateGb.toFixed(1)}GB`);
     } else {
       lines.push(`✅ Estimated disk usage ~${diskEstimateGb.toFixed(1)}GB — within 70% of default ${DEFAULT_CONTAINER_DISK_GB}GB container disk.`);
     }
