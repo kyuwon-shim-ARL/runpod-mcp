@@ -478,9 +478,18 @@ export interface PodMetadataStubInput {
   name: string;
   created_at: string;
   datacenter?: string;
+  /** "GPU" (default) or "CPU". Determines which compute fields are emitted. */
+  compute_type?: "GPU" | "CPU";
+  /** GPU pod only. Ignored when compute_type === "CPU". */
   gpu?: string;
+  /** GPU pod only. Ignored when compute_type === "CPU". */
   gpu_count?: number;
-  cost_per_hr?: number;
+  /** CPU pod only. */
+  vcpu_count?: number;
+  /** CPU pod only. */
+  cpu_flavor_ids?: string[];
+  /** null when unknown (e.g., RunPod doesn't expose CPU pricing via API). */
+  cost_per_hr?: number | null;
   image?: string;
   container_disk_gb?: number;
   network_volume?: { id: string; name: string; size_gb: number; datacenter?: string } | null;
@@ -490,17 +499,30 @@ export interface PodMetadataStubInput {
  * Build a JSON-formatted pod metadata stub from facts known at pod-creation time.
  * Echoed in create_pod / create_pod_auto responses so Claude can pass it directly
  * to save_pod_metadata after enriching with purpose / post_create_steps / etc.
+ *
+ * GPU pods (default) emit gpu/gpu_count. CPU pods emit vcpu_count/cpu_flavor_ids.
  */
 export function buildPodMetadataStub(input: PodMetadataStubInput): string {
-  const stub = {
+  const isCpu = input.compute_type === "CPU";
+  const base = {
     pod_id: input.pod_id,
     name: input.name,
     purpose: "<fill in: what this pod is for>",
     created_at: input.created_at,
     deleted_at: null,
     datacenter: input.datacenter ?? null,
-    gpu: input.gpu ?? null,
-    gpu_count: input.gpu_count ?? 1,
+    compute_type: input.compute_type ?? "GPU",
+  };
+  const compute = isCpu
+    ? {
+        vcpu_count: input.vcpu_count ?? null,
+        cpu_flavor_ids: input.cpu_flavor_ids ?? null,
+      }
+    : {
+        gpu: input.gpu ?? null,
+        gpu_count: input.gpu_count ?? 1,
+      };
+  const tail = {
     cost_per_hr: input.cost_per_hr ?? null,
     container_disk_gb: input.container_disk_gb ?? null,
     image: input.image ?? null,
@@ -509,7 +531,7 @@ export function buildPodMetadataStub(input: PodMetadataStubInput): string {
     post_create_steps: [],
     incidents: [],
   };
-  return JSON.stringify(stub, null, 2);
+  return JSON.stringify({ ...base, ...compute, ...tail }, null, 2);
 }
 
 // ── delete_pod with auto-stop ──

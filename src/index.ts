@@ -12,6 +12,7 @@ import type { ToolResult } from "./tool-helpers.js";
 import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, injectPytorchEnv, summarizeTrend, getStockStatus, isInStock, getSpotPrice, getOnDemandPrice } from "./gpu-utils.js";
 import { classifyTrainingSmoke, planMonitoringCadence, renderMonitoringCadenceSection } from "./monitoring-utils.js";
 import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
+import { CPU_FLAVORS, CPU_FLAVOR_IDS, defaultFlavorOrder } from "./cpu-catalog.js";
 
 const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
 const COST_GATE_HOURLY_USD = 1.0;    // ondemandPrice * gpuCount >= this triggers gate
@@ -70,6 +71,35 @@ function podSummary(pod: Pod): string {
 function isAuthError(e: unknown): boolean {
   const msg = String((e as { message?: string })?.message ?? "");
   return /\b(401|403|unauthorized|forbidden|authentication)\b/i.test(msg);
+}
+
+/**
+ * Resolve the DC iteration list and (optional) network-volume note used by
+ * create_pod_auto's CPU and GPU branches. Returns an error string when the
+ * caller-supplied networkVolumeId can't be found, so the caller can short-circuit.
+ *
+ * NV present → only NV's DC (single). NV absent → user dcPriority OR built-in default.
+ */
+async function resolveDcAndNv(
+  client: RunPodClient,
+  networkVolumeId: string | undefined,
+  dcPriority: string[] | undefined
+): Promise<
+  | { error: string }
+  | { dcsToTry: string[]; nvDataCenterId: string | undefined; volumeNote: string }
+> {
+  let nvDataCenterId: string | undefined;
+  let volumeNote = "";
+  if (networkVolumeId) {
+    const vol = await client.getNetworkVolume(networkVolumeId);
+    if (!vol) return { error: `Network volume ${networkVolumeId} not found.` };
+    nvDataCenterId = vol.dataCenterId;
+    volumeNote = `\nNetwork Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
+  }
+  const dcsToTry: string[] = nvDataCenterId
+    ? [nvDataCenterId]
+    : (dcPriority && dcPriority.length > 0 ? dcPriority : DEFAULT_DC_PRIORITY);
+  return { dcsToTry, nvDataCenterId, volumeNote };
 }
 
 /**
@@ -242,8 +272,108 @@ server.tool(
       .string()
       .optional()
       .describe("Token from verify_data_on_nv. Required when gpuCount >= 2 AND networkVolumeId is set (ensures data was verified on NV before launching expensive multi-GPU pod)."),
+    cpuOnly: z.boolean().default(false).describe("Create a CPU-only pod (no GPU). Skips GPU stock probing and cost safety gates. Use list_cpu_types to see flavor options."),
+    cpuFamily: z.enum(["compute", "general", "highmem"]).optional().describe("CPU flavor family preference (cpuOnly only). compute=2GB/vCPU, general=4GB/vCPU, highmem=8GB/vCPU. Ignored when cpuFlavorIds is provided."),
+    cpuFlavorIds: z.array(z.enum(CPU_FLAVOR_IDS as [string, ...string[]])).optional().describe("CPU flavor IDs in priority order (cpuOnly only). When provided, cpuFlavorPriority is set to 'custom' (RunPod honors the order). Defaults to cpu5 then cpu3 in the chosen family. Run list_cpu_types for valid IDs."),
+    vcpuCount: z.number().int().positive().max(128).default(2).describe("vCPU count for CPU pod (cpuOnly only). Default 2, max 128."),
   },
   safeTool(async (args) => {
+    // CPU-only short-circuit. Skips GPU stock probing, cost gate, NV readiness — CPU pods
+    // are <$1/hr and don't have the multi-GPU runaway-cost shape that those gates exist for.
+    if (args.cpuOnly) {
+      const c = requireClient();
+      const autoSshKey = await readSshPubKey();
+      const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
+
+      const nv = await resolveDcAndNv(c, args.networkVolumeId, args.dcPriority);
+      if ("error" in nv) return text(nv.error);
+      const { dcsToTry, volumeNote } = nv;
+
+      // User-explicit flavor list → "custom" priority (RunPod honors order).
+      // Default fallback list → "availability" (RunPod picks any available).
+      const hasExplicitFlavors = !!(args.cpuFlavorIds && args.cpuFlavorIds.length > 0);
+      const flavorIds = hasExplicitFlavors
+        ? args.cpuFlavorIds!
+        : defaultFlavorOrder(args.cpuFamily);
+      const flavorPriority: "custom" | "availability" = hasExplicitFlavors ? "custom" : "availability";
+
+      if (args.dryRun) {
+        return text(
+          `## Dry Run — CPU Pod Preview (no pod created)\n\n` +
+            `Compute type: CPU\n` +
+            `vCPU: ${args.vcpuCount}\n` +
+            `Flavor priority: ${flavorIds.join(", ")} (mode: ${flavorPriority}${hasExplicitFlavors ? ", honors order" : `, RunPod picks${args.cpuFamily ? ` from family=${args.cpuFamily}` : ""}`})\n` +
+            `Image: ${args.imageName}\n` +
+            `Container disk: ${args.containerDiskInGb}GB\n` +
+            `DC fallback order: ${dcsToTry.join(" → ")}${volumeNote}\n\n` +
+            `Note: RunPod does not expose CPU pricing via API. Verify on console.runpod.io/pods → CPU tab.\n\n` +
+            `## Next Steps\n→ create_pod_auto with same parameters and dryRun: false`
+        );
+      }
+
+      const cpuFailures: Array<{ dc: string; error: string }> = [];
+      for (const dc of dcsToTry) {
+        try {
+          const opts = {
+            name: args.name,
+            imageName: args.imageName,
+            computeType: "CPU" as const,
+            vcpuCount: args.vcpuCount,
+            cpuFlavorIds: flavorIds,
+            cpuFlavorPriority: flavorPriority,
+            containerDiskInGb: args.containerDiskInGb,
+            volumeInGb: args.volumeInGb,
+            volumeMountPath: "/workspace",
+            ...(resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {}),
+            ports: ["22/tcp"] as string[],
+            env: args.env,
+            networkVolumeId: args.networkVolumeId,
+            dataCenterIds: [dc],
+            cloudType: args.cloudType,
+          };
+          const pod = await c.createPod(opts);
+          const assignedFlavor = pod.cpuFlavorId ?? null;
+          const stub = buildPodMetadataStub({
+            pod_id: pod.id,
+            name: args.name,
+            created_at: new Date().toISOString(),
+            datacenter: dc,
+            compute_type: "CPU",
+            vcpu_count: args.vcpuCount,
+            cpu_flavor_ids: flavorIds,
+            cost_per_hr: pod.costPerHr ?? null, // RunPod returns this on pod creation
+            image: args.imageName,
+            container_disk_gb: args.containerDiskInGb,
+            network_volume: args.networkVolumeId
+              ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc }
+              : null,
+          });
+          const assignedNote = assignedFlavor && !flavorIds.includes(assignedFlavor)
+            ? ` (RunPod picked ${assignedFlavor}, not in requested list — verify if intentional)`
+            : assignedFlavor
+            ? ` (RunPod assigned ${assignedFlavor})`
+            : "";
+          return text(
+            `Auto-selected CPU pod in ${dc} (requested: ${flavorIds.join(", ")} [${flavorPriority}], ${args.vcpuCount} vCPU)${assignedNote}${volumeNote}\n${podSummary(pod)}\n\n` +
+              `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
+              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
+          );
+        } catch (e) {
+          if (isAuthError(e)) return errorResult(e);
+          cpuFailures.push({ dc, error: (e as Error).message });
+          continue;
+        }
+      }
+
+      return text(
+        `No CPU pod could be created across ${dcsToTry.length} DC.\n\n` +
+          `Attempted: ${dcsToTry.join(" → ")}\n` +
+          `Flavor priority: ${flavorIds.join(", ")} [${flavorPriority}]\n\n` +
+          `Failures:\n${cpuFailures.map((f) => `  ${f.dc}: ${f.error}`).join("\n")}\n\n` +
+          `Try overriding dcPriority or widening cpuFlavorIds. Run list_cpu_types for options.`
+      );
+    }
+
     // NV readiness token check: multi-GPU + NV requires prior verify_data_on_nv call
     if (args.gpuCount >= COST_GATE_GPU_COUNT && args.networkVolumeId && !args.dryRun) {
       if (!args.nvReadinessToken) {
@@ -329,23 +459,9 @@ server.tool(
 
     const gpuTypes = await c.listGpuTypes();
 
-    // Resolve datacenter affinity from network volume.
-    // If NV is provided, the pod MUST run in NV's DC — dcPriority is ignored.
-    let nvDataCenterId: string | undefined;
-    let volumeNote = "";
-    if (args.networkVolumeId) {
-      const vol = await c.getNetworkVolume(args.networkVolumeId);
-      if (!vol) return text(`Network volume ${args.networkVolumeId} not found.`);
-      nvDataCenterId = vol.dataCenterId;
-      volumeNote = `\nNetwork Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
-    }
-
-    // DC iteration list:
-    //   - NV present  → only NV's DC (single)
-    //   - NV absent   → user-supplied dcPriority OR built-in default
-    const dcsToTry: string[] = nvDataCenterId
-      ? [nvDataCenterId]
-      : (args.dcPriority && args.dcPriority.length > 0 ? args.dcPriority : DEFAULT_DC_PRIORITY);
+    const nvRes = await resolveDcAndNv(c, args.networkVolumeId, args.dcPriority);
+    if ("error" in nvRes) return text(nvRes.error);
+    const { dcsToTry, nvDataCenterId, volumeNote } = nvRes;
 
     const { candidates, errors } = selectGpuCandidates(gpuTypes, {
       gpuPreference: args.gpuPreference,
@@ -786,6 +902,40 @@ server.tool(
   })
 );
 
+// ── list_cpu_types ──
+server.tool(
+  "list_cpu_types",
+  "List available RunPod CPU pod flavors (cpu3/cpu5 × compute/general/highmem). Pricing is not exposed by RunPod's API — verify on https://console.runpod.io/pods (CPU tab) before cost-sensitive decisions.",
+  {
+    family: z.enum(["compute", "general", "highmem"]).optional().describe("Filter by family: compute (2GB/vCPU), general (4GB/vCPU), highmem (8GB/vCPU)"),
+    generation: z.enum(["cpu3", "cpu5"]).optional().describe("Filter by generation: cpu3 (AMD EPYC Milan) or cpu5 (Intel Xeon)"),
+  },
+  safeTool(async ({ family, generation }) => {
+    let flavors = CPU_FLAVORS;
+    if (family) flavors = flavors.filter((f) => f.family === family);
+    if (generation) flavors = flavors.filter((f) => f.generation === generation);
+
+    if (!flavors.length) return text("No CPU flavors match the criteria.");
+
+    const header = "Flavor ID | Display Name | vCPU Family | RAM/vCPU | Vendor | Price";
+    const sep = "---|---|---|---|---|---";
+    const rows = flavors.map((f) => {
+      const price = f.hourlyPriceUsd != null ? `$${f.hourlyPriceUsd}/hr` : "n/a (Console)";
+      return `${f.id} | ${f.displayName} | ${f.family} | ${f.ramGbPerVcpu}GB | ${f.cpuVendor} | ${price}`;
+    });
+
+    const footer = [
+      "",
+      "**Note**: RunPod does not expose CPU pricing via API. Check console.runpod.io/pods → CPU tab.",
+      "**Family conventions**: `c` = compute-optimized (2GB/vCPU), `g` = general (4GB/vCPU), `m` = high-memory (8GB/vCPU).",
+      `**Valid flavor IDs**: ${CPU_FLAVOR_IDS.join(", ")}.`,
+      "**To create a CPU pod**: `create_pod_auto({ cpuOnly: true, ... })` or `create_pod({ computeType: 'CPU', cpuFlavorIds: ['cpu5c'], vcpuCount: 16, ... })`.",
+    ].join("\n");
+
+    return text([header, sep, ...rows].join("\n") + "\n" + footer);
+  })
+);
+
 // ── get_ssh_command ──
 server.tool(
   "get_ssh_command",
@@ -982,7 +1132,7 @@ server.tool(
 // ── gpu_health_check ──
 server.tool(
   "gpu_health_check",
-  "Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation. Best called 1-2 min after training starts to measure actual GPU utilization.",
+  "(GPU pods only — returns 'nvidia-smi not found' on CPU pods.) Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation. Best called 1-2 min after training starts to measure actual GPU utilization.",
   {
     podId: z.string().describe("Pod ID"),
     perSampleMb: z
@@ -1231,7 +1381,7 @@ server.tool(
 // ── gpu_sample_burst ──
 server.tool(
   "gpu_sample_burst",
-  "Take multiple rapid GPU utilization snapshots (3-5 samples, 3-5s apart) to detect trends. Returns per-sample metrics plus a trend verdict: STABLE_OPTIMAL, IMPROVING, DEGRADING, CONSISTENTLY_IDLE, or VOLATILE. Use during training to verify GPU stays utilized over time.",
+  "(GPU pods only — fails on CPU pods.) Take multiple rapid GPU utilization snapshots (3-5 samples, 3-5s apart) to detect trends. Returns per-sample metrics plus a trend verdict: STABLE_OPTIMAL, IMPROVING, DEGRADING, CONSISTENTLY_IDLE, or VOLATILE. Use during training to verify GPU stays utilized over time.",
   {
     podId: z.string().describe("Pod ID"),
     samples: z.number().min(2).max(10).default(5).describe("Number of samples to take"),

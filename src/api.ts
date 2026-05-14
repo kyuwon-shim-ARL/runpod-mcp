@@ -185,11 +185,11 @@ export class RunPodClient {
   }
 
   async createPod(opts: CreatePodOptions): Promise<Pod> {
+    const isCpu = opts.computeType === "CPU";
+
     const body: Record<string, unknown> = {
       name: opts.name,
       imageName: opts.imageName,
-      gpuTypeIds: opts.gpuTypeIds,
-      gpuCount: opts.gpuCount ?? 1,
       interruptible: opts.interruptible ?? false,
       containerDiskInGb: opts.containerDiskInGb ?? 50,
       volumeInGb: opts.volumeInGb ?? 20,
@@ -199,6 +199,19 @@ export class RunPodClient {
       cloudType: opts.cloudType ?? "COMMUNITY",
       env: { ...opts.env },
     };
+
+    if (isCpu) {
+      body.computeType = "CPU";
+      body.vcpuCount = opts.vcpuCount ?? 2;
+      if (opts.cpuFlavorIds?.length) body.cpuFlavorIds = opts.cpuFlavorIds;
+      if (opts.cpuFlavorPriority) body.cpuFlavorPriority = opts.cpuFlavorPriority;
+    } else {
+      if (!opts.gpuTypeIds?.length) {
+        throw new Error("createPod requires gpuTypeIds for GPU pods (or set computeType: 'CPU')");
+      }
+      body.gpuTypeIds = opts.gpuTypeIds;
+      body.gpuCount = opts.gpuCount ?? 1;
+    }
 
     if (opts.sshPublicKey) {
       (body.env as Record<string, string>).SSH_PUBLIC_KEY = opts.sshPublicKey;
@@ -233,6 +246,9 @@ export class RunPodClient {
   // ── Spot Instances (GraphQL with variables) ──
 
   async createSpotPod(opts: CreatePodOptions & { bidPerGpu: number }): Promise<{ id: string }> {
+    if (!opts.gpuTypeIds?.length) {
+      throw new Error("createSpotPod requires gpuTypeIds — spot pricing is GPU-only");
+    }
     const envArray = Object.entries(opts.env ?? {}).map(([key, value]) => ({ key, value }));
     if (opts.sshPublicKey) {
       envArray.push({ key: "SSH_PUBLIC_KEY", value: opts.sshPublicKey });

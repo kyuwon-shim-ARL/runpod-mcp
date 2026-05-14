@@ -95,6 +95,57 @@ describe("restRequest", () => {
     const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(callBody.name).toBe("my-pod");
     expect(callBody.gpuTypeIds).toEqual(["NVIDIA GeForce RTX 3090"]);
+    expect(callBody.computeType).toBeUndefined();
+    expect(callBody.cpuFlavorIds).toBeUndefined();
+  });
+
+  it("createPod (CPU) sends CPU-specific body and omits gpuTypeIds", async () => {
+    const createdPod = { id: "cpu-pod", name: "cpu-job", desiredStatus: "CREATED" };
+    mockFetch.mockResolvedValueOnce(jsonResponse(createdPod));
+
+    const client = makeClient();
+    const result = await client.createPod({
+      name: "cpu-job",
+      imageName: "ubuntu:22.04",
+      computeType: "CPU",
+      vcpuCount: 16,
+      cpuFlavorIds: ["cpu5c", "cpu3c"],
+      cpuFlavorPriority: "custom",
+    });
+
+    expect(result.id).toBe("cpu-pod");
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.computeType).toBe("CPU");
+    expect(callBody.vcpuCount).toBe(16);
+    expect(callBody.cpuFlavorIds).toEqual(["cpu5c", "cpu3c"]);
+    expect(callBody.cpuFlavorPriority).toBe("custom");
+    expect(callBody.gpuTypeIds).toBeUndefined();
+    expect(callBody.gpuCount).toBeUndefined();
+  });
+
+  it("createPod (CPU) defaults vcpuCount to 2 when not provided", async () => {
+    const createdPod = { id: "cpu-pod", name: "tiny", desiredStatus: "CREATED" };
+    mockFetch.mockResolvedValueOnce(jsonResponse(createdPod));
+
+    const client = makeClient();
+    await client.createPod({
+      name: "tiny",
+      imageName: "ubuntu:22.04",
+      computeType: "CPU",
+    });
+
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.vcpuCount).toBe(2);
+    expect(callBody.cpuFlavorIds).toBeUndefined();
+    expect(callBody.cpuFlavorPriority).toBeUndefined();
+  });
+
+  it("createPod (GPU) throws when gpuTypeIds is missing", async () => {
+    const client = makeClient();
+    await expect(
+      client.createPod({ name: "x", imageName: "img" })
+    ).rejects.toThrow(/gpuTypeIds/);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("deletePod sends DELETE request", async () => {
@@ -171,6 +222,18 @@ describe("graphqlRequest", () => {
 
     const client = makeClient();
     await expect(client.listGpuTypes()).rejects.toThrow("RunPod GraphQL API: 403 Forbidden");
+  });
+
+  it("createSpotPod throws when gpuTypeIds is missing (spot is GPU-only)", async () => {
+    const client = makeClient();
+    await expect(
+      client.createSpotPod({
+        name: "x",
+        imageName: "img",
+        bidPerGpu: 0.5,
+      })
+    ).rejects.toThrow(/gpuTypeIds/);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("createSpotPod sends mutation with variables", async () => {

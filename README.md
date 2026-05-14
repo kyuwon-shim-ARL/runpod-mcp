@@ -42,14 +42,14 @@ claude mcp add runpod --scope user \
   -- node /path/to/runpod-mcp/dist/index.js
 ```
 
-## Tools (18)
+## Tools (19)
 
 | Tool | Description |
 |------|-------------|
 | `list_pods` | List all pods with status and SSH info |
 | `get_pod` | Get detailed pod info |
-| `create_pod` | Create a GPU pod (REST or GraphQL spot) |
-| `create_pod_auto` | Auto-select GPU based on stock availability |
+| `create_pod` | Create a GPU or CPU pod (REST). For CPU, pass `computeType: "CPU"` + `cpuFlavorIds`. |
+| `create_pod_auto` | Auto-select GPU based on stock availability. Pass `cpuOnly: true` for CPU pods. |
 | `stop_pod` | Stop pod (preserves volume) |
 | `start_pod` | Start a stopped pod |
 | `restart_pod` | Restart a running pod |
@@ -57,6 +57,7 @@ claude mcp add runpod --scope user \
 | `wait_for_pod` | Poll until SSH-ready (TCP probe) |
 | `cleanup_stale_pods` | Find and delete EXITED pods idle beyond grace period |
 | `list_gpu_types` | GPU types with pricing and stock (GraphQL) |
+| `list_cpu_types` | CPU pod flavors (cpu3/cpu5 × compute/general/highmem) from static catalog |
 | `get_ssh_command` | Get SSH connection command |
 | `execute_ssh_command` | Run command on pod via SSH |
 | `upload_files` | Upload files via rsync |
@@ -64,6 +65,25 @@ claude mcp add runpod --scope user \
 | `gpu_health_check` | Check GPU utilization with batch size advisor |
 | `gpu_sample_burst` | Multi-sample GPU metrics with trend analysis |
 | `gpu_cost_compare` | Compare GPU costs against cheaper alternatives |
+
+### CPU pods
+
+For CPU-only workloads (data prep, smina/Vina docking, anything that doesn't touch the GPU),
+use `cpuOnly: true` to bypass GPU stock probing and cost safety gates. CPU pods run roughly
+$0.10–0.30/hr vs $0.40+/hr for the cheapest GPU pod, so they're cheaper for pure-CPU jobs.
+
+```
+list_cpu_types                                    # see flavor options
+create_pod_auto({ cpuOnly: true,
+                  cpuFamily: "compute",           # or "general" / "highmem"
+                  vcpuCount: 16,
+                  name: "data-prep" })
+```
+
+**Pricing caveat**: RunPod does not expose CPU pod pricing via API. `list_cpu_types` shows
+flavor metadata only — verify hourly pricing on the [RunPod Console](https://console.runpod.io/pods)
+(CPU tab) before cost-sensitive decisions. The pod metadata stub emitted by `create_pod_auto`
+sets `cost_per_hr: 0` for CPU pods; fill it in by hand from the Console.
 
 ## Environment Variables
 

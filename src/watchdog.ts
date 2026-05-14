@@ -130,6 +130,9 @@ export async function runWatchdog(
 
   for (const pod of running) {
     if (options.skipPattern.test(pod.name)) continue;
+    // CPU pods have no nvidia-smi — watchdog can't measure VRAM idle. Skip them
+    // entirely rather than flagging false "SSH_FAILED" alarms on every cycle.
+    if (!pod.gpu) continue;
 
     checked++;
     try {
