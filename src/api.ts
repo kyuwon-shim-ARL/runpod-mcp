@@ -388,9 +388,11 @@ export class RunPodClient {
     const sshArg = `ssh ${sshCmd.join(" ")}`;
 
     const remote = `root@${pod.publicIp}:${remotePath}`;
-    // --no-same-owner: removed — unsupported in rsync 3.1.3/CentOS 8 (EXP-046 incident)
-    // --no-same-group: kept — supported in rsync 3.1.x, prevents group chown errors on download
-    const rsyncFlags = "-azP --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
+    // --no-owner/--no-group: skip owner/group preservation (prevents chown errors on download).
+    // NOTE: --no-same-owner/--no-same-group are *tar* options, not rsync ones; rsync rejects
+    // them with "unknown option" (verified on 3.1.3). EXP-046 and the 2026-09-02 PIU-v2
+    // upload failure were both this.
+    const rsyncFlags = "-azP --no-owner --no-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
       return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }

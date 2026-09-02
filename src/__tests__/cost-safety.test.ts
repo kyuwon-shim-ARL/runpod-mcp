@@ -138,15 +138,9 @@ describe("cloudType: default is COMMUNITY (Bug 1 fix)", () => {
   });
 });
 
-// ── Bug 2: getRsyncArgs flags (covered in api.test.ts, cross-verify here) ─
-
-describe("getRsyncArgs: rsync flag compatibility (Bug 2 fix)", () => {
-  it("rsync flag string does NOT contain --no-same-owner", () => {
-    const rsyncFlags = "-azP --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
-    expect(rsyncFlags).not.toContain("--no-same-owner");
-    expect(rsyncFlags).toContain("--no-same-group");
-  });
-});
+// ── Bug 2: getRsyncArgs flags — tested against the real implementation in api.test.ts
+// ("uses rsync's --no-owner/--no-group ..."). A hardcoded copy of the flag string used to
+// live here and asserted the broken --no-same-group; removed so it cannot drift again.
 
 // ── Bug 3: SSH pub key resolution logic ───────────────────────────────────
 

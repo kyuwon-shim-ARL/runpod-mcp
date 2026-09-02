@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `getRsyncArgs`: replaced the tar-only `--no-same-owner`/`--no-same-group` with rsync's real
+  `--no-owner`/`--no-group`. Every `upload_files`/`download_files` call aborted with
+  `rsync: --no-same-group: unknown option` (the earlier EXP-046 fix removed only one of the two).
+  Removed a stale test in `cost-safety.test.ts` that hardcoded the broken flag string.
+
 ## [0.5.6] - 2026-05-06
 
 ### Added

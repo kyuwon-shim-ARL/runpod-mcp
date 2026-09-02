@@ -327,12 +327,16 @@ describe("getRsyncArgs", () => {
     expect(client.getRsyncArgs(pod, "/a", "/b", "upload")).toBeNull();
   });
 
-  it("excludes --no-same-owner (EXP-046: unsupported in rsync 3.1.3) but keeps --no-same-group", () => {
+  it("uses rsync's --no-owner/--no-group, never the tar-only --no-same-owner/--no-same-group", () => {
     const client = makeClient();
     const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } } as any;
-    const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
-    expect(args).not.toContain("--no-same-owner");
-    expect(args).toContain("--no-same-group");
+    for (const direction of ["upload", "download"] as const) {
+      const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", direction);
+      expect(args).toContain("--no-owner");
+      expect(args).toContain("--no-group");
+      expect(args).not.toContain("--no-same-owner");
+      expect(args).not.toContain("--no-same-group");
+    }
   });
 
   it("includes --stats flag and excludes -v (verbose)", () => {

@@ -20986,7 +20986,8 @@ var StdioServerTransport = class {
 };
 
 // src/index.ts
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 // src/api.ts
@@ -21139,20 +21140,31 @@ var RunPodClient = class {
     return this.normalizePod(pod);
   }
   async createPod(opts) {
+    const isCpu = opts.computeType === "CPU";
     const body = {
       name: opts.name,
       imageName: opts.imageName,
-      gpuTypeIds: opts.gpuTypeIds,
-      gpuCount: opts.gpuCount ?? 1,
       interruptible: opts.interruptible ?? false,
       containerDiskInGb: opts.containerDiskInGb ?? 50,
       volumeInGb: opts.volumeInGb ?? 20,
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: opts.ports ?? ["22/tcp"],
       supportPublicIp: opts.supportPublicIp ?? true,
-      cloudType: opts.cloudType ?? "ALL",
+      cloudType: opts.cloudType ?? "COMMUNITY",
       env: { ...opts.env }
     };
+    if (isCpu) {
+      body.computeType = "CPU";
+      body.vcpuCount = opts.vcpuCount ?? 2;
+      if (opts.cpuFlavorIds?.length) body.cpuFlavorIds = opts.cpuFlavorIds;
+      if (opts.cpuFlavorPriority) body.cpuFlavorPriority = opts.cpuFlavorPriority;
+    } else {
+      if (!opts.gpuTypeIds?.length) {
+        throw new Error("createPod requires gpuTypeIds for GPU pods (or set computeType: 'CPU')");
+      }
+      body.gpuTypeIds = opts.gpuTypeIds;
+      body.gpuCount = opts.gpuCount ?? 1;
+    }
     if (opts.sshPublicKey) {
       body.env.SSH_PUBLIC_KEY = opts.sshPublicKey;
     }
@@ -21178,6 +21190,9 @@ var RunPodClient = class {
   }
   // ── Spot Instances (GraphQL with variables) ──
   async createSpotPod(opts) {
+    if (!opts.gpuTypeIds?.length) {
+      throw new Error("createSpotPod requires gpuTypeIds \u2014 spot pricing is GPU-only");
+    }
     const envArray = Object.entries(opts.env ?? {}).map(([key, value]) => ({ key, value }));
     if (opts.sshPublicKey) {
       envArray.push({ key: "SSH_PUBLIC_KEY", value: opts.sshPublicKey });
@@ -21202,12 +21217,12 @@ var RunPodClient = class {
       volumeMountPath: opts.volumeMountPath ?? "/workspace",
       ports: (opts.ports ?? ["22/tcp"]).join(","),
       env: envArray,
-      cloudType: opts.cloudType ?? "ALL",
+      cloudType: opts.cloudType ?? "COMMUNITY",
       supportPublicIp: opts.supportPublicIp ?? true
     };
     if (opts.networkVolumeId) input.networkVolumeId = opts.networkVolumeId;
     if (opts.dockerArgs) input.dockerArgs = opts.dockerArgs;
-    if (opts.dataCenterIds?.length) input.dataCenterIds = opts.dataCenterIds;
+    if (opts.dataCenterIds?.length) input.dataCenterId = opts.dataCenterIds[0];
     const data = await this.graphqlRequest(query, { input }, { timeoutMs: 6e4 });
     return data.podRentInterruptable;
   }
@@ -21308,13 +21323,13 @@ var RunPodClient = class {
     if (this.config.sshKeyPath) sshCmd.push("-i", this.config.sshKeyPath);
     const sshArg = `ssh ${sshCmd.join(" ")}`;
     const remote = `root@${pod.publicIp}:${remotePath}`;
-    const rsyncFlags = "-azP --no-same-owner --no-same-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
+    const rsyncFlags = "-azP --no-owner --no-group --stats --timeout=120 --skip-compress=gz/bz2/xz/zst/zip/pt/safetensors/bin/gguf";
     if (direction === "upload") {
       return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, localPath, remote];
     }
     return ["rsync", ...rsyncFlags.split(" "), "-e", sshArg, remote, localPath];
   }
-  // ── Wait for Pod (with TCP probe) ──
+  // ── Wait for Pod (with TCP probe + SSH auth probe) ──
   tcpProbe(host, port, timeoutMs = 5e3) {
     return new Promise((resolve2) => {
       const sock = createConnection({ host, port, timeout: timeoutMs });
@@ -21332,6 +21347,28 @@ var RunPodClient = class {
       });
     });
   }
+  // Probe whether SSH key auth is working (authorized_keys injected by RunPod).
+  // TCP open ≠ auth ready: RunPod injects keys after the SSH daemon starts,
+  // causing a race window where connections get "Permission denied (publickey)".
+  async sshAuthProbe(pod) {
+    if (!pod.publicIp || !pod.portMappings?.["22"]) return "auth_fail";
+    const args = [
+      "-o",
+      "StrictHostKeyChecking=no",
+      "-o",
+      "ConnectTimeout=5",
+      "-o",
+      "BatchMode=yes",
+      "-p",
+      String(pod.portMappings["22"])
+    ];
+    if (this.config.sshKeyPath) args.push("-i", this.config.sshKeyPath);
+    args.push(`root@${pod.publicIp}`, "--", "true");
+    const result = await spawnAsync("ssh", args, { timeout: 8e3 });
+    if (result.status === 0) return "ok";
+    if (result.status === 255 && result.stderr.includes("Permission denied")) return "auth_fail";
+    return "ok";
+  }
   async waitForPod(podId, timeoutMs = 3e5, intervalMs = 1e4, onProgress) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -21339,9 +21376,14 @@ var RunPodClient = class {
       const elapsed = Math.round((Date.now() - start) / 1e3);
       if (pod.desiredStatus === "RUNNING" && pod.publicIp && pod.portMappings?.["22"]) {
         onProgress?.(`[${elapsed}s] Pod RUNNING, probing SSH at ${pod.publicIp}:${pod.portMappings["22"]}...`);
-        const sshReady = await this.tcpProbe(pod.publicIp, pod.portMappings["22"]);
-        if (sshReady) return pod;
-        onProgress?.(`[${elapsed}s] SSH not ready yet, retrying...`);
+        const tcpReady = await this.tcpProbe(pod.publicIp, pod.portMappings["22"]);
+        if (tcpReady) {
+          const authResult = await this.sshAuthProbe(pod);
+          if (authResult === "ok") return pod;
+          onProgress?.(`[${elapsed}s] SSH port open but authorized_keys not injected yet, retrying...`);
+        } else {
+          onProgress?.(`[${elapsed}s] SSH not ready yet, retrying...`);
+        }
       } else if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "ERROR") {
         throw new Error(`Pod ${podId} entered terminal state: ${pod.desiredStatus}`);
       } else {
@@ -21460,6 +21502,183 @@ function getSpotPrice(gpu) {
 }
 function getOnDemandPrice(gpu) {
   return gpu.lowestPrice?.uninterruptablePrice ?? gpu.communityPrice ?? gpu.securePrice ?? null;
+}
+
+// src/monitoring-utils.ts
+var SKELETON_PATTERNS = [
+  { re: /NotImplementedError/, label: "NotImplementedError" },
+  { re: /^\s*ImportError\b/m, label: "ImportError" },
+  { re: /ModuleNotFoundError/, label: "ModuleNotFoundError" },
+  { re: /^\s*SyntaxError\b/m, label: "SyntaxError" },
+  { re: /^\s*AttributeError:.*has no attribute/m, label: "AttributeError" }
+];
+function classifyTrainingSmoke(stdout, stderr, sshStatus) {
+  if (sshStatus === null && !stdout && !stderr) {
+    return { kind: "timeout_no_ssh" };
+  }
+  const combined = `${stdout}
+${stderr}`;
+  for (const p of SKELETON_PATTERNS) {
+    if (p.re.test(combined)) {
+      const lines = combined.split("\n");
+      const hit = lines.find((l) => p.re.test(l)) ?? p.label;
+      return { kind: "skeleton", match: p.label, excerpt: hit.trim() };
+    }
+  }
+  if (combined.includes("__SMOKE_IMPORT_OK__")) {
+    return { kind: "ok", reason: "Module imported cleanly (no top-level skeleton)" };
+  }
+  const exitMatch = combined.match(/__SMOKE_EXIT__(\d+)/);
+  if (exitMatch) {
+    const code = exitMatch[1];
+    if (code === "0") return { kind: "ok", reason: "Smoke command exited 0" };
+    if (code === "124") {
+      return { kind: "ok", reason: "Smoke ran for 30s without skeleton errors (timeout = training is callable)" };
+    }
+    return { kind: "unexpected", reason: `exit ${code}` };
+  }
+  if (sshStatus === null) return { kind: "timeout_no_ssh" };
+  return { kind: "unexpected", reason: `ssh_status=${sshStatus}, no smoke marker found` };
+}
+function planMonitoringCadence(input) {
+  const cachePerCheck = input.cachePerCheckUsd ?? 0.6;
+  const startUnix = input.startUnix ?? Math.floor(Date.now() / 1e3);
+  if (input.firstEpochSeconds <= 0 || input.totalEpochs <= 0) {
+    throw new Error("firstEpochSeconds and totalEpochs must be positive");
+  }
+  if (input.sessionRemainingMinutes <= 0) {
+    throw new Error("sessionRemainingMinutes must be positive");
+  }
+  const etaMinutes = Math.round(input.firstEpochSeconds * input.totalEpochs / 60);
+  const etaIso = new Date((startUnix + etaMinutes * 60) * 1e3).toISOString();
+  const sessionThreshold = input.sessionRemainingMinutes * 0.8;
+  const handoffRequired = etaMinutes > sessionThreshold;
+  const toIso = (mins) => new Date((startUnix + mins * 60) * 1e3).toISOString();
+  let checks;
+  let handoffTemplate;
+  let handoffReason;
+  if (handoffRequired) {
+    if (input.sessionRemainingMinutes < 12) {
+      checks = [];
+    } else {
+      const proposed = Math.max(
+        10,
+        Math.min(Math.round(input.sessionRemainingMinutes * 0.25), Math.round(etaMinutes * 0.2))
+      );
+      const earlyCheckMin = Math.min(proposed, input.sessionRemainingMinutes - 2);
+      checks = [
+        {
+          atMinutes: earlyCheckMin,
+          atIso: toIso(earlyCheckMin),
+          fraction: earlyCheckMin / etaMinutes,
+          action: "gpu_sample_burst \u2014 last cache-warm sanity check before handoff"
+        }
+      ];
+    }
+    handoffReason = `ETA ${etaMinutes}min exceeds 80% of session window (${input.sessionRemainingMinutes}min \xD7 0.8 = ${sessionThreshold.toFixed(0)}min). Token cost of supervising \u2248 ${Math.ceil(etaMinutes / 30)} cache-misses \xD7 $${cachePerCheck.toFixed(2)} would dominate runpod cost.`;
+    handoffTemplate = renderHandoffTemplate({
+      podId: input.podId,
+      etaIso,
+      etaMinutes,
+      runpodCostPerHr: input.runpodCostPerHr
+    });
+  } else {
+    checks = [0.5, 0.8, 1].map((frac) => {
+      const at = Math.round(etaMinutes * frac);
+      return {
+        atMinutes: at,
+        atIso: toIso(at),
+        fraction: frac,
+        action: frac < 0.99 ? `gpu_health_check \u2014 verify still ${frac === 0.5 ? "running healthily" : "approaching completion"}` : "rsync /root/outputs \u2192 /workspace/outputs (RSYNC_OK), then delete_pod(artifactsSavedConfirmed:true)"
+      };
+    });
+  }
+  const estimatedSupervisedTokenCost = checks.length * cachePerCheck;
+  const estimatedHandoffTokenCost = handoffRequired ? cachePerCheck * 0.1 : 0;
+  const estimatedRunpodCost = etaMinutes / 60 * input.runpodCostPerHr;
+  return {
+    etaMinutes,
+    etaIso,
+    handoffRequired,
+    handoffReason,
+    checkSchedule: checks,
+    estimatedSupervisedTokenCost,
+    estimatedHandoffTokenCost,
+    estimatedRunpodCost,
+    recommendation: handoffRequired ? "handoff" : "supervise",
+    handoffTemplate
+  };
+}
+function renderMonitoringCadenceSection(input) {
+  const lines = [];
+  lines.push(``);
+  lines.push(`### Monitoring Cadence Plan (\uD544\uC218 \u2014 6\uB2E8\uACC4, \uC784\uC758 polling \uAE08\uC9C0)`);
+  if (input.partialMode) {
+    lines.push(``);
+    lines.push(`\u26A0\uFE0F GPU \uCD94\uCC9C\uC774 \uC5C6\uB294 PARTIAL PLAN \uC0C1\uD0DC \u2014 \uC801\uD569\uD55C GPU \uD655\uC815 \uD6C4 \uB2E4\uC2DC \`plan_gpu_job\`\uC744 \uD638\uCD9C\uD574 cadence \uC139\uC158\uC744 \uBC1B\uC73C\uC138\uC694.`);
+    return lines;
+  }
+  if (input.expectedHours != null && input.expectedHours > 2) {
+    lines.push(``);
+    lines.push(`\u26A0\uFE0F **Session Span \uACBD\uACE0**: expectedHours=${input.expectedHours} > 2\uC2DC\uAC04. \uB2E8\uC77C conversation\uC73C\uB85C supervise \uBE44\uD604\uC2E4\uC801 (cache miss \xD7 N = \uD1A0\uD070 \uBE44\uC6A9 \uD3ED\uC99D).`);
+    lines.push(`\u2192 Step C\uC5D0\uC11C \`plan_monitoring_cadence\` \uAC00 \uAC70\uC758 \uD56D\uC0C1 \`handoffRequired=true\` \uBC18\uD658\uD560 \uAC83. MONITORING_HANDOFF.md \uD328\uD134\uC744 \uCC98\uC74C\uBD80\uD130 \uCC44\uD0DD.`);
+  }
+  const priceLiteral = input.gpuPrice.toFixed(2);
+  lines.push(``);
+  lines.push(`**Step A. Cache-warm \uAC80\uC99D (T+0 ~ T+5min)** \u2014 \uC9E7\uC740 cache-warm \uC708\uB3C4\uC6B0\uB85C \uC2E4\uD589 \uC815\uC0C1 \uC5EC\uBD80 \uD655\uC778`);
+  lines.push(`- \uD6C8\uB828 launch \uC9C1\uD6C4 60s \uB300\uAE30 \u2192 \`gpu_sample_burst(podId, samples=5, intervalSeconds=5)\``);
+  lines.push(`- \`STABLE_OPTIMAL\` / \`IMPROVING\` \u2192 Step B \uC9C4\uD589`);
+  lines.push(`- \`CONSISTENTLY_IDLE\` \u2192 \uC989\uC2DC \uC911\uB2E8. NotImplementedError / CPU fallback / \uB370\uC774\uD130 \uACBD\uB85C \uC624\uB958 \uC758\uC2EC \u2192 \uB85C\uADF8 \uD655\uC778 + delete_pod`);
+  lines.push(`- \`DEGRADING\` / \`VOLATILE\` \u2192 \uB85C\uADF8 \uD655\uC778 \uD6C4 \uACB0\uC815`);
+  lines.push(``);
+  lines.push(`**Step B. \uCC98\uB9AC\uB7C9 \uC2E4\uCE21 (T+5min ~ T+10min)** \u2014 1 epoch/step \uC2E4\uCE21 \uC2DC\uAC04 \uD655\uBCF4`);
+  lines.push(`- \`execute_ssh_command(podId, "tail -100 /workspace/log 2>/dev/null | grep -E 'epoch|step|it/s' | tail -5")\``);
+  lines.push(`- 1 epoch (\uB610\uB294 step) \uC2E4\uCE21 \uC2DC\uAC04 = X\uCD08, \uCD1D epoch \uC218 = N`);
+  lines.push(`- \uCE21\uC815 ETA = X \xD7 N / 60 (\uBD84)`);
+  lines.push(`- expectedHours=${input.expectedHours ?? "unknown"}h vs \uCE21\uC815 ETA \uBE44\uAD50 \u2192 \xB130% \uCD08\uACFC \uC2DC plan/GPU \uC7AC\uAC80\uD1A0`);
+  lines.push(``);
+  lines.push(`**Step C. plan_monitoring_cadence \uD638\uCD9C (T+10min)** \u2014 \uBA38\uC2E0\uB9AC\uB354\uBE14 \uC2A4\uCF00\uC904 \uC0B0\uCD9C`);
+  lines.push(`- \`plan_monitoring_cadence(podId="<id>", firstEpochSeconds=X, totalEpochs=N, sessionRemainingMinutes=<\uB0A8\uC740\uC2DC\uAC04>, runpodCostPerHr=${priceLiteral})\``);
+  lines.push(`- \uCD9C\uB825: \`etaMinutes\`, \`handoffRequired\`, \`checkSchedule[]\`, \`estimatedSupervisedTokenCost\`, \`estimatedHandoffTokenCost\`, \`handoffTemplate\``);
+  lines.push(`- \u26A0\uFE0F **\uC774 \uB3C4\uAD6C\uAC00 \uC0B0\uCD9C\uD558\uB294 \uC2A4\uCF00\uC904\uC744 \uADF8\uB300\uB85C \uB530\uB97C \uAC83. 30\uBD84 fixed polling \uAE08\uC9C0** (cache miss \uB204\uC801 = $0.6/\uD68C \xD7 N \uBE44\uC6A9 \uD3ED\uC99D)`);
+  lines.push(``);
+  lines.push(`**Step D. Session-handoff \uBD84\uAE30**`);
+  lines.push(`- \`handoffRequired=true\` \u2192 \uC989\uC2DC \`MONITORING_HANDOFF.md\` \uC791\uC131 (\`handoffTemplate\` \uD65C\uC6A9 \u2014 pod ID, ETA UTC, RSYNC_OK \uBA85\uB839 \uC790\uB3D9 \uCC44\uC6CC\uC9D0)`);
+  lines.push(`- \uC0C8 \uC138\uC158\uC774 ETA \uC2DC\uC810\uC5D0\uB9CC \uC7AC\uC9C4\uC785 \u2192 download + cleanup (200k context \uC7AC\uCC98\uB9AC \uBE44\uC6A9 \uD68C\uD53C, ~$0.5\uC5D0 \uD574\uACB0)`);
+  lines.push(`- \`handoffRequired=false\` \u2192 \uC9C1\uC811 supervise (\`checkSchedule\`\uC758 \uC2DC\uAC01\uC5D0\uB9CC \uCCB4\uD06C)`);
+  lines.push(``);
+  lines.push(`**Step E. Wakeup pacing \uADDC\uCE59**`);
+  lines.push(`- \uB2E4\uC74C \uCCB4\uD06C\uAE4C\uC9C0 < 4\uBD84 \u2192 \uC9C1\uC811 \uB300\uAE30 (cache \uC720\uC9C0, sleep 270s \uC774\uD558)`);
+  lines.push(`- 4\uBD84 ~ 60\uBD84 \u2192 \uB2E4\uB978 \uC791\uC5C5 \uD6C4 \`ScheduleWakeup\` (cache miss 1\uD68C \uAC10\uC218)`);
+  lines.push(`- 60\uBD84 + \u2192 handoff \uC804\uD658 (Step D)`);
+  lines.push(`- \uC808\uB300 \uAE08\uC9C0: 5\uBD84+ polling \uB8E8\uD504 (cache miss \uB204\uC801)`);
+  lines.push(``);
+  lines.push(`**Step F. \uC644\uB8CC \uCC98\uB9AC**`);
+  lines.push(`- (NV \uC788\uC74C) \`rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK\` \u2192 RSYNC_OK \uD655\uC778 \uD6C4 \`delete_pod(artifactsSavedConfirmed: true)\``);
+  lines.push(`- (NV \uC5C6\uC74C) \`download_files\` \u2192 \uC644\uB8CC \uD655\uC778 \uD6C4 \`delete_pod(artifactsSavedConfirmed: true)\``);
+  lines.push(`- \uC704 \uD655\uC778 \uC5C6\uC774 \`delete_pod\` \uD638\uCD9C \uAE08\uC9C0 (\uC544\uD2F0\uD329\uD2B8 \uC190\uC2E4)`);
+  return lines;
+}
+function renderHandoffTemplate(args) {
+  return [
+    `# RunPod Monitoring Handoff`,
+    ``,
+    `- Pod ID: \`${args.podId}\``,
+    `- ETA (UTC): \`${args.etaIso}\` (~${args.etaMinutes} min from launch)`,
+    `- Cost rate: $${args.runpodCostPerHr.toFixed(2)}/hr (idle billing if not deleted promptly)`,
+    ``,
+    `## Resume protocol (new session, after ETA)`,
+    `1. \`get_pod(podId="${args.podId}")\` \u2014 confirm status RUNNING and time elapsed > ETA`,
+    `2. \`gpu_sample_burst(podId="${args.podId}", samples=3)\` \u2014 verify training has wound down (CONSISTENTLY_IDLE expected)`,
+    `3. (NV present) \`execute_ssh_command(podId="${args.podId}", command="rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK")\` \u2014 must see \`RSYNC_OK\` in stdout`,
+    `4. (NV absent) \`download_files(podId="${args.podId}", remotePath="/workspace", localPath="./outputs/")\``,
+    `5. \`delete_pod(podId="${args.podId}", artifactsSavedConfirmed=true)\` \u2014 only after step 3 or 4 confirmed`,
+    ``,
+    `## Failure handling`,
+    `- If ETA elapsed and training still running: extend ETA by 30%, re-check via gpu_sample_burst`,
+    `- If pod stopped/exited: read logs via \`execute_ssh_command(... "tail -200 /workspace/log")\` before deleting`,
+    `- NEVER call \`delete_pod\` without confirming artifact persistence (rsync RSYNC_OK or download_files completion)`
+  ].join("\n");
 }
 
 // src/pod-ops.ts
@@ -21721,15 +21940,24 @@ function estimatePodCost(costPerHr, startedAt, now = /* @__PURE__ */ new Date())
   return { hours, cost: hours * costPerHr };
 }
 function buildPodMetadataStub(input) {
-  const stub = {
+  const isCpu = input.compute_type === "CPU";
+  const base = {
     pod_id: input.pod_id,
     name: input.name,
     purpose: "<fill in: what this pod is for>",
     created_at: input.created_at,
     deleted_at: null,
     datacenter: input.datacenter ?? null,
+    compute_type: input.compute_type ?? "GPU"
+  };
+  const compute = isCpu ? {
+    vcpu_count: input.vcpu_count ?? null,
+    cpu_flavor_ids: input.cpu_flavor_ids ?? null
+  } : {
     gpu: input.gpu ?? null,
-    gpu_count: input.gpu_count ?? 1,
+    gpu_count: input.gpu_count ?? 1
+  };
+  const tail = {
     cost_per_hr: input.cost_per_hr ?? null,
     container_disk_gb: input.container_disk_gb ?? null,
     image: input.image ?? null,
@@ -21738,7 +21966,7 @@ function buildPodMetadataStub(input) {
     post_create_steps: [],
     incidents: []
   };
-  return JSON.stringify(stub, null, 2);
+  return JSON.stringify({ ...base, ...compute, ...tail }, null, 2);
 }
 async function deletePodWithStop(client2, podId, timeoutMs = 6e4) {
   const pod = await client2.getPod(podId);
@@ -21757,7 +21985,74 @@ async function deletePodWithStop(client2, podId, timeoutMs = 6e4) {
   return { wasRunning };
 }
 
+// src/cpu-catalog.ts
+var CPU_FLAVORS = [
+  {
+    id: "cpu3c",
+    displayName: "CPU3 Compute (AMD EPYC)",
+    generation: "cpu3",
+    family: "compute",
+    cpuVendor: "AMD EPYC Milan",
+    ramGbPerVcpu: 2,
+    hourlyPriceUsd: null
+  },
+  {
+    id: "cpu3g",
+    displayName: "CPU3 General (AMD EPYC)",
+    generation: "cpu3",
+    family: "general",
+    cpuVendor: "AMD EPYC Milan",
+    ramGbPerVcpu: 4,
+    hourlyPriceUsd: null
+  },
+  {
+    id: "cpu3m",
+    displayName: "CPU3 High-Memory (AMD EPYC)",
+    generation: "cpu3",
+    family: "highmem",
+    cpuVendor: "AMD EPYC Milan",
+    ramGbPerVcpu: 8,
+    hourlyPriceUsd: null
+  },
+  {
+    id: "cpu5c",
+    displayName: "CPU5 Compute (Intel Xeon)",
+    generation: "cpu5",
+    family: "compute",
+    cpuVendor: "Intel Xeon",
+    ramGbPerVcpu: 2,
+    hourlyPriceUsd: null
+  },
+  {
+    id: "cpu5g",
+    displayName: "CPU5 General (Intel Xeon)",
+    generation: "cpu5",
+    family: "general",
+    cpuVendor: "Intel Xeon",
+    ramGbPerVcpu: 4,
+    hourlyPriceUsd: null
+  },
+  {
+    id: "cpu5m",
+    displayName: "CPU5 High-Memory (Intel Xeon)",
+    generation: "cpu5",
+    family: "highmem",
+    cpuVendor: "Intel Xeon",
+    ramGbPerVcpu: 8,
+    hourlyPriceUsd: null
+  }
+];
+var CPU_FLAVOR_IDS = CPU_FLAVORS.map((f) => f.id);
+function flavorsByFamily(family) {
+  return CPU_FLAVORS.filter((f) => f.family === family);
+}
+function defaultFlavorOrder(family) {
+  const pool = family ? flavorsByFamily(family) : CPU_FLAVORS;
+  return [...pool].sort((a, b) => a.generation < b.generation ? 1 : a.generation > b.generation ? -1 : 0).map((f) => f.id);
+}
+
 // src/index.ts
+var COST_GATE_GPU_COUNT = 2;
 var API_KEY = process.env.RUNPOD_API_KEY;
 var SETUP_MSG = "RUNPOD_API_KEY is not configured. To set up:\n\n1. Get your API key from https://www.runpod.io/console/user/settings\n2. Add to your shell profile (~/.bashrc or ~/.zshrc):\n   export RUNPOD_API_KEY=rp_xxxxxx\n3. (Optional) For SSH/rsync features:\n   export SSH_KEY_PATH=~/.ssh/id_ed25519\n4. Restart Claude Code for changes to take effect.";
 var client = null;
@@ -21796,6 +22091,30 @@ function isAuthError(e) {
   const msg = String(e?.message ?? "");
   return /\b(401|403|unauthorized|forbidden|authentication)\b/i.test(msg);
 }
+async function resolveDcAndNv(client2, networkVolumeId, dcPriority) {
+  let nvDataCenterId;
+  let volumeNote = "";
+  if (networkVolumeId) {
+    const vol = await client2.getNetworkVolume(networkVolumeId);
+    if (!vol) return { error: `Network volume ${networkVolumeId} not found.` };
+    nvDataCenterId = vol.dataCenterId;
+    volumeNote = `
+Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
+  }
+  const dcsToTry = nvDataCenterId ? [nvDataCenterId] : dcPriority && dcPriority.length > 0 ? dcPriority : DEFAULT_DC_PRIORITY;
+  return { dcsToTry, nvDataCenterId, volumeNote };
+}
+async function readSshPubKey() {
+  const keyPath = process.env.SSH_KEY_PATH;
+  if (!keyPath) return void 0;
+  const pubPath = keyPath.endsWith(".pub") ? keyPath : keyPath + ".pub";
+  try {
+    const content = await readFile(pubPath, "utf8");
+    return content.trim();
+  } catch {
+    return void 0;
+  }
+}
 server.tool("list_pods", "List all RunPod pods with status and SSH info", {}, safeTool(async () => {
   const pods = await requireClient().listPods();
   if (!pods.length) return text("No pods found.");
@@ -21825,10 +22144,13 @@ server.tool(
     ports: external_exports.array(external_exports.string()).default(["22/tcp"]),
     env: external_exports.record(external_exports.string()).optional().describe("Environment variables"),
     dockerArgs: external_exports.string().optional(),
-    cloudType: external_exports.enum(["ALL", "SECURE", "COMMUNITY"]).default("ALL").describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
+    cloudType: external_exports.enum(["ALL", "SECURE", "COMMUNITY"]).default("COMMUNITY").describe("Cloud type filter: COMMUNITY (default, cheaper/shared), SECURE (dedicated), or ALL"),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0.")
   },
   safeTool(async (args) => {
+    const autoSshKey = await readSshPubKey();
+    const sshWarnText = process.env.SSH_KEY_PATH && !autoSshKey ? "\n\n\u26A0\uFE0F SSH_KEY_PATH \uC124\uC815\uB428 but \uACF5\uAC1C\uD0A4 \uC77D\uAE30 \uC2E4\uD328 \u2014 \uC9C1\uC811 SSH/SCP \uBD88\uAC00, execute_ssh_command(\uD504\uB85D\uC2DC) \uC0AC\uC6A9" : "";
+    const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
     const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
     const opts = {
       name: args.name,
@@ -21840,7 +22162,7 @@ server.tool(
       volumeInGb: args.volumeInGb,
       volumeMountPath: args.volumeMountPath,
       networkVolumeId: args.networkVolumeId,
-      sshPublicKey: args.sshPublicKey,
+      ...resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {},
       ports: args.ports,
       env: podEnv,
       dockerArgs: args.dockerArgs,
@@ -21862,7 +22184,7 @@ server.tool(
       const stub2 = buildStub(result.id, args.bidPerGpu);
       return text(
         `Spot pod created!
-ID: ${result.id}
+ID: ${result.id}${sshWarnText}
 
 ## Pod Metadata Stub (pass to save_pod_metadata after enriching)
 \`\`\`json
@@ -21878,7 +22200,7 @@ ${stub2}
     const stub = buildStub(pod.id, null);
     return text(
       `Pod created!
-${podSummary(pod)}
+${podSummary(pod)}${sshWarnText}
 
 ## Pod Metadata Stub (pass to save_pod_metadata after enriching)
 \`\`\`json
@@ -21893,7 +22215,7 @@ ${stub}
 );
 server.tool(
   "create_pod_auto",
-  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.",
+  "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.\n\u26A0\uFE0F costSafetyConfirmed\uB294 \uC0AC\uC6A9\uC790\uAC00 \uC9C1\uC811 \uD655\uC778\uD55C \uACBD\uC6B0\uC5D0\uB9CC true\uB85C \uC124\uC815\uD558\uC138\uC694. Claude\uAC00 \uC790\uB3D9\uC73C\uB85C true\uB97C \uC124\uC815\uD558\uB294 \uAC83\uC740 \uC5C4\uACA9\uD788 \uAE08\uC9C0\uB429\uB2C8\uB2E4.",
   {
     name: external_exports.string().describe("Pod name"),
     imageName: external_exports.string().default("runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"),
@@ -21911,22 +22233,191 @@ server.tool(
       "Datacenter priority list for fallback when stock is tight. Tries each DC in order with each GPU type until a pod is created. Ignored when networkVolumeId is set (NV constrains the DC). Defaults to a built-in priority based on observed RunPod stock pool sizes (largest first): US-GA-1, US-CA-2, EU-SE-1, EU-CZ-1, AP-JP-1, US-TX-3, EU-RO-1."
     ),
     optimizePytorch: external_exports.boolean().default(false).describe("Inject PyTorch CUDA optimization env vars (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). Requires PyTorch >= 2.0."),
-    cloudType: external_exports.enum(["ALL", "SECURE", "COMMUNITY"]).default("ALL").describe("Cloud type filter: ALL (default), SECURE (dedicated), or COMMUNITY (cheaper, shared)"),
-    dryRun: external_exports.boolean().default(false).describe("Preview GPU selection and cost estimate without creating a pod. Note: GPU availability may change between dry run and actual creation.")
+    cloudType: external_exports.enum(["ALL", "SECURE", "COMMUNITY"]).default("COMMUNITY").describe("Cloud type filter: COMMUNITY (default, cheaper/shared), SECURE (dedicated), or ALL"),
+    dryRun: external_exports.boolean().default(false).describe("Preview GPU selection and cost estimate without creating a pod. Note: GPU availability may change between dry run and actual creation."),
+    costSafetyConfirmed: external_exports.boolean().optional().describe("Set to true only after the user has reviewed the cost safety checklist. Required for gpuCount >= 2 with dryRun: false."),
+    nvReadinessToken: external_exports.string().optional().describe("Token from verify_data_on_nv. Required when gpuCount >= 2 AND networkVolumeId is set (ensures data was verified on NV before launching expensive multi-GPU pod)."),
+    cpuOnly: external_exports.boolean().default(false).describe("Create a CPU-only pod (no GPU). Skips GPU stock probing and cost safety gates. Use list_cpu_types to see flavor options."),
+    cpuFamily: external_exports.enum(["compute", "general", "highmem"]).optional().describe("CPU flavor family preference (cpuOnly only). compute=2GB/vCPU, general=4GB/vCPU, highmem=8GB/vCPU. Ignored when cpuFlavorIds is provided."),
+    cpuFlavorIds: external_exports.array(external_exports.enum(CPU_FLAVOR_IDS)).optional().describe("CPU flavor IDs in priority order (cpuOnly only). When provided, cpuFlavorPriority is set to 'custom' (RunPod honors the order). Defaults to cpu5 then cpu3 in the chosen family. Run list_cpu_types for valid IDs."),
+    vcpuCount: external_exports.number().int().positive().max(128).default(2).describe("vCPU count for CPU pod (cpuOnly only). Default 2, max 128.")
   },
   safeTool(async (args) => {
-    const c = requireClient();
-    const gpuTypes = await c.listGpuTypes();
-    let nvDataCenterId;
-    let volumeNote = "";
-    if (args.networkVolumeId) {
-      const vol = await c.getNetworkVolume(args.networkVolumeId);
-      if (!vol) return text(`Network volume ${args.networkVolumeId} not found.`);
-      nvDataCenterId = vol.dataCenterId;
-      volumeNote = `
-Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
+    if (args.cpuOnly) {
+      const c2 = requireClient();
+      const autoSshKey2 = await readSshPubKey();
+      const resolvedSshPublicKey2 = args.sshPublicKey ?? autoSshKey2;
+      const nv = await resolveDcAndNv(c2, args.networkVolumeId, args.dcPriority);
+      if ("error" in nv) return text(nv.error);
+      const { dcsToTry: dcsToTry2, volumeNote: volumeNote2 } = nv;
+      const hasExplicitFlavors = !!(args.cpuFlavorIds && args.cpuFlavorIds.length > 0);
+      const flavorIds = hasExplicitFlavors ? args.cpuFlavorIds : defaultFlavorOrder(args.cpuFamily);
+      const flavorPriority = hasExplicitFlavors ? "custom" : "availability";
+      if (args.dryRun) {
+        return text(
+          `## Dry Run \u2014 CPU Pod Preview (no pod created)
+
+Compute type: CPU
+vCPU: ${args.vcpuCount}
+Flavor priority: ${flavorIds.join(", ")} (mode: ${flavorPriority}${hasExplicitFlavors ? ", honors order" : `, RunPod picks${args.cpuFamily ? ` from family=${args.cpuFamily}` : ""}`})
+Image: ${args.imageName}
+Container disk: ${args.containerDiskInGb}GB
+DC fallback order: ${dcsToTry2.join(" \u2192 ")}${volumeNote2}
+
+Note: RunPod does not expose CPU pricing via API. Verify on console.runpod.io/pods \u2192 CPU tab.
+
+## Next Steps
+\u2192 create_pod_auto with same parameters and dryRun: false`
+        );
+      }
+      const cpuFailures = [];
+      for (const dc of dcsToTry2) {
+        try {
+          const opts = {
+            name: args.name,
+            imageName: args.imageName,
+            computeType: "CPU",
+            vcpuCount: args.vcpuCount,
+            cpuFlavorIds: flavorIds,
+            cpuFlavorPriority: flavorPriority,
+            containerDiskInGb: args.containerDiskInGb,
+            volumeInGb: args.volumeInGb,
+            volumeMountPath: "/workspace",
+            ...resolvedSshPublicKey2 ? { sshPublicKey: resolvedSshPublicKey2 } : {},
+            ports: ["22/tcp"],
+            env: args.env,
+            networkVolumeId: args.networkVolumeId,
+            dataCenterIds: [dc],
+            cloudType: args.cloudType
+          };
+          const pod = await c2.createPod(opts);
+          const assignedFlavor = pod.cpuFlavorId ?? null;
+          const stub = buildPodMetadataStub({
+            pod_id: pod.id,
+            name: args.name,
+            created_at: (/* @__PURE__ */ new Date()).toISOString(),
+            datacenter: dc,
+            compute_type: "CPU",
+            vcpu_count: args.vcpuCount,
+            cpu_flavor_ids: flavorIds,
+            cost_per_hr: pod.costPerHr ?? null,
+            // RunPod returns this on pod creation
+            image: args.imageName,
+            container_disk_gb: args.containerDiskInGb,
+            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
+          });
+          const assignedNote = assignedFlavor && !flavorIds.includes(assignedFlavor) ? ` (RunPod picked ${assignedFlavor}, not in requested list \u2014 verify if intentional)` : assignedFlavor ? ` (RunPod assigned ${assignedFlavor})` : "";
+          return text(
+            `Auto-selected CPU pod in ${dc} (requested: ${flavorIds.join(", ")} [${flavorPriority}], ${args.vcpuCount} vCPU)${assignedNote}${volumeNote2}
+${podSummary(pod)}
+
+## Pod Metadata Stub (pass to save_pod_metadata after enriching)
+\`\`\`json
+${stub}
+\`\`\`
+
+## Next Steps
+\u2192 wait_for_pod(podId: "${pod.id}")
+\u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})`
+          );
+        } catch (e) {
+          if (isAuthError(e)) return errorResult(e);
+          cpuFailures.push({ dc, error: e.message });
+          continue;
+        }
+      }
+      return text(
+        `No CPU pod could be created across ${dcsToTry2.length} DC.
+
+Attempted: ${dcsToTry2.join(" \u2192 ")}
+Flavor priority: ${flavorIds.join(", ")} [${flavorPriority}]
+
+Failures:
+${cpuFailures.map((f) => `  ${f.dc}: ${f.error}`).join("\n")}
+
+Try overriding dcPriority or widening cpuFlavorIds. Run list_cpu_types for options.`
+      );
     }
-    const dcsToTry = nvDataCenterId ? [nvDataCenterId] : args.dcPriority && args.dcPriority.length > 0 ? args.dcPriority : DEFAULT_DC_PRIORITY;
+    if (args.gpuCount >= COST_GATE_GPU_COUNT && args.networkVolumeId && !args.dryRun) {
+      if (!args.nvReadinessToken) {
+        return text(
+          `\u26A0\uFE0F NV READINESS TOKEN REQUIRED (gpuCount=${args.gpuCount}, networkVolumeId=${args.networkVolumeId})
+\uACE0\uBE44\uC6A9 \uB2E4\uC911-GPU \uD31F \uC0DD\uC131 \uC804 \uB370\uC774\uD130 \uAC80\uC99D\uC774 \uD544\uC694\uD569\uB2C8\uB2E4:
+1. \uC2A4\uD14C\uC774\uC9D5 \uD31F\uC5D0\uC11C \uB370\uC774\uD130 \uC804\uC1A1 \uC644\uB8CC
+2. verify_data_on_nv(podId, requiredPaths) \uD638\uCD9C \u2192 \uD1A0\uD070 \uBC1C\uAE09
+3. \uBC1C\uAE09\uB41C \uD1A0\uD070\uC744 nvReadinessToken \uD30C\uB77C\uBBF8\uD130\uC5D0 \uC804\uB2EC\uD574 \uC7AC\uD638\uCD9C\uD558\uC138\uC694.`
+        );
+      }
+      try {
+        const tokenPath = `${NV_READY_DIR}/nv_ready_${args.networkVolumeId}.json`;
+        const tokenRaw = await readFile(tokenPath, "utf-8");
+        const tokenData = JSON.parse(tokenRaw);
+        if (tokenData.token !== args.nvReadinessToken) {
+          return text(`\u274C NV readiness token mismatch for volume ${args.networkVolumeId}. Re-run verify_data_on_nv to get a fresh token.`);
+        }
+        const ageHours = (Date.now() - new Date(tokenData.verifiedAt).getTime()) / 36e5;
+        if (ageHours > TOKEN_TTL_HOURS) {
+          return text(`\u274C NV readiness token expired (${ageHours.toFixed(1)}h old, TTL=${TOKEN_TTL_HOURS}h). Re-run verify_data_on_nv.`);
+        }
+      } catch {
+        return text(`\u274C NV readiness token file not found for volume ${args.networkVolumeId}. Run verify_data_on_nv first.`);
+      }
+    }
+    if (args.gpuCount >= COST_GATE_GPU_COUNT && !args.dryRun) {
+      const mcpServer = server.server;
+      const hasElicitation = mcpServer?._clientCapabilities?.elicitation !== void 0;
+      const booleanFallback = () => !args.costSafetyConfirmed ? text(
+        `\u26A0\uFE0F COST SAFETY CHECK (gpuCount=${args.gpuCount})
+\uACE0\uBE44\uC6A9 \uD31F \uC0DD\uC131 \uC804 \uD655\uC778\uD558\uC138\uC694:
+[ ] 1. \uB370\uC774\uD130/\uCF54\uB4DC\uAC00 \uC774\uBBF8 \uC900\uBE44\uB428 (\uB85C\uCEEC \uC804\uCC98\uB9AC or \uC804\uC1A1 \uD31F \uC644\uB8CC)
+[ ] 2. 1-GPU\uB85C \uAC80\uC99D \uD14C\uC2A4\uD2B8 \uC644\uB8CC\uB428 (VRAM\xB7\uC18D\uB3C4\xB7\uCF54\uB4DC \uC815\uC0C1 \uB3D9\uC791)
+
+\uD655\uC778 \uC644\uB8CC \uD6C4 \uB3D9\uC77C \uD30C\uB77C\uBBF8\uD130\uC5D0 costSafetyConfirmed: true\uB97C \uCD94\uAC00\uD574 \uC7AC\uD638\uCD9C\uD558\uC138\uC694.`
+      ) : null;
+      if (hasElicitation) {
+        try {
+          const elicitResult = await mcpServer.elicitInput({
+            message: `\u26A0\uFE0F COST SAFETY CHECK (gpuCount=${args.gpuCount})
+\uACE0\uBE44\uC6A9 \uD31F \uC0DD\uC131 \uC804 \uD655\uC778\uD558\uC138\uC694:
+[ ] 1. \uB370\uC774\uD130/\uCF54\uB4DC\uAC00 \uC774\uBBF8 \uC900\uBE44\uB428 (\uB85C\uCEEC \uC804\uCC98\uB9AC or \uC804\uC1A1 \uD31F \uC644\uB8CC)
+[ ] 2. 1-GPU\uB85C \uAC80\uC99D \uD14C\uC2A4\uD2B8 \uC644\uB8CC\uB428 (VRAM\xB7\uC18D\uB3C4\xB7\uCF54\uB4DC \uC815\uC0C1 \uB3D9\uC791)
+
+\uC704 \uD56D\uBAA9\uC744 \uD655\uC778\uD588\uC73C\uBA74 \uC2B9\uC778\uD558\uC138\uC694.`,
+            requestedSchema: {
+              type: "object",
+              properties: {
+                confirmed: {
+                  type: "boolean",
+                  title: "\uBE44\uC6A9 \uC548\uC804 \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uD655\uC778 \uC644\uB8CC",
+                  description: "\uC704 \uD56D\uBAA9\uC744 \uBAA8\uB450 \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4",
+                  default: false
+                }
+              },
+              required: ["confirmed"]
+            }
+          });
+          const approved = elicitResult?.action === "accept" && elicitResult?.content?.confirmed === true;
+          if (!approved) {
+            return text(`\u{1F6AB} \uCDE8\uC18C\uB428. \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uD655\uC778 \uD6C4 \uC7AC\uC2DC\uB3C4\uD558\uC138\uC694.
+(elicitation action: ${elicitResult?.action ?? "null"})`);
+          }
+        } catch {
+          const blocked = booleanFallback();
+          if (blocked) return blocked;
+        }
+      } else {
+        const blocked = booleanFallback();
+        if (blocked) return blocked;
+      }
+    }
+    const c = requireClient();
+    const autoSshKey = await readSshPubKey();
+    const sshWarnText = process.env.SSH_KEY_PATH && !autoSshKey ? "\n\u26A0\uFE0F SSH_KEY_PATH \uC124\uC815\uB428 but \uACF5\uAC1C\uD0A4 \uC77D\uAE30 \uC2E4\uD328 \u2014 \uC9C1\uC811 SSH/SCP \uBD88\uAC00, execute_ssh_command(\uD504\uB85D\uC2DC) \uC0AC\uC6A9" : "";
+    const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
+    const gpuTypes = await c.listGpuTypes();
+    const nvRes = await resolveDcAndNv(c, args.networkVolumeId, args.dcPriority);
+    if ("error" in nvRes) return text(nvRes.error);
+    const { dcsToTry, nvDataCenterId, volumeNote } = nvRes;
     const { candidates, errors } = selectGpuCandidates(gpuTypes, {
       gpuPreference: args.gpuPreference,
       minVram: args.minVram,
@@ -21942,7 +22433,9 @@ Network Volume: ${vol.name} (${vol.id}) in ${vol.dataCenterId}`;
 Datacenter: ${nvDataCenterId} (forced by network volume)` : `
 DC fallback order: ${dcsToTry.join(" \u2192 ")}`;
       return text(
-        `## Dry Run \u2014 Preview Only (no pod created)
+        (args.gpuCount >= 2 ? `\u26A0\uFE0F COST SAFETY REMINDER: \uC2E4\uC81C \uC0DD\uC131(dryRun: false) \uC2DC \uC0AC\uC804 \uCC28\uB2E8\uC774 \uBC1C\uB3D9\uB429\uB2C8\uB2E4.
+
+` : ``) + `## Dry Run \u2014 Preview Only (no pod created)
 
 GPU: ${gpu.displayName} (${gpu.memoryInGb}GB VRAM, stock: ${stock ?? "unknown"})
 ${priceInfo}
@@ -21970,7 +22463,7 @@ Note: per-DC stock cannot be probed without creating a pod. Real run will iterat
             containerDiskInGb: args.containerDiskInGb,
             volumeInGb: args.volumeInGb,
             volumeMountPath: "/workspace",
-            sshPublicKey: args.sshPublicKey,
+            ...resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {},
             ports: ["22/tcp"],
             env: podEnv,
             networkVolumeId: args.networkVolumeId,
@@ -21994,7 +22487,7 @@ Note: per-DC stock cannot be probed without creating a pod. Real run will iterat
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})
 Spot bid: $${bidPrice}/hr
-Pod ID: ${result.id}${overprovisionWarning}${volumeNote}
+Pod ID: ${result.id}${overprovisionWarning}${volumeNote}${sshWarnText}
 
 ## Pod Metadata Stub (pass to save_pod_metadata after enriching)
 \`\`\`json
@@ -22021,7 +22514,7 @@ ${stub2}
             network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
           });
           return text(
-            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}
+            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}
 ${podSummary(pod)}
 
 ## Pod Metadata Stub (pass to save_pod_metadata after enriching)
@@ -22083,7 +22576,9 @@ server.tool(
   { podId: external_exports.string() },
   safeTool(async ({ podId }) => {
     await requireClient().stopPod(podId);
-    return text(`Pod ${podId} stop requested.`);
+    return text(`\u26A0\uFE0F \uC8FC\uC758: stop\uC740 \uACFC\uAE08\uC774 \uACC4\uC18D\uB429\uB2C8\uB2E4. \uD6C8\uB828\uC774 \uC644\uB8CC\uB418\uC5C8\uC73C\uBA74 delete_pod\uB97C \uC0AC\uC6A9\uD558\uC138\uC694.
+
+Pod ${podId} stop requested.`);
   })
 );
 server.tool(
@@ -22110,24 +22605,45 @@ server.tool(
 server.tool(
   "delete_pod",
   "Permanently delete a pod (auto-stops if running). WARNING: destroys all data not on network volumes. Returns an estimated total cost (uptime \xD7 cost_per_hr) for closing the pod metadata record.",
-  { podId: external_exports.string() },
-  safeTool(async ({ podId }) => {
+  {
+    podId: external_exports.string(),
+    artifactsSavedConfirmed: external_exports.boolean().optional().describe(
+      "Required when pod has no network volume. Set true only after confirming model weights/results are downloaded locally. Claude must NOT set this automatically without explicit user confirmation. (Same rule as costSafetyConfirmed.)"
+    )
+  },
+  safeTool(async ({ podId, artifactsSavedConfirmed }) => {
     const c = requireClient();
     let costEstimate = null;
     let podName;
+    let hasNv = false;
     try {
       const pod = await c.getPod(podId);
       podName = pod.name;
       costEstimate = estimatePodCost(pod.costPerHr, pod.lastStartedAt);
+      hasNv = !!pod.networkVolumeId;
     } catch {
+    }
+    if (!hasNv && artifactsSavedConfirmed !== true) {
+      return text(
+        `\u26D4 ARTIFACT GATE: Pod "${podName ?? podId}" has no network volume \u2014 container disk data will be permanently lost.
+
+Before deleting:
+  1. download_files(podId: "${podId}", remotePath: "/workspace", localPath: "./outputs/")
+     OR confirm outputs are already saved elsewhere.
+  2. Re-call: delete_pod(podId: "${podId}", artifactsSavedConfirmed: true)
+
+\u26A0\uFE0F Claude must NOT set artifactsSavedConfirmed:true automatically. Requires explicit user confirmation. (Same rule as costSafetyConfirmed.)`
+      );
     }
     const { wasRunning } = await deletePodWithStop(c, podId);
     const stoppedNote = wasRunning ? " (was running \u2192 auto-stopped first)" : "";
+    const nvNote = hasNv ? `
+\u{1F4A1} NV pod: /workspace outputs persist after deletion. Data outside /workspace (container disk) is gone.` : "";
     const costNote = costEstimate ? `
 
 [Cost estimate] Uptime ${costEstimate.hours.toFixed(2)}h \xD7 rate \u2192 $${costEstimate.cost.toFixed(2)}
 Update the pod metadata: read .omc/pods/<file>.yaml \u2192 set deleted_at and cost_actual_usd \u2192 save_pod_metadata \u2192 git commit "chore(pod): close ${podName ?? podId}"` : "\n\n[Cost estimate] Unavailable (no costPerHr or lastStartedAt). Set cost_actual_usd manually if you tracked it.";
-    return text(`Pod ${podId} deleted.${stoppedNote}${costNote}`);
+    return text(`Pod ${podId} deleted.${stoppedNote}${nvNote}${costNote}`);
   })
 );
 server.tool(
@@ -22146,15 +22662,24 @@ server.tool(
 
 Skipped: ${skipped.length} pod(s)${skipped.length ? "\n" + skipped.map((s) => `  - ${s.pod.name}: ${s.reason}`).join("\n") : ""}`);
     }
+    const noNvPods = stale.filter((s) => !s.pod.networkVolumeId);
     if (dryRun) {
-      const lines = stale.map(
-        (s) => `  - ${s.pod.name} (${s.pod.id}) \u2014 idle ${s.idleHours}h, ${s.pod.gpu?.displayName ?? "unknown GPU"}, $${s.pod.costPerHr ?? "?"}/hr`
-      );
+      const lines = stale.map((s) => {
+        const hasNv = !!s.pod.networkVolumeId;
+        const artifactWarn = hasNv ? "" : ` \u26A0\uFE0F NO NV \u2014 container disk data will be lost`;
+        return `  - ${s.pod.name} (${s.pod.id}) \u2014 idle ${s.idleHours}h, ${s.pod.gpu?.displayName ?? "unknown GPU"}, $${s.pod.costPerHr ?? "?"}/hr${artifactWarn}`;
+      });
+      const nvWarning = noNvPods.length ? `
+
+\u26A0\uFE0F ARTIFACT WARNING: ${noNvPods.length} pod(s) have no network volume \u2014 container disk data will be permanently lost on deletion:
+` + noNvPods.map((s) => `  - ${s.pod.name}: use delete_pod(artifactsSavedConfirmed:true) after downloading outputs`).join("\n") : "";
       return text(`[DRY RUN] Would delete ${stale.length} stale pod(s):
-${lines.join("\n")}
+${lines.join("\n")}${nvWarning}
 
 Re-run with dryRun=false to delete.`);
     }
+    const preWarning = noNvPods.length ? `\u26A0\uFE0F ARTIFACT WARNING: ${noNvPods.length} pod(s) with no network volume will lose container disk data:
+` + noNvPods.map((s) => `  - ${s.pod.name}`).join("\n") + "\nProceeding with deletion...\n\n" : "";
     const deleted = [];
     const failed = [];
     for (const s of stale) {
@@ -22165,7 +22690,7 @@ Re-run with dryRun=false to delete.`);
         failed.push(`${s.pod.name} (idle ${s.idleHours}h): ${e.message}`);
       }
     }
-    return text(`Deleted ${deleted.length} stale pod(s):
+    return text(`${preWarning}Deleted ${deleted.length} stale pod(s):
 ${deleted.map((d) => `  - ${d}`).join("\n")}${failed.length ? `
 
 Failed: ${failed.join(", ")}` : ""}`);
@@ -22295,6 +22820,34 @@ server.tool(
   })
 );
 server.tool(
+  "list_cpu_types",
+  "List available RunPod CPU pod flavors (cpu3/cpu5 \xD7 compute/general/highmem). Pricing is not exposed by RunPod's API \u2014 verify on https://console.runpod.io/pods (CPU tab) before cost-sensitive decisions.",
+  {
+    family: external_exports.enum(["compute", "general", "highmem"]).optional().describe("Filter by family: compute (2GB/vCPU), general (4GB/vCPU), highmem (8GB/vCPU)"),
+    generation: external_exports.enum(["cpu3", "cpu5"]).optional().describe("Filter by generation: cpu3 (AMD EPYC Milan) or cpu5 (Intel Xeon)")
+  },
+  safeTool(async ({ family, generation }) => {
+    let flavors = CPU_FLAVORS;
+    if (family) flavors = flavors.filter((f) => f.family === family);
+    if (generation) flavors = flavors.filter((f) => f.generation === generation);
+    if (!flavors.length) return text("No CPU flavors match the criteria.");
+    const header = "Flavor ID | Display Name | vCPU Family | RAM/vCPU | Vendor | Price";
+    const sep = "---|---|---|---|---|---";
+    const rows = flavors.map((f) => {
+      const price = f.hourlyPriceUsd != null ? `$${f.hourlyPriceUsd}/hr` : "n/a (Console)";
+      return `${f.id} | ${f.displayName} | ${f.family} | ${f.ramGbPerVcpu}GB | ${f.cpuVendor} | ${price}`;
+    });
+    const footer = [
+      "",
+      "**Note**: RunPod does not expose CPU pricing via API. Check console.runpod.io/pods \u2192 CPU tab.",
+      "**Family conventions**: `c` = compute-optimized (2GB/vCPU), `g` = general (4GB/vCPU), `m` = high-memory (8GB/vCPU).",
+      `**Valid flavor IDs**: ${CPU_FLAVOR_IDS.join(", ")}.`,
+      "**To create a CPU pod**: `create_pod_auto({ cpuOnly: true, ... })` or `create_pod({ computeType: 'CPU', cpuFlavorIds: ['cpu5c'], vcpuCount: 16, ... })`."
+    ].join("\n");
+    return text([header, sep, ...rows].join("\n") + "\n" + footer);
+  })
+);
+server.tool(
   "get_ssh_command",
   "Get the SSH command for connecting to a running pod",
   { podId: external_exports.string() },
@@ -22319,9 +22872,15 @@ server.tool(
     const pod = await c.getPod(podId);
     const sshArgs = c.getSshArgs(pod);
     if (!sshArgs) return text("Pod is not ready for SSH.");
-    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
+    let result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
       timeout: timeoutSeconds * 1e3
     });
+    for (let i = 0; i < 3 && result.status === 255 && result.stderr.includes("Permission denied"); i++) {
+      await new Promise((r) => setTimeout(r, 5e3));
+      result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", command], {
+        timeout: timeoutSeconds * 1e3
+      });
+    }
     if (result.error) return text(`SSH error: ${result.error.message}`);
     if (result.status !== 0) {
       return text(`Exit code: ${result.status}
@@ -22453,7 +23012,7 @@ ${result.stdout}`);
 );
 server.tool(
   "gpu_health_check",
-  "Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation. Best called 1-2 min after training starts to measure actual GPU utilization.",
+  "(GPU pods only \u2014 returns 'nvidia-smi not found' on CPU pods.) Check GPU memory utilization on a running pod via nvidia-smi. Returns per-GPU metrics with utilization labels and optional batch size recommendation. Best called 1-2 min after training starts to measure actual GPU utilization.",
   {
     podId: external_exports.string().describe("Pod ID"),
     perSampleMb: external_exports.number().optional().describe(
@@ -22654,7 +23213,7 @@ Please specify requiredVramGb explicitly.`
 );
 server.tool(
   "gpu_sample_burst",
-  "Take multiple rapid GPU utilization snapshots (3-5 samples, 3-5s apart) to detect trends. Returns per-sample metrics plus a trend verdict: STABLE_OPTIMAL, IMPROVING, DEGRADING, CONSISTENTLY_IDLE, or VOLATILE. Use during training to verify GPU stays utilized over time.",
+  "(GPU pods only \u2014 fails on CPU pods.) Take multiple rapid GPU utilization snapshots (3-5 samples, 3-5s apart) to detect trends. Returns per-sample metrics plus a trend verdict: STABLE_OPTIMAL, IMPROVING, DEGRADING, CONSISTENTLY_IDLE, or VOLATILE. Use during training to verify GPU stays utilized over time.",
   {
     podId: external_exports.string().describe("Pod ID"),
     samples: external_exports.number().min(2).max(10).default(5).describe("Number of samples to take"),
@@ -22816,6 +23375,804 @@ Stop and delete these pods first, then retry.`
     }
     await c.deleteNetworkVolume(volumeId);
     return text(`Network volume "${vol.name}" (${volumeId}) has been permanently deleted.`);
+  })
+);
+server.tool(
+  "plan_gpu_job",
+  "Pre-flight planning for a GPU job. Given a job description, recommends GPU, estimates total cost, determines if a staging pod + network volume are needed, and optionally generates a /gpu-exec pipeline_spec.json stub. Call this BEFORE create_pod_auto to avoid idle billing and wrong GPU selection.",
+  {
+    purpose: external_exports.string().describe("What you're training/running (e.g. 'Fine-tune LLaMA 3 8B on 22GB dataset')"),
+    datasetGb: external_exports.number().optional().describe("Dataset size in GB to transfer to the pod"),
+    modelSizeGb: external_exports.number().optional().describe("Approximate model VRAM requirement in GB (used to filter GPUs)"),
+    gpuCount: external_exports.number().default(1).describe("Desired number of GPUs for the training pod"),
+    expectedHours: external_exports.number().optional().describe("Estimated training duration in hours"),
+    gpuPreference: external_exports.array(external_exports.string()).optional().describe("Preferred GPU types in order. Defaults to RTX 3090 / 4090 / A40 / A5000"),
+    seedCount: external_exports.number().default(1).describe("Number of random seeds to run (e.g. 3 for seed 42/123/456). When > 1, shows parallel pod pattern instead of sequential \u2014 same cost, N\xD7 faster."),
+    armCount: external_exports.number().default(1).describe("Number of experimental arms/conditions (e.g. 2 for T14 vs T15). Total pods = armCount \xD7 seedCount."),
+    randomAccessTrainingGb: external_exports.number().optional().describe("Size (GB) of dataset that needs random access during training (image datasets, shuffled molecule sets, etc.). When provided, plan_gpu_job recommends containerDiskInGb large enough to copy data from NV to rootfs. NV random read is ~18\xD7 slower than rootfs (43 vs 775 files/sec), so random-access training MUST run on rootfs. rootfs CANNOT be expanded after pod creation."),
+    checkpointBudgetGb: external_exports.number().default(5).describe("Expected checkpoint storage during training (GB). Written to rootfs (/root/outputs/) during training, then rsync'd to NV on completion. Included in containerDiskInGb recommendation. Default 5GB covers typical model checkpoints."),
+    outputSpecPath: external_exports.string().optional().describe("If set, write a /gpu-exec pipeline_spec.json stub to this path")
+  },
+  safeTool(async (args) => {
+    const DEFAULT_MIN_VRAM_GB = 12;
+    const NV_COST_PER_GB_MONTH = 0.07;
+    const c = requireClient();
+    const allGpuTypes = await c.listGpuTypes();
+    const minVram = args.modelSizeGb ?? DEFAULT_MIN_VRAM_GB;
+    const prefList = args.gpuPreference ?? ["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000"];
+    const eligible = allGpuTypes.filter((g) => getOnDemandPrice(g) != null && g.memoryInGb >= minVram);
+    eligible.sort((a, b) => {
+      const ai = prefList.indexOf(a.displayName);
+      const bi = prefList.indexOf(b.displayName);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
+      return (getOnDemandPrice(a) ?? 999) - (getOnDemandPrice(b) ?? 999);
+    });
+    const recommended = eligible[0];
+    const partialMode = !recommended;
+    const datasetGb = args.datasetGb ?? 0;
+    const estimatedOutputGb = args.modelSizeGb != null ? args.modelSizeGb * 2 : 5;
+    const nvRaw = Math.ceil((datasetGb + estimatedOutputGb) * 1.3);
+    const nvGb = Math.max(50, nvRaw);
+    const stagingNeeded = datasetGb > 0.5;
+    const fmtCost = (n) => `~$${n.toFixed(2)}`;
+    const gpuPrice = recommended ? getOnDemandPrice(recommended) ?? 0 : 0;
+    const cheapest1gpu = eligible.length > 0 ? getOnDemandPrice(eligible[0]) ?? 0 : 0;
+    const stagingHours = stagingNeeded ? Math.max(1, Math.ceil(datasetGb / 50)) : 0;
+    const stagingCost = stagingNeeded ? stagingHours * cheapest1gpu : 0;
+    const validationCost = gpuPrice * 1;
+    const trainingCost = args.expectedHours != null ? gpuPrice * args.expectedHours * args.gpuCount : null;
+    const nvCost = nvGb * NV_COST_PER_GB_MONTH;
+    const lines = [];
+    lines.push(`## GPU Job Plan: ${args.purpose}`);
+    lines.push(``);
+    if (partialMode) {
+      lines.push(`\u26A0\uFE0F **PARTIAL PLAN** \u2014 No on-demand GPU meets VRAM requirement (${minVram}GB).`);
+      lines.push(`Try reducing \`modelSizeGb\` or check \`list_gpu_types\` for available options.`);
+    } else {
+      lines.push(`### Recommended GPU`);
+      lines.push(`**${recommended.displayName}** (${recommended.memoryInGb}GB VRAM) \xD7 ${args.gpuCount} \u2014 $${gpuPrice}/hr each`);
+      lines.push(`Reason: cheapest on-demand GPU meeting ${minVram}GB VRAM requirement`);
+    }
+    lines.push(``);
+    lines.push(`### Cost Estimate`);
+    lines.push(`| Item | Detail | Cost |`);
+    lines.push(`|------|--------|------|`);
+    if (stagingNeeded) {
+      lines.push(`| Staging pod (data transfer) | ${stagingHours}hr \xD7 $${cheapest1gpu.toFixed(2)}/hr \xD7 1 GPU | ${fmtCost(stagingCost)} |`);
+    }
+    if (!partialMode) {
+      lines.push(`| Validation pod (1-GPU test) | 1hr \xD7 $${gpuPrice.toFixed(2)}/hr | ${fmtCost(validationCost)} |`);
+      lines.push(`| Training pod | ${args.expectedHours != null ? `${args.expectedHours}hr \xD7 $${gpuPrice.toFixed(2)}/hr \xD7 ${args.gpuCount} GPU` : "expectedHours not provided"} | ${trainingCost != null ? fmtCost(trainingCost) : "N/A"} |`);
+    }
+    lines.push(`| Network Volume (${nvGb}GB) | $${NV_COST_PER_GB_MONTH}/GB/mo | ${fmtCost(nvCost)}/mo |`);
+    if (!partialMode && trainingCost != null) {
+      const total = stagingCost + validationCost + trainingCost;
+      lines.push(`| **Total (excl. NV)** | | **${fmtCost(total)}** |`);
+    }
+    lines.push(``);
+    lines.push(`### Staging Pattern`);
+    if (stagingNeeded) {
+      lines.push(`\u26A0\uFE0F Dataset ${datasetGb}GB > 500MB \u2014 **staging pod required** to avoid paying GPU rates during upload.`);
+      lines.push(`1. \`create_network_volume(${nvGb}GB)\` \u2014 ceil((${datasetGb} + ${estimatedOutputGb}) \xD7 1.3) = ${nvRaw}GB \u2192 min 50GB`);
+      lines.push(`2. \`create_pod_auto(cheapest 1-GPU, networkVolumeId)\` \u2192 upload data \u2192 delete pod`);
+      lines.push(`3. \`create_pod_auto(${recommended?.displayName ?? "target GPU"} \xD7 ${args.gpuCount}, networkVolumeId)\` \u2192 train \u2192 delete pod`);
+    } else {
+      lines.push(`\u2705 Dataset ${datasetGb > 0 ? `${datasetGb}GB` : "not specified"} \u2014 direct upload on training pod is fine (< 500MB threshold).`);
+    }
+    lines.push(``);
+    lines.push(`### NV Sizing`);
+    lines.push(`\`ceil((datasetGb=${datasetGb} + estimatedOutputGb=${estimatedOutputGb}) \xD7 1.3)\` = ${nvRaw}GB \u2192 **${nvGb}GB** (min 50GB)`);
+    lines.push(`Cost: ~$${(nvGb * NV_COST_PER_GB_MONTH).toFixed(2)}/mo`);
+    lines.push(``);
+    lines.push(`### rootfs \uC0AC\uC774\uC9D5 (NV \u2192 rootfs \uBCF5\uC0AC \uD544\uC218)`);
+    if (args.randomAccessTrainingGb != null && args.randomAccessTrainingGb > 0) {
+      const ra = args.randomAccessTrainingGb;
+      const recDisk = Math.ceil(ra * 1.3 + 30);
+      lines.push(`\u26A0\uFE0F **\uB79C\uB364 \uC561\uC138\uC2A4 \uD6C8\uB828 ${ra}GB \uAC10\uC9C0** \u2014 NV\uB294 rootfs\uBCF4\uB2E4 ~18\xD7 \uB290\uB9BC (43 vs 775 files/sec)`);
+      lines.push(`\uD6C8\uB828 \uB370\uC774\uD130\uB97C NV\uC5D0\uC11C rootfs\uB85C \uBCF5\uC0AC \uD6C4 \uD6C8\uB828\uD574\uC57C \uD568. **rootfs\uB294 \uD31F \uC0DD\uC131 \uD6C4 \uBABB \uB298\uB9BC**.`);
+      lines.push(``);
+      lines.push(`**\uAD8C\uC7A5**: \`containerDiskInGb=${recDisk}\` (data ${ra}GB \xD7 1.3 + 30GB system overhead)`);
+      lines.push(`\uD31F \uC0DD\uC131 \uC9C1\uD6C4: \`mkdir -p /root/data && cp -r --reflink=auto /workspace/<dataset> /root/data/\``);
+      lines.push(`\uD6C8\uB828 \uC2A4\uD06C\uB9BD\uD2B8\uB294 \`/root/data/<dataset>\` \uB97C \uC77D\uB3C4\uB85D \uC124\uC815.`);
+      lines.push(`run_preflight \uD638\uCD9C \uC2DC \`trainDataPath="/root/data/<dataset>"\`, \`expectedRandomAccessGb=${ra}\` \uC804\uB2EC.`);
+    } else if (datasetGb >= 50) {
+      lines.push(`\u26A0\uFE0F \uB300\uD615 \uB370\uC774\uD130\uC14B (${datasetGb}GB). \uB79C\uB364 \uC561\uC138\uC2A4 \uD6C8\uB828(\uC774\uBBF8\uC9C0, \uC154\uD50C\uB41C \uB370\uC774\uD130\uC14B \uB4F1)\uC774\uB77C\uBA74:`);
+      lines.push(`- NV\uB294 rootfs\uBCF4\uB2E4 ~18\xD7 \uB290\uB9BC \u2014 \uB370\uC774\uD130\uB97C rootfs\uB85C \uBCF5\uC0AC \uD6C4 \uD6C8\uB828 \uD544\uC694`);
+      lines.push(`- rootfs\uB294 \uD31F \uC0DD\uC131 \uD6C4 \uBABB \uB298\uB9BC \u2192 \`containerDiskInGb\` \uC0AC\uC804 \uACC4\uC0B0 \uD544\uC218`);
+      lines.push(`- **\uB79C\uB364 \uC561\uC138\uC2A4 \uD6C8\uB828\uC774\uB77C\uBA74** \`randomAccessTrainingGb\` \uD30C\uB77C\uBBF8\uD130\uB97C \uCD94\uAC00\uD574 \uC815\uD655\uD55C \uC0AC\uC774\uC988 \uAD8C\uC7A5\uAC12\uC744 \uBC1B\uC73C\uC138\uC694`);
+      lines.push(`- \uC21C\uC218 sequential \uC77D\uAE30(rare)\uBA74 NV \uC9C1\uC811 \uAC00\uB2A5 \u2014 run_preflight\uC5D0\uC11C \`allowNvStreaming:true\``);
+    } else {
+      lines.push(`\u2705 \uB370\uC774\uD130\uC14B ${datasetGb}GB \u2014 rootfs \uAE30\uBCF8\uAC12\uC73C\uB85C \uCDA9\uBD84. \uB79C\uB364 \uC561\uC138\uC2A4 \uD6C8\uB828\uC774\uB77C\uB3C4 \uC791\uC740 \uB370\uC774\uD130\uB294 \uBD80\uB2F4 \uC801\uC74C.`);
+    }
+    lines.push(``);
+    lines.push(`### Pre-flight Checklist`);
+    lines.push(`[ ] 1. \uB85C\uCEEC \uC804\uCC98\uB9AC \uC644\uB8CC (tokenization, feature extraction \uB4F1 GPU \uBD88\uD544\uC694\uD55C \uC791\uC5C5)`);
+    lines.push(`[ ] 2. \uD559\uC2B5 \uCF54\uB4DC \uB85C\uCEEC \uD14C\uC2A4\uD2B8 \uD1B5\uACFC (import, forward pass, \uC124\uC815 \uD30C\uC77C \uD655\uC778)`);
+    lines.push(`[ ] 3. \uCCB4\uD06C\uD3EC\uC778\uD2B8 \uC800\uC7A5 \uACBD\uB85C \uC124\uC815 \u2192 **/root/outputs/** (rootfs, \uD6C8\uB828 \uC911 write \uBE60\uB984)`);
+    lines.push(`[ ] 4. NV \uD06C\uAE30 \uD655\uC778: ${nvGb}GB \uC900\uBE44`);
+    lines.push(`[ ] 5. **rootfs \uC0AC\uC774\uC988 \uD655\uC778** (\uB79C\uB364 \uC561\uC138\uC2A4 \uB370\uC774\uD130 + \uCCB4\uD06C\uD3EC\uC778\uD2B8 ${args.checkpointBudgetGb}GB + \uC2DC\uC2A4\uD15C \uC624\uBC84\uD5E4\uB4DC \u2014 \uC0DD\uC131 \uD6C4 \uBABB \uB298\uB9BC)`);
+    if (args.gpuCount >= COST_GATE_GPU_COUNT) {
+      lines.push(`[ ] 6. **1-GPU \uAC80\uC99D \uD14C\uC2A4\uD2B8 \uC644\uB8CC** (gpuCount=${args.gpuCount} \u2014 \uACE0\uBE44\uC6A9 \uD31F \uC804 \uD544\uC218)`);
+    }
+    lines.push(``);
+    lines.push(`### Post-Training (\uC544\uD2F0\uD329\uD2B8 \uBCF4\uC874)`);
+    lines.push(`[ ] \uD6C8\uB828 \uC644\uB8CC \uD6C4 (NV \uC788\uC74C): \`rsync -a /root/outputs/ /workspace/outputs/ && echo RSYNC_OK\` \u2192 RSYNC_OK \uD655\uC778 \u2192 \`delete_pod(artifactsSavedConfirmed: true)\``);
+    lines.push(`[ ] \uD6C8\uB828 \uC644\uB8CC \uD6C4 (NV \uC5C6\uC74C): \`download_files\` \u2192 \`delete_pod(artifactsSavedConfirmed: true)\``);
+    lines.push(...renderMonitoringCadenceSection({
+      expectedHours: args.expectedHours ?? null,
+      gpuPrice,
+      partialMode
+    }));
+    lines.push(``);
+    if (args.seedCount > 1) {
+      const totalPods = args.seedCount * args.armCount;
+      const defaultSeeds = [42, 123, 456, 789, 999];
+      const seeds = defaultSeeds.slice(0, args.seedCount);
+      lines.push(``);
+      lines.push(`### \u26A0\uFE0F Seed \uBCD1\uB82C\uD654 \uD544\uC218 (seedCount=${args.seedCount})`);
+      lines.push(`**\uC21C\uCC28 \uC2E4\uD589 \uAE08\uC9C0 \u2014 \uAC19\uC740 \uBE44\uC6A9\uC5D0 ${args.seedCount}\uBC30 \uB290\uB824\uC9D0.**`);
+      lines.push(`arm\uB2F9 seed ${args.seedCount}\uAC1C\uB294 ${args.seedCount}\uD31F \uB3D9\uC2DC \uC0DD\uC131. DDP \uBD88\uD544\uC694, \uB2E8\uC21C \uBCD1\uB82C.`);
+      lines.push(``);
+      lines.push(`| \uBC29\uC2DD | \uC18C\uC694 \uC2DC\uAC04 | \uBE44\uC6A9 |`);
+      lines.push(`|------|----------|------|`);
+      if (args.expectedHours != null) {
+        const seqHours = args.expectedHours * args.seedCount;
+        const parHours = args.expectedHours;
+        const seqCost = gpuPrice * seqHours * args.gpuCount;
+        const parCost = gpuPrice * parHours * args.gpuCount * args.seedCount;
+        lines.push(`| \uC21C\uCC28 \uC2E4\uD589 (${args.seedCount} seed \xD7 1\uD31F) | ${seqHours}hr | ${fmtCost(seqCost)} |`);
+        lines.push(`| **\uBCD1\uB82C \uC2E4\uD589 (${args.seedCount}\uD31F \uB3D9\uC2DC)** | **${parHours}hr** | **${fmtCost(parCost)}** |`);
+      } else {
+        lines.push(`| \uC21C\uCC28 \uC2E4\uD589 | ${args.seedCount}\xD7 \uC18C\uC694 \uC2DC\uAC04 | \uB3D9\uC77C \uBE44\uC6A9 |`);
+        lines.push(`| **\uBCD1\uB82C \uC2E4\uD589** | **1\xD7 \uC18C\uC694 \uC2DC\uAC04** | **\uB3D9\uC77C \uBE44\uC6A9** |`);
+      }
+      lines.push(``);
+      lines.push(`**\uCD1D \uD31F \uC218:** ${totalPods}\uAC1C (${args.armCount}arm \xD7 ${args.seedCount}seed)`);
+      lines.push(``);
+      lines.push(`**\uD31F \uC0DD\uC131 \uD328\uD134${args.armCount > 1 ? ` (arm 1\uAC1C \uAE30\uC900, \xD7 ${args.armCount} \uBC18\uBCF5)` : ""}:**`);
+      seeds.forEach((seed, i) => {
+        lines.push(`\`create_pod_auto({ env: { SEED: "${seed}" }, ... })  # seed ${i + 1}/${args.seedCount}\``);
+      });
+      if (args.armCount > 1) {
+        lines.push(``);
+        lines.push(`> arm\uC774 ${args.armCount}\uAC1C\uC774\uBA74 \uC704 \uD328\uD134\uC744 arm\uBCC4\uB85C \uBC18\uBCF5 \u2192 \uCD1D **${totalPods}\uD31F \uB3D9\uC2DC** \uC2E4\uD589`);
+      }
+    }
+    const DEFAULT_CONTAINER_DISK_GB = 30;
+    const diskEstimateGb = ((args.modelSizeGb ?? 5) + datasetGb * 0.1 + args.checkpointBudgetGb + 2) * args.gpuCount;
+    const diskThreshold = DEFAULT_CONTAINER_DISK_GB * 0.7;
+    lines.push(``);
+    lines.push(`### Container Disk`);
+    if (diskEstimateGb > diskThreshold) {
+      const recommendedDisk = Math.ceil(diskEstimateGb * 1.5);
+      lines.push(`\u26A0\uFE0F **Container disk warning**: estimated experiment output ~${diskEstimateGb.toFixed(1)}GB (model + tmp + checkpoints + logs \xD7 gpuCount=${args.gpuCount}) exceeds 70% of RunPod default ${DEFAULT_CONTAINER_DISK_GB}GB disk.`);
+      lines.push(`\u2192 Set \`containerDiskInGb: ${recommendedDisk}\` in create_pod_auto`);
+      lines.push(`\u2192 Formula: (modelSizeGb=${args.modelSizeGb ?? 5} + datasetGb\xD70.1=${(datasetGb * 0.1).toFixed(1)} + checkpointBudgetGb=${args.checkpointBudgetGb} + 2) \xD7 gpuCount=${args.gpuCount} = ${diskEstimateGb.toFixed(1)}GB`);
+    } else {
+      lines.push(`\u2705 Estimated disk usage ~${diskEstimateGb.toFixed(1)}GB \u2014 within 70% of default ${DEFAULT_CONTAINER_DISK_GB}GB container disk.`);
+    }
+    lines.push(``);
+    lines.push(`### Next Steps`);
+    lines.push(`1. \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uC644\uB8CC \uD6C4: \`create_pod_auto(dryRun: true, gpuCount: ${args.gpuCount}, ...)\` \uB85C GPU \uC120\uD0DD \uC7AC\uD655\uC778`);
+    if (args.outputSpecPath) {
+      lines.push(`2. /gpu-exec \uD30C\uC774\uD504\uB77C\uC778: \`pipeline_spec.json\` stub \u2192 \`${args.outputSpecPath}\``);
+    } else {
+      lines.push(`2. /gpu-exec \uD30C\uC774\uD504\uB77C\uC778\uC774 \uD544\uC694\uD558\uBA74 \`outputSpecPath\` \uD30C\uB77C\uBBF8\uD130\uB85C \`pipeline_spec.json\` stub \uC0DD\uC131 \uAC00\uB2A5`);
+    }
+    if (args.outputSpecPath) {
+      const specPath = isAbsolute(args.outputSpecPath) ? args.outputSpecPath : resolve(process.cwd(), args.outputSpecPath);
+      const stub = {
+        pipeline_id: `plan-${Date.now()}`,
+        mode: "runpod",
+        gpu: recommended?.displayName ?? "FILL_IN",
+        gpu_count: args.gpuCount,
+        network_volume_gb: nvGb,
+        phases: [
+          ...stagingNeeded ? [{
+            id: "upload",
+            purpose: "Data transfer",
+            gpu: "cheapest-1gpu",
+            steps: [`Upload dataset (${datasetGb}GB) to /workspace/data/`]
+          }] : [],
+          {
+            id: "train",
+            purpose: args.purpose,
+            gpu: recommended?.displayName ?? "FILL_IN",
+            gpu_count: args.gpuCount,
+            steps: ["Run training script", "Save checkpoint to /workspace/checkpoints/"],
+            gate: 'FILL_IN: e.g. {"metric": "val_loss", "threshold": 0.5, "op": "<"}'
+          }
+        ]
+      };
+      try {
+        await mkdir(dirname(specPath), { recursive: true });
+        await writeFile(specPath, JSON.stringify(stub, null, 2), "utf-8");
+        lines.push(`
+\u2705 pipeline_spec.json stub \uC0DD\uC131\uB428: \`${specPath}\``);
+      } catch (e) {
+        lines.push(`
+\u26A0\uFE0F pipeline_spec.json \uC800\uC7A5 \uC2E4\uD328: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    return text(lines.join("\n"));
+  })
+);
+var NV_READY_DIR = ".omc/gpu-exec";
+var TOKEN_TTL_HOURS = 72;
+server.tool(
+  "verify_data_on_nv",
+  "Verify that a dataset has been successfully transferred to a Network Volume by SSHing to a mounted staging pod and checking file existence + sizes. Returns a readiness token (valid 72h) that create_pod_auto requires when gpuCount >= 2 + networkVolumeId. Call this BEFORE deleting the staging pod \u2014 token requires pod to still be RUNNING.",
+  {
+    podId: external_exports.string().describe("ID of the RUNNING staging pod with the NV mounted"),
+    requiredPaths: external_exports.array(external_exports.string()).describe(
+      "Paths to verify on /workspace/ (e.g. ['data/train.jsonl', 'data/val.jsonl'])"
+    ),
+    minTotalGb: external_exports.number().optional().describe(
+      "Minimum total size in GB across all paths. Fails if smaller (catches truncation)."
+    )
+  },
+  safeTool(async ({ podId, requiredPaths, minTotalGb }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    if (!pod) return text(`\u274C Pod ${podId} not found. verify_data_on_nv requires the staging pod to still be RUNNING. Call this tool BEFORE deleting the staging pod.`);
+    const nvId = pod.networkVolumeId;
+    if (!nvId) return text(`\u274C Pod ${podId} has no Network Volume attached. Cannot issue NV readiness token.`);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text(`\u274C Pod ${podId} is not ready for SSH. Run wait_for_pod first.`);
+    const lines = [`## verify_data_on_nv \u2014 ${podId}`];
+    let totalBytes = 0;
+    const pathResults = [];
+    for (const p of requiredPaths) {
+      const cmd = `ls -la /workspace/${p} 2>/dev/null && du -sb /workspace/${p} 2>/dev/null | awk '{print $1}'`;
+      const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", cmd], { timeout: 3e4 });
+      if (result.status !== 0 || !result.stdout.trim()) {
+        pathResults.push(`\u274C /workspace/${p} \u2014 not found or inaccessible`);
+      } else {
+        const sizeMatch = result.stdout.match(/(\d+)\s*$/m);
+        const bytes = sizeMatch ? parseInt(sizeMatch[1], 10) : 0;
+        totalBytes += bytes;
+        const sizeGb = (bytes / 1073741824).toFixed(2);
+        pathResults.push(`\u2705 /workspace/${p} \u2014 ${sizeGb}GB`);
+      }
+    }
+    const failedPaths = pathResults.filter((r) => r.startsWith("\u274C"));
+    if (failedPaths.length > 0) {
+      lines.push(...pathResults);
+      return text(lines.join("\n") + "\n\n\u274C Verification FAILED \u2014 missing files detected.");
+    }
+    const totalGb = totalBytes / 1073741824;
+    if (minTotalGb != null && totalGb < minTotalGb) {
+      lines.push(...pathResults);
+      lines.push(`
+\u274C Data truncation detected: expected \u2265${minTotalGb}GB, found ${totalGb.toFixed(2)}GB`);
+      return text(lines.join("\n"));
+    }
+    const token = randomUUID();
+    const tokenData = { token, nvId, podId, verifiedAt: (/* @__PURE__ */ new Date()).toISOString(), totalGb: parseFloat(totalGb.toFixed(3)), paths: requiredPaths };
+    await mkdir(NV_READY_DIR, { recursive: true });
+    await writeFile(`${NV_READY_DIR}/nv_ready_${nvId}.json`, JSON.stringify(tokenData, null, 2), "utf-8");
+    lines.push(...pathResults);
+    lines.push(`
+\u2705 NV ${nvId} verified: ${totalGb.toFixed(2)}GB across ${requiredPaths.length} paths.`);
+    lines.push(`Token valid 72h. Pass to create_pod_auto as nvReadinessToken.`);
+    lines.push(`Token: ${token}`);
+    return text(lines.join("\n"));
+  })
+);
+server.tool(
+  "run_preflight",
+  "Run pre-flight checks on a RUNNING pod before starting an expensive experiment. Checks disk space, requirements.txt pinning, file existence, system tools, and Python import smoke tests. Based on real incident postmortem: 6/8 bugs catchable in <5 min with this tool. Call after pod setup, before launching training.",
+  {
+    podId: external_exports.string().describe("Pod ID to SSH into for checks"),
+    requirementsPath: external_exports.string().optional().describe("Local path to requirements.txt \u2014 checks ML-critical package pinning"),
+    requiredFiles: external_exports.array(external_exports.string()).optional().describe("Paths on /workspace/ that must exist (model files, data, configs)"),
+    requiredTools: external_exports.array(external_exports.string()).optional().describe("System tools that must be in PATH on pod (e.g. ['cpptraj', 'gmx_MMPBSA'])"),
+    importSmokes: external_exports.array(external_exports.string()).optional().describe("Python import statements to test on pod (e.g. ['from chemprop.featurizers import SimpleMoleculeMolGraphFeaturizer'])"),
+    minDiskFreeGb: external_exports.number().default(10).describe("Minimum free disk space on /workspace/ in GB"),
+    strict: external_exports.boolean().default(false).describe("If true, treat any WARNING as FAIL"),
+    trainDataPath: external_exports.string().optional().describe("Absolute path on pod where the training script READS data from (e.g. '/workspace/dataset' or '/root/data'). REQUIRED for GPU pods with NV attached unless allowNvStreaming:true. NV random read is ~18x slower than rootfs (43 vs 775 files/sec). Verifies data has been copied from NV to rootfs."),
+    expectedRandomAccessGb: external_exports.number().optional().describe("Size (GB) of dataset that needs random access during training. Used to verify rootfs has enough free space. rootfs CANNOT be expanded after pod creation \u2014 must be sized at creation time via containerDiskInGb."),
+    allowNvStreaming: external_exports.boolean().default(false).describe("Opt-out: skip the NV\u2192rootfs migration HALT. Only set true if training does PURELY sequential reads (rare for ML; image/molecule/text shuffled training all need random access)."),
+    trainingSmokeCmd: external_exports.string().optional().describe(`Optional shell command (run from /workspace) that exercises the actual training entry point for ~30s \u2014 e.g. 'python3 train.py --smoke-test' or 'python3 -c "from src.train import main; main(smoke=True)"'. Catches NotImplementedError/skeleton scripts BEFORE billing starts. HALT on NotImplementedError|ImportError|SyntaxError|ModuleNotFoundError|AttributeError. A 30s timeout (exit 124) without those patterns is treated as PASS (training started running). Strongly recommended for any pod whose script you have not previously executed end-to-end.`),
+    trainingEntryModule: external_exports.string().optional().describe("Optional Python module path (e.g. 'src.train' or 'experiments.e215.run') used as a fallback smoke when trainingSmokeCmd is not provided. Runs `python3 -c 'import <mod>'` from /workspace and HALTs on top-level NotImplementedError/ImportError/SyntaxError. Cheaper than trainingSmokeCmd but only catches import-time failures, not function-body skeletons.")
+  },
+  safeTool(async ({ podId, requirementsPath, requiredFiles, requiredTools, importSmokes, minDiskFreeGb, strict, trainDataPath, expectedRandomAccessGb, allowNvStreaming, trainingSmokeCmd, trainingEntryModule }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    if (!pod) return text(`\u274C Pod ${podId} not found.`);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text(`\u274C Pod ${podId} not ready for SSH. Run wait_for_pod first.`);
+    const CRITICAL_ML = ["peft", "transformers", "torch", "torchaudio", "torchvision", "bitsandbytes", "accelerate", "datasets"];
+    const results = [];
+    let hasFail = false;
+    let hasWarn = false;
+    {
+      const cudaScript = [
+        "import subprocess, torch",
+        "ok = torch.cuda.is_available()",
+        "if ok:",
+        "  try:",
+        "    drv = subprocess.check_output(['nvidia-smi','--query-gpu=driver_version','--format=csv,noheader'],text=True).strip()",
+        "  except FileNotFoundError:",
+        "    drv = 'nvidia-smi-missing'",
+        "  print(f'CUDA:OK cuda_build={torch.version.cuda} driver={drv} torch={torch.__version__}')",
+        "else:",
+        "  print(f'CUDA:FAIL torch={torch.__version__} cuda_build={torch.version.cuda}')"
+      ].join("\n");
+      const cudaB64 = Buffer.from(cudaScript).toString("base64");
+      const cudaCheckCmd = `bash -c 'echo ${cudaB64} | base64 -d | python3'`;
+      const cudaResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", cudaCheckCmd], { timeout: 6e4 });
+      if (cudaResult.status === null) {
+        results.push({ label: "CUDA", status: "\u26A0\uFE0F", detail: "CUDA check timed out (60s) \u2014 pod may be cold-starting. Re-run run_preflight." });
+        hasWarn = true;
+      } else {
+        const lines2 = (cudaResult.stdout ?? "").split("\n");
+        const cudaLine = lines2.find((l) => l.startsWith("CUDA:OK") || l.startsWith("CUDA:FAIL")) ?? "";
+        const stderrFull = cudaResult.stderr ?? "";
+        const isModuleErr = stderrFull.includes("ModuleNotFoundError") || stderrFull.includes("No module named");
+        const stderrDisplay = stderrFull.substring(0, 200);
+        if (cudaLine.startsWith("CUDA:FAIL")) {
+          results.push({ label: "CUDA", status: "\u274C", detail: cudaLine });
+          hasFail = true;
+        } else if (cudaResult.status !== 0 || !cudaLine) {
+          const detail = isModuleErr ? `torch not installed: ${stderrDisplay}` : `check failed (exit ${cudaResult.status}): ${stderrDisplay || cudaLine}`;
+          results.push({ label: "CUDA", status: "\u274C", detail });
+          hasFail = true;
+        } else {
+          results.push({ label: "CUDA", status: "\u2705", detail: cudaLine.replace("CUDA:OK ", "") });
+        }
+      }
+    }
+    {
+      const trainPathSafe = (trainDataPath ?? "").replace(/['\\\n\r]/g, "");
+      const inspectShell = [
+        `R=$(stat -c %m / 2>/dev/null || echo '/')`,
+        `W=$(stat -c %m /workspace 2>/dev/null || echo 'MISSING')`,
+        trainPathSafe ? `T=$(stat -c %m '${trainPathSafe}' 2>/dev/null || echo 'MISSING')` : `T=''`,
+        `FREE=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}' || echo '0')`,
+        `TOTAL=$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G","",$2); print $2}' || echo '0')`,
+        trainPathSafe ? `DATA=$(du -sBG '${trainPathSafe}' 2>/dev/null | awk '{gsub("G","",$1); print $1}' || echo '0')` : `DATA=''`,
+        `echo "R=$R|W=$W|T=$T|FREE=$FREE|TOTAL=$TOTAL|DATA=$DATA"`
+      ].join(";");
+      const inspectB64 = Buffer.from(inspectShell).toString("base64");
+      const inspectCmd = `bash -c 'echo ${inspectB64} | base64 -d | bash'`;
+      const inspectResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", inspectCmd], { timeout: 3e4 });
+      if (inspectResult.status === null) {
+        results.push({ label: "NV\u2192rootfs", status: "\u26A0\uFE0F", detail: "Mount inspection timed out (30s) \u2014 pod may be cold-starting. Re-run run_preflight." });
+        hasWarn = true;
+      } else if (inspectResult.status !== 0) {
+        results.push({ label: "NV\u2192rootfs", status: "\u26A0\uFE0F", detail: `Mount inspection failed (exit ${inspectResult.status}) \u2014 skipping NV check. stderr: ${(inspectResult.stderr ?? "").substring(0, 150)}` });
+        hasWarn = true;
+      } else {
+        const lastLine = (inspectResult.stdout ?? "").trim().split("\n").pop() ?? "";
+        const parts = {};
+        for (const kv of lastLine.split("|")) {
+          const eq = kv.indexOf("=");
+          if (eq > 0) parts[kv.substring(0, eq)] = kv.substring(eq + 1);
+        }
+        const rootMount = parts.R || "/";
+        const workspaceMount = parts.W || "MISSING";
+        const trainMount = parts.T || "";
+        const rootfsFreeGb = parseInt(parts.FREE || "0", 10) || 0;
+        const rootfsTotalGb = parseInt(parts.TOTAL || "0", 10) || 0;
+        const trainDataGb = parseInt(parts.DATA || "0", 10) || 0;
+        const nvAttached = workspaceMount !== "MISSING" && workspaceMount !== rootMount;
+        if (!nvAttached) {
+          results.push({ label: "NV\u2192rootfs", status: "\u2705", detail: `No NV attached \u2014 rootfs only (${rootfsFreeGb}/${rootfsTotalGb}GB free)` });
+        } else if (!trainDataPath && !allowNvStreaming) {
+          results.push({
+            label: "NV\u2192rootfs",
+            status: "\u274C",
+            detail: `HALT \u2014 NV attached at ${workspaceMount} but trainDataPath not specified. NV random read ~18x slower than rootfs (43 vs 775 files/sec). ASK USER: (1) which path will the training script READ data from? (2) dataset size in GB needing random access? Then re-run with trainDataPath="<path>" and expectedRandomAccessGb=<N>. Opt-out (rare, sequential reads only): allowNvStreaming:true. Note: rootfs has ${rootfsFreeGb}/${rootfsTotalGb}GB free \u2014 cannot grow after pod creation.`
+          });
+          hasFail = true;
+        } else if (!trainDataPath && allowNvStreaming) {
+          results.push({
+            label: "NV\u2192rootfs",
+            status: "\u26A0\uFE0F",
+            detail: `NV streaming opted in (allowNvStreaming:true). Random reads will be ~18x slower than rootfs. Verify training pattern is sequential.`
+          });
+          hasWarn = true;
+        } else if (trainMount === "MISSING") {
+          results.push({
+            label: "NV\u2192rootfs",
+            status: "\u274C",
+            detail: `trainDataPath does not exist on pod: ${trainDataPath}. Check the path or upload data first.`
+          });
+          hasFail = true;
+        } else if (trainMount !== rootMount) {
+          const dataInfo = trainDataGb > 0 ? `${trainDataGb}GB` : "unknown size";
+          const targetPath = `/root/data`;
+          const recCmd = `mkdir -p ${targetPath} && cp -r --reflink=auto ${trainDataPath} ${targetPath}/`;
+          const sufficient = trainDataGb === 0 || rootfsFreeGb >= trainDataGb + 5;
+          if (!sufficient) {
+            const recDisk = Math.ceil(trainDataGb * 1.3 + 30);
+            results.push({
+              label: "NV\u2192rootfs",
+              status: "\u274C",
+              detail: `Data on NV (mount=${trainMount}, ${dataInfo}) AND rootfs too small (${rootfsFreeGb}GB free, need \u2265${trainDataGb + 5}GB). rootfs CANNOT be grown on running pod \u2014 recreate pod with containerDiskInGb\u2265${recDisk}.`
+            });
+          } else {
+            results.push({
+              label: "NV\u2192rootfs",
+              status: "\u274C",
+              detail: `Data on NV (mount=${trainMount}, ${dataInfo}) \u2014 must copy to rootfs first. NV random read ~18x slower than rootfs. Run on pod: ${recCmd}. Then re-point training script to ${targetPath}/<basename> and re-run preflight.`
+            });
+          }
+          hasFail = true;
+        } else if (expectedRandomAccessGb != null && rootfsFreeGb < expectedRandomAccessGb + 10) {
+          const recDisk = Math.ceil(expectedRandomAccessGb * 1.3 + 30);
+          results.push({
+            label: "NV\u2192rootfs",
+            status: "\u274C",
+            detail: `Data on rootfs \u2713 but rootfs has only ${rootfsFreeGb}GB free, need \u2265${expectedRandomAccessGb + 10}GB (expectedRandomAccessGb=${expectedRandomAccessGb} + 10GB headroom). rootfs CANNOT be grown on running pod \u2014 recreate with containerDiskInGb\u2265${recDisk}.`
+          });
+          hasFail = true;
+        } else {
+          const sizeNote = expectedRandomAccessGb != null ? ` (rootfs ${rootfsFreeGb}/${rootfsTotalGb}GB free, expected ${expectedRandomAccessGb}GB)` : ` (rootfs ${rootfsFreeGb}/${rootfsTotalGb}GB free)`;
+          results.push({
+            label: "NV\u2192rootfs",
+            status: "\u2705",
+            detail: `Data on rootfs (mount=${trainMount})${sizeNote}`
+          });
+        }
+      }
+    }
+    const dfResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", `df -BG /workspace | awk 'NR==2{print $4}' | tr -d G`], { timeout: 15e3 });
+    const freeGb = dfResult.status === 0 ? parseInt(dfResult.stdout.trim(), 10) : -1;
+    if (freeGb < 0) {
+      results.push({ label: "Disk free", status: "\u274C", detail: "Could not query disk space" });
+      hasFail = true;
+    } else if (freeGb < minDiskFreeGb) {
+      results.push({ label: "Disk free", status: "\u274C", detail: `Only ${freeGb}GB free \u2014 need \u2265${minDiskFreeGb}GB` });
+      hasFail = true;
+    } else {
+      results.push({ label: "Disk free", status: "\u2705", detail: `${freeGb}GB free (min: ${minDiskFreeGb}GB)` });
+    }
+    if (requirementsPath) {
+      try {
+        const content = await readFile(requirementsPath, "utf-8");
+        const lines2 = content.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#"));
+        const issues = [];
+        for (const line of lines2) {
+          const match = line.match(/^([a-zA-Z0-9_-]+)(.*)$/);
+          if (!match) continue;
+          const pkg = match[1].toLowerCase();
+          if (!CRITICAL_ML.includes(pkg)) continue;
+          const spec = match[2].trim();
+          if (!spec) {
+            issues.push(`${pkg} (no version spec)`);
+          } else if (/^>=/.test(spec) && !spec.includes(",<")) {
+            issues.push(`${pkg}${spec} (unbounded \u2014 no upper bound)`);
+          }
+        }
+        if (issues.length > 0) {
+          results.push({ label: "requirements.txt", status: "\u26A0\uFE0F", detail: `Unbounded: ${issues.join(", ")}` });
+          hasWarn = true;
+        } else {
+          results.push({ label: "requirements.txt", status: "\u2705", detail: "All critical ML packages pinned" });
+        }
+      } catch {
+        results.push({ label: "requirements.txt", status: "\u274C", detail: `File not found: ${requirementsPath}` });
+        hasFail = true;
+      }
+    }
+    if (requiredFiles && requiredFiles.length > 0) {
+      const checkCmd = requiredFiles.map((f) => `ls /workspace/${f} 2>/dev/null && echo "OK:${f}" || echo "MISSING:${f}"`).join("; ");
+      const fileResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", checkCmd], { timeout: 2e4 });
+      const out = fileResult.stdout;
+      const missing = requiredFiles.filter((f) => out.includes(`MISSING:${f}`));
+      if (missing.length > 0) {
+        results.push({ label: "Required files", status: "\u274C", detail: `Missing: ${missing.join(", ")}` });
+        hasFail = true;
+      } else {
+        results.push({ label: "Required files", status: "\u2705", detail: `${requiredFiles.length} file(s) present` });
+      }
+    }
+    if (requiredTools && requiredTools.length > 0) {
+      const toolCmd = requiredTools.map((t) => `which ${t} 2>/dev/null && echo "FOUND:${t}" || echo "MISSING:${t}"`).join("; ");
+      const toolResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", toolCmd], { timeout: 15e3 });
+      const out = toolResult.stdout;
+      const missing = requiredTools.filter((t) => out.includes(`MISSING:${t}`));
+      if (missing.length > 0) {
+        results.push({ label: "System tools", status: "\u274C", detail: `Not in PATH: ${missing.join(", ")}` });
+        hasFail = true;
+      } else {
+        results.push({ label: "System tools", status: "\u2705", detail: requiredTools.join(", ") });
+      }
+    }
+    if (importSmokes && importSmokes.length > 0) {
+      for (const imp of importSmokes) {
+        const smokeCmd = `python3 -c "${imp.replace(/"/g, '\\"')}" 2>&1 && echo "__IMPORT_OK__" || echo "__IMPORT_FAIL__"`;
+        const smokeResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", smokeCmd], { timeout: 3e4 });
+        if (smokeResult.stdout.includes("__IMPORT_OK__")) {
+          results.push({ label: `Import: ${imp.split(" ")[1]}`, status: "\u2705", detail: "OK" });
+        } else {
+          const errLine = smokeResult.stdout.split("\n").find((l) => l.includes("Error") || l.includes("error")) ?? "import failed";
+          results.push({ label: `Import: ${imp.split(" ")[1]}`, status: "\u274C", detail: errLine.trim() });
+          hasFail = true;
+        }
+      }
+    }
+    if (trainingSmokeCmd || trainingEntryModule) {
+      let sshCmd;
+      let smokeLabel;
+      if (trainingSmokeCmd) {
+        const safeCmd = trainingSmokeCmd.replace(/[\n\r]/g, " ");
+        const wrapped = `cd /workspace && timeout 30 ${safeCmd} 2>&1; echo __SMOKE_EXIT__$?`;
+        const wrappedB64 = Buffer.from(wrapped).toString("base64");
+        sshCmd = `bash -c 'echo ${wrappedB64} | base64 -d | bash'`;
+        smokeLabel = "Training smoke (cmd)";
+      } else {
+        const safeMod = (trainingEntryModule ?? "").replace(/[^\w.]/g, "");
+        const py = `import importlib; importlib.import_module('${safeMod}'); print('__SMOKE_IMPORT_OK__')`;
+        const pyB64 = Buffer.from(py).toString("base64");
+        const wrapped = `cd /workspace && timeout 30 bash -c 'echo ${pyB64} | base64 -d | python3' 2>&1; echo __SMOKE_EXIT__$?`;
+        const wrappedB64 = Buffer.from(wrapped).toString("base64");
+        sshCmd = `bash -c 'echo ${wrappedB64} | base64 -d | bash'`;
+        smokeLabel = `Training smoke (import ${safeMod})`;
+      }
+      const smokeResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", sshCmd], { timeout: 45e3 });
+      const stdout = smokeResult.stdout ?? "";
+      const stderr = smokeResult.stderr ?? "";
+      const verdict = classifyTrainingSmoke(stdout, stderr, smokeResult.status);
+      if (verdict.kind === "skeleton") {
+        results.push({
+          label: smokeLabel,
+          status: "\u274C",
+          detail: `HALT \u2014 training entry not runnable: ${verdict.match}. Implement training logic before launching the pod (idle billing risk). Excerpt: ${verdict.excerpt.substring(0, 200)}`
+        });
+        hasFail = true;
+      } else if (verdict.kind === "ok") {
+        results.push({ label: smokeLabel, status: "\u2705", detail: verdict.reason });
+      } else if (verdict.kind === "timeout_no_ssh") {
+        results.push({
+          label: smokeLabel,
+          status: "\u26A0\uFE0F",
+          detail: "SSH itself timed out (45s) \u2014 pod may be cold-starting. Re-run run_preflight."
+        });
+        hasWarn = true;
+      } else {
+        results.push({
+          label: smokeLabel,
+          status: "\u26A0\uFE0F",
+          detail: `Smoke exited with unexpected status: ${verdict.reason}`
+        });
+        hasWarn = true;
+      }
+    }
+    const lines = [`## Pre-flight Results \u2014 ${podId}`];
+    for (const r of results) {
+      lines.push(`${r.status} ${r.label}: ${r.detail}`);
+    }
+    lines.push("\u2500".repeat(50));
+    const totalChecks = results.length;
+    const passed = results.filter((r) => r.status === "\u2705").length;
+    const failed = results.filter((r) => r.status === "\u274C").length;
+    const warned = results.filter((r) => r.status === "\u26A0\uFE0F").length;
+    const overallFail = hasFail || strict && hasWarn;
+    lines.push(`RESULT: ${overallFail ? "\u274C FAIL" : "\u2705 PASS"} (${passed}/${totalChecks} checks passed${warned > 0 ? `, ${warned} warning(s)` : ""}, ${failed} failure(s))`);
+    return text(lines.join("\n"));
+  })
+);
+server.tool(
+  "plan_monitoring_cadence",
+  "Compute a data-driven monitoring schedule from MEASURED throughput. Call AFTER training has launched and you have read the first epoch/step time from the pod log. Returns: etaMinutes, handoffRequired (true when ETA exceeds 80% of remaining session window), checkSchedule (50/80/100% of ETA when supervising), cost estimates (cache miss \xD7 N vs fresh-session handoff), and an auto-generated MONITORING_HANDOFF.md template when handoff is required. This is the ONLY sanctioned way to set a check cadence \u2014 fixed-interval polling (e.g. every 30 min) is forbidden because cache-miss token cost compounds linearly with check count.",
+  {
+    podId: external_exports.string().describe("Pod ID being monitored"),
+    firstEpochSeconds: external_exports.number().positive().describe("Measured wall time of one epoch (or one step, if epoch is too coarse). Read from /workspace/log via execute_ssh_command. Must be measured AFTER cache-warm verification (Step A in plan_gpu_job's Monitoring Cadence Plan)."),
+    totalEpochs: external_exports.number().positive().describe("Total epochs (or total steps, must match unit of firstEpochSeconds)"),
+    sessionRemainingMinutes: external_exports.number().positive().describe("Estimated minutes remaining in this conversation before context limits / user end-of-day. If unsure, use 90 (a typical productive session window)."),
+    runpodCostPerHr: external_exports.number().nonnegative().describe("Pod cost per hour in USD (from create_pod_auto response or list_gpu_types)"),
+    cachePerCheckUsd: external_exports.number().nonnegative().default(0.6).describe("Estimated token cost of one supervised check (default $0.60 = 200k context \xD7 $3/MTok cache miss). Scale up for larger conversations.")
+  },
+  safeTool(async ({ podId, firstEpochSeconds, totalEpochs, sessionRemainingMinutes, runpodCostPerHr, cachePerCheckUsd }) => {
+    const result = planMonitoringCadence({
+      podId,
+      firstEpochSeconds,
+      totalEpochs,
+      sessionRemainingMinutes,
+      runpodCostPerHr,
+      cachePerCheckUsd
+    });
+    const lines = [];
+    lines.push(`## Monitoring Cadence \u2014 ${podId}`);
+    lines.push(``);
+    lines.push(`**ETA**: ${result.etaMinutes} min (\`${result.etaIso}\`)`);
+    lines.push(`**Recommendation**: ${result.recommendation === "handoff" ? "\u{1F501} HANDOFF (new session at ETA)" : "\u{1F441}  SUPERVISE (this session)"}`);
+    if (result.handoffReason) {
+      lines.push(`**Why**: ${result.handoffReason}`);
+    }
+    lines.push(``);
+    lines.push(`### Cost comparison`);
+    lines.push(`| Path | Token cost | RunPod cost | Total |`);
+    lines.push(`|------|-----------|-------------|-------|`);
+    const supSimulated = Math.max(3, Math.ceil(result.etaMinutes / 30)) * cachePerCheckUsd;
+    lines.push(`| Supervise (this session, ${result.handoffRequired ? "naive 30-min polling" : `${result.checkSchedule.length} ETA-based checks`}) | $${(result.handoffRequired ? supSimulated : result.estimatedSupervisedTokenCost).toFixed(2)} | $${result.estimatedRunpodCost.toFixed(2)} | $${((result.handoffRequired ? supSimulated : result.estimatedSupervisedTokenCost) + result.estimatedRunpodCost).toFixed(2)} |`);
+    lines.push(`| Handoff (fresh session at ETA) | $${result.estimatedHandoffTokenCost.toFixed(2)} | $${result.estimatedRunpodCost.toFixed(2)} | $${(result.estimatedHandoffTokenCost + result.estimatedRunpodCost).toFixed(2)} |`);
+    lines.push(``);
+    lines.push(`### Check schedule`);
+    if (result.checkSchedule.length === 0) {
+      lines.push(`(none \u2014 handoff replaces all checks)`);
+    } else {
+      lines.push(`| At (min) | At (UTC) | Fraction | Action |`);
+      lines.push(`|---------|----------|----------|--------|`);
+      for (const c of result.checkSchedule) {
+        lines.push(`| +${c.atMinutes} | ${c.atIso} | ${(c.fraction * 100).toFixed(0)}% | ${c.action} |`);
+      }
+    }
+    lines.push(``);
+    if (result.handoffTemplate) {
+      lines.push(`### MONITORING_HANDOFF.md template`);
+      lines.push(`Save the block below to your project (e.g. \`./MONITORING_HANDOFF.md\`), then end this session. Open a fresh session at the ETA and feed the file as input.`);
+      lines.push(``);
+      lines.push("```markdown");
+      lines.push(result.handoffTemplate);
+      lines.push("```");
+    } else {
+      lines.push(`### Wakeup pacing`);
+      const next = result.checkSchedule[0];
+      if (next) {
+        if (next.atMinutes < 4) {
+          lines.push(`Next check in ${next.atMinutes}min \u2014 wait inline (cache stays warm at <270s).`);
+        } else if (next.atMinutes <= 60) {
+          lines.push(`Next check in ${next.atMinutes}min \u2014 schedule a wakeup, do other work in the meantime.`);
+        } else {
+          lines.push(`Next check in ${next.atMinutes}min \u2014 single cache miss is acceptable; otherwise switch to handoff.`);
+        }
+      }
+    }
+    return text(lines.join("\n"));
+  })
+);
+server.tool(
+  "watch_running_pods",
+  "Launch a background bash watcher (scripts/pod_watcher.sh) that polls specific RUNNING pods every N minutes via SSH. Auto-stops pods with GPU compute utilization < idleThresholdPct for consecutive checks. Writes events to .omc/gpu-exec/events.jsonl. PID saved to .omc/gpu-exec/watcher.pid. Call stop_watching_pods() to stop. Call get_pipeline_events() to read status.",
+  {
+    podIds: external_exports.array(external_exports.string()).min(1).describe("Pod IDs to watch (required \u2014 at least 1)"),
+    intervalMinutes: external_exports.number().default(5).describe("Poll interval in minutes"),
+    idleThresholdPct: external_exports.number().default(20).describe("GPU compute utilization % below which pod is considered idle"),
+    idleConsecutiveChecks: external_exports.number().default(2).describe("Consecutive idle checks before auto-stop"),
+    mode: external_exports.enum(["full", "error-only"]).default("full").describe(
+      "full: log HEALTH_CHECK event every interval. error-only: only log IDLE_WARNING/AUTO_STOPPED/ERROR/WATCHER_EXITED \u2014 reduces noise for long runs (23+ hours)."
+    ),
+    expectedCompletionAt: external_exports.string().optional().describe(
+      "ISO8601 timestamp of expected training completion. Watcher switches to 1-minute check interval in the 30 minutes before this time."
+    )
+  },
+  safeTool(async ({ podIds, intervalMinutes, idleThresholdPct, idleConsecutiveChecks, mode, expectedCompletionAt }) => {
+    const pidFile = `${NV_READY_DIR}/watcher.pid`;
+    try {
+      const existingPid = (await readFile(pidFile, "utf-8")).trim();
+      const checkResult = await spawnAsync("kill", ["-0", existingPid], { timeout: 5e3 });
+      if (checkResult.status === 0) {
+        return text(`\u274C Watcher already running (PID ${existingPid}). Call stop_watching_pods() first.`);
+      }
+    } catch {
+    }
+    await mkdir(NV_READY_DIR, { recursive: true });
+    const scriptPath = `${process.cwd()}/scripts/pod_watcher.sh`;
+    const args = [
+      "--pods",
+      podIds.join(","),
+      "--interval",
+      String(intervalMinutes),
+      "--idle-pct",
+      String(idleThresholdPct),
+      "--idle-checks",
+      String(idleConsecutiveChecks),
+      "--mode",
+      mode
+    ];
+    if (expectedCompletionAt) args.push("--expected-completion", expectedCompletionAt);
+    const eventsFile = `${NV_READY_DIR}/events.jsonl`;
+    const spawn2 = await spawnAsync(
+      "bash",
+      ["-c", `nohup bash ${scriptPath} ${args.join(" ")} >> ${eventsFile} 2>&1 & echo $!`],
+      { timeout: 5e3 }
+    );
+    if (spawn2.status !== 0) {
+      return text(`\u274C Failed to start watcher: ${spawn2.stderr}`);
+    }
+    const pid = spawn2.stdout.trim();
+    await writeFile(pidFile, pid, "utf-8");
+    const completionNote = expectedCompletionAt ? ` Expected completion: ${expectedCompletionAt}.` : "";
+    return text(
+      `\u2705 Watcher started (PID ${pid}) for pods: [${podIds.join(", ")}]. Mode: ${mode}.${completionNote}
+Events \u2192 ${eventsFile}
+Call get_pipeline_events() for updates, stop_watching_pods() to stop.`
+    );
+  })
+);
+server.tool(
+  "stop_watching_pods",
+  "Stop the background pod watcher launched by watch_running_pods.",
+  {},
+  safeTool(async () => {
+    const pidFile = `${NV_READY_DIR}/watcher.pid`;
+    let pid;
+    try {
+      pid = (await readFile(pidFile, "utf-8")).trim();
+    } catch {
+      return text("No watcher running (PID file not found).");
+    }
+    await spawnAsync("kill", [pid], { timeout: 5e3 });
+    let exited = false;
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const check2 = await spawnAsync("kill", ["-0", pid], { timeout: 2e3 });
+      if (check2.status !== 0) {
+        exited = true;
+        break;
+      }
+    }
+    if (!exited) {
+      await spawnAsync("kill", ["-9", pid], { timeout: 5e3 });
+    }
+    try {
+      await writeFile(pidFile, "", "utf-8");
+    } catch {
+    }
+    await spawnAsync("rm", ["-f", pidFile], { timeout: 5e3 });
+    return text(`Watcher stopped (PID ${pid}).`);
+  })
+);
+server.tool(
+  "get_pipeline_events",
+  "Read and summarize events from the background pod watcher. Returns per-pod GPU utilization trend, auto-stop events, and cost warnings. Highlights WATCHER_EXITED with manual stop instructions. If WATCHER_EXITED is detected, repeats warning on every call (sticky) until watcher is restarted.",
+  {
+    podId: external_exports.string().optional().describe("Filter events to a specific pod ID (omit for all pods)"),
+    tail: external_exports.number().default(50).describe("Last N events to return")
+  },
+  safeTool(async ({ podId, tail }) => {
+    const eventsFile = `${NV_READY_DIR}/events.jsonl`;
+    let raw;
+    try {
+      raw = await readFile(eventsFile, "utf-8");
+    } catch {
+      return text("No events file found. Start a watcher with watch_running_pods() first.");
+    }
+    const allLines = raw.split("\n").filter((l) => l.trim());
+    const filtered = podId ? allLines.filter((l) => {
+      try {
+        return JSON.parse(l).podId === podId;
+      } catch {
+        return false;
+      }
+    }) : allLines;
+    const recent = filtered.slice(-tail);
+    const parsed = recent.map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+    const exitedEvents = parsed.filter((e) => e.event === "WATCHER_EXITED");
+    const lastExited = exitedEvents[exitedEvents.length - 1];
+    const lines = [`## Pipeline Events${podId ? ` \u2014 ${podId}` : ""} (last ${tail})`];
+    if (lastExited) {
+      lines.push(`
+\u{1F6A8} **WATCHER EXITED** \u2014 Pod ${lastExited.podId ?? "unknown"} may still be running and accruing cost.`);
+      lines.push(`   Reason: ${lastExited.reason ?? "GraphQL stop failure"}`);
+      lines.push(`   \u2192 Manual action required: call delete_pod("${lastExited.podId ?? "<podId>"}") or stop_pod() immediately.`);
+      lines.push(``);
+    }
+    for (const e of parsed) {
+      const ts = e.ts ?? "";
+      const event = e.event ?? "UNKNOWN";
+      const pod = e.podId ?? "";
+      const gpu = e.gpuPct != null ? ` GPU:${e.gpuPct}%` : "";
+      const idle = e.idleCheck != null ? ` idle:${e.idleCheck}` : "";
+      const detail = e.detail ? ` \u2014 ${e.detail}` : "";
+      lines.push(`${ts} [${event}]${pod ? ` pod:${pod}` : ""}${gpu}${idle}${detail}`);
+    }
+    if (parsed.length === 0) {
+      lines.push("(no events)");
+    }
+    return text(lines.join("\n"));
   })
 );
 var transport = new StdioServerTransport();

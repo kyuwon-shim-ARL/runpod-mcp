@@ -73,6 +73,48 @@ describe("restRequest", () => {
         const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
         expect(callBody.name).toBe("my-pod");
         expect(callBody.gpuTypeIds).toEqual(["NVIDIA GeForce RTX 3090"]);
+        expect(callBody.computeType).toBeUndefined();
+        expect(callBody.cpuFlavorIds).toBeUndefined();
+    });
+    it("createPod (CPU) sends CPU-specific body and omits gpuTypeIds", async () => {
+        const createdPod = { id: "cpu-pod", name: "cpu-job", desiredStatus: "CREATED" };
+        mockFetch.mockResolvedValueOnce(jsonResponse(createdPod));
+        const client = makeClient();
+        const result = await client.createPod({
+            name: "cpu-job",
+            imageName: "ubuntu:22.04",
+            computeType: "CPU",
+            vcpuCount: 16,
+            cpuFlavorIds: ["cpu5c", "cpu3c"],
+            cpuFlavorPriority: "custom",
+        });
+        expect(result.id).toBe("cpu-pod");
+        const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+        expect(callBody.computeType).toBe("CPU");
+        expect(callBody.vcpuCount).toBe(16);
+        expect(callBody.cpuFlavorIds).toEqual(["cpu5c", "cpu3c"]);
+        expect(callBody.cpuFlavorPriority).toBe("custom");
+        expect(callBody.gpuTypeIds).toBeUndefined();
+        expect(callBody.gpuCount).toBeUndefined();
+    });
+    it("createPod (CPU) defaults vcpuCount to 2 when not provided", async () => {
+        const createdPod = { id: "cpu-pod", name: "tiny", desiredStatus: "CREATED" };
+        mockFetch.mockResolvedValueOnce(jsonResponse(createdPod));
+        const client = makeClient();
+        await client.createPod({
+            name: "tiny",
+            imageName: "ubuntu:22.04",
+            computeType: "CPU",
+        });
+        const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+        expect(callBody.vcpuCount).toBe(2);
+        expect(callBody.cpuFlavorIds).toBeUndefined();
+        expect(callBody.cpuFlavorPriority).toBeUndefined();
+    });
+    it("createPod (GPU) throws when gpuTypeIds is missing", async () => {
+        const client = makeClient();
+        await expect(client.createPod({ name: "x", imageName: "img" })).rejects.toThrow(/gpuTypeIds/);
+        expect(mockFetch).not.toHaveBeenCalled();
     });
     it("deletePod sends DELETE request", async () => {
         mockFetch.mockResolvedValueOnce(jsonResponse({}));
@@ -129,6 +171,15 @@ describe("graphqlRequest", () => {
         mockFetch.mockResolvedValueOnce(errorResponse(403, "Forbidden"));
         const client = makeClient();
         await expect(client.listGpuTypes()).rejects.toThrow("RunPod GraphQL API: 403 Forbidden");
+    });
+    it("createSpotPod throws when gpuTypeIds is missing (spot is GPU-only)", async () => {
+        const client = makeClient();
+        await expect(client.createSpotPod({
+            name: "x",
+            imageName: "img",
+            bidPerGpu: 0.5,
+        })).rejects.toThrow(/gpuTypeIds/);
+        expect(mockFetch).not.toHaveBeenCalled();
     });
     it("createSpotPod sends mutation with variables", async () => {
         const data = { data: { podRentInterruptable: { id: "spot-pod-1", imageName: "test", machineId: "m1" } } };
@@ -206,12 +257,16 @@ describe("getRsyncArgs", () => {
         const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: null };
         expect(client.getRsyncArgs(pod, "/a", "/b", "upload")).toBeNull();
     });
-    it("excludes --no-same-owner (EXP-046: unsupported in rsync 3.1.3) but keeps --no-same-group", () => {
+    it("uses rsync's --no-owner/--no-group, never the tar-only --no-same-owner/--no-same-group", () => {
         const client = makeClient();
         const pod = { id: "p1", name: "test", desiredStatus: "RUNNING", publicIp: "1.2.3.4", portMappings: { "22": 10022 } };
-        const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", "upload");
-        expect(args).not.toContain("--no-same-owner");
-        expect(args).toContain("--no-same-group");
+        for (const direction of ["upload", "download"]) {
+            const args = client.getRsyncArgs(pod, "/local/data", "/workspace/data", direction);
+            expect(args).toContain("--no-owner");
+            expect(args).toContain("--no-group");
+            expect(args).not.toContain("--no-same-owner");
+            expect(args).not.toContain("--no-same-group");
+        }
     });
     it("includes --stats flag and excludes -v (verbose)", () => {
         const client = makeClient();
@@ -258,6 +313,7 @@ describe("waitForPod", () => {
         };
         vi.spyOn(client, "getPod").mockResolvedValue(readyPod);
         vi.spyOn(client, "tcpProbe").mockResolvedValue(true);
+        vi.spyOn(client, "sshAuthProbe").mockResolvedValue("ok");
         const pod = await client.waitForPod("p1", 5000, 100);
         expect(pod.id).toBe("p1");
     });
@@ -273,6 +329,25 @@ describe("waitForPod", () => {
         vi.spyOn(client, "getPod").mockResolvedValue(pendingPod);
         await expect(client.waitForPod("p1", 300, 100)).rejects.toThrow("did not become ready");
     });
+    it("retries when TCP is ready but authorized_keys not yet injected (auth_fail race)", async () => {
+        // Regression: authorized_keys injected after SSH daemon starts — TCP open ≠ auth ready.
+        // waitForPod must keep retrying when sshAuthProbe returns auth_fail.
+        const client = makeClient();
+        const readyPod = {
+            id: "p1", name: "test", desiredStatus: "RUNNING",
+            publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+        };
+        vi.spyOn(client, "getPod").mockResolvedValue(readyPod);
+        vi.spyOn(client, "tcpProbe").mockResolvedValue(true);
+        let authCallCount = 0;
+        vi.spyOn(client, "sshAuthProbe").mockImplementation(async () => {
+            authCallCount++;
+            return authCallCount >= 3 ? "ok" : "auth_fail";
+        });
+        const pod = await client.waitForPod("p1", 5000, 10);
+        expect(pod.id).toBe("p1");
+        expect(authCallCount).toBeGreaterThanOrEqual(3);
+    });
     it("calls onProgress callback with status updates", async () => {
         const client = makeClient();
         const pendingPod = { id: "p1", name: "test", desiredStatus: "CREATED" };
@@ -286,6 +361,7 @@ describe("waitForPod", () => {
             return (callCount >= 2 ? readyPod : pendingPod);
         });
         vi.spyOn(client, "tcpProbe").mockResolvedValue(true);
+        vi.spyOn(client, "sshAuthProbe").mockResolvedValue("ok");
         const messages = [];
         await client.waitForPod("p1", 5000, 50, (msg) => messages.push(msg));
         expect(messages.length).toBeGreaterThan(0);
