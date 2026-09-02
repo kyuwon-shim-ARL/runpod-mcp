@@ -97,6 +97,17 @@ describe("runWatchdog", () => {
         const result = await runWatchdog(client, makeOptions());
         expect(result.checked).toBe(0);
     });
+    it("skips CPU pods (no gpu field) — no nvidia-smi available", async () => {
+        const client = {
+            listPods: vi.fn().mockResolvedValue([
+                { id: "p1", name: "cpu-job", desiredStatus: "RUNNING" }, // no gpu field
+            ]),
+        };
+        const alerter = makeAlerter();
+        const result = await runWatchdog(client, makeOptions(), alerter);
+        expect(result.checked).toBe(0);
+        expect(alerter.warns).toHaveLength(0);
+    });
     it("cleans up state for pods no longer running", async () => {
         // Pre-populate state with a pod that no longer exists
         saveState(stateFile, {
@@ -114,13 +125,14 @@ describe("runWatchdog", () => {
         // Low usage = IDLE (< 30% VRAM)
         const idleOutput = "0, RTX 3090, 24576, 2000, 22576, 5, 3, 45";
         mockSpawnAsync.mockResolvedValue({ stdout: idleOutput, stderr: "", status: 0 });
+        const gpuField = { id: "NVIDIA GeForce RTX 3090", displayName: "RTX 3090", count: 1 };
         const client = {
             listPods: vi.fn().mockResolvedValue([
-                { id: "p1", name: "training-run", desiredStatus: "RUNNING", costPerHr: 0.44 },
+                { id: "p1", name: "training-run", desiredStatus: "RUNNING", costPerHr: 0.44, gpu: gpuField },
             ]),
             getPod: vi.fn().mockResolvedValue({
                 id: "p1", name: "training-run", desiredStatus: "RUNNING",
-                publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+                publicIp: "1.2.3.4", portMappings: { "22": 10022 }, gpu: gpuField,
             }),
             config: { sshKeyPath: "/tmp/key" },
         };
@@ -139,13 +151,14 @@ describe("runWatchdog", () => {
         const idleOutput = "0, RTX 3090, 24576, 1000, 23576, 2, 1, 40";
         mockSpawnAsync.mockResolvedValue({ stdout: idleOutput, stderr: "", status: 0 });
         const stopPod = vi.fn().mockResolvedValue({});
+        const gpuField = { id: "NVIDIA GeForce RTX 3090", displayName: "RTX 3090", count: 1 };
         const client = {
             listPods: vi.fn().mockResolvedValue([
-                { id: "p1", name: "idle-pod", desiredStatus: "RUNNING", costPerHr: 0.44 },
+                { id: "p1", name: "idle-pod", desiredStatus: "RUNNING", costPerHr: 0.44, gpu: gpuField },
             ]),
             getPod: vi.fn().mockResolvedValue({
                 id: "p1", name: "idle-pod", desiredStatus: "RUNNING",
-                publicIp: "1.2.3.4", portMappings: { "22": 10022 },
+                publicIp: "1.2.3.4", portMappings: { "22": 10022 }, gpu: gpuField,
             }),
             stopPod,
             config: { sshKeyPath: "/tmp/key" },

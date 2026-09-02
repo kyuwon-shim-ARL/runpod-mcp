@@ -338,6 +338,37 @@ describe("buildPodMetadataStub", () => {
         });
         expect(JSON.parse(stub).gpu_count).toBe(1);
     });
+    it("defaults compute_type to GPU and emits gpu fields", () => {
+        const stub = buildPodMetadataStub({
+            pod_id: "abc",
+            name: "test",
+            created_at: "2026-04-07T00:00:00Z",
+            gpu: "RTX 4090",
+        });
+        const parsed = JSON.parse(stub);
+        expect(parsed.compute_type).toBe("GPU");
+        expect(parsed.gpu).toBe("RTX 4090");
+        expect(parsed.vcpu_count).toBeUndefined();
+        expect(parsed.cpu_flavor_ids).toBeUndefined();
+    });
+    it("CPU mode emits vcpu_count and cpu_flavor_ids, omits gpu fields", () => {
+        const stub = buildPodMetadataStub({
+            pod_id: "cpu-pod",
+            name: "data-prep",
+            created_at: "2026-04-07T00:00:00Z",
+            compute_type: "CPU",
+            vcpu_count: 16,
+            cpu_flavor_ids: ["cpu5c", "cpu3c"],
+            cost_per_hr: null,
+        });
+        const parsed = JSON.parse(stub);
+        expect(parsed.compute_type).toBe("CPU");
+        expect(parsed.vcpu_count).toBe(16);
+        expect(parsed.cpu_flavor_ids).toEqual(["cpu5c", "cpu3c"]);
+        expect(parsed.cost_per_hr).toBeNull();
+        expect(parsed.gpu).toBeUndefined();
+        expect(parsed.gpu_count).toBeUndefined();
+    });
 });
 // ── Patch D: upload integrity helpers ──
 describe("parseDuBytes", () => {
