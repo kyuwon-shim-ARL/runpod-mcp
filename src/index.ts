@@ -119,6 +119,39 @@ async function readSshPubKey(): Promise<string | undefined> {
 }
 
 
+/**
+ * Ensure rsync exists on the pod before a transfer.
+ *
+ * upload_files and download_files both shell out to rsync, which needs rsync on BOTH ends —
+ * but the default image (runpod/pytorch:*) does not ship it. That contradiction inside this
+ * plugin surfaced as "bash: line 1: rsync: command not found" on three separate pods
+ * (2026-09-02, 09-07, 09-08) before anyone fixed it here rather than by hand each time.
+ *
+ * Returns null when rsync is present or was installed; a message string when it could not be.
+ */
+export async function ensureRemoteRsync(sshArgs: string[]): Promise<string | null> {
+  const probe = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", "command -v rsync"], {
+    timeout: 30_000,
+  });
+  if (probe.status === 0 && probe.stdout.trim()) return null;
+
+  const install =
+    "(apt-get update -qq && apt-get install -y -qq rsync) >/dev/null 2>&1 || " +
+    "(yum install -y -q rsync) >/dev/null 2>&1 || " +
+    "(apk add --no-progress rsync) >/dev/null 2>&1; command -v rsync";
+  const attempt = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", install], {
+    timeout: 300_000,
+  });
+  if (attempt.status === 0 && attempt.stdout.trim()) return null;
+
+  return (
+    "rsync is missing on the pod and could not be installed automatically" +
+    (attempt.stderr ? `: ${attempt.stderr.trim().slice(0, 300)}` : ".") +
+    " Install it manually (apt-get install -y rsync) and retry."
+  );
+}
+
+
 // ══════════════════════════════════════════
 //  TOOLS
 // ══════════════════════════════════════════
@@ -1027,6 +1060,10 @@ server.tool(
     if (!sshArgs && verifySize) {
       return text("Pod has no SSH endpoint; cannot run integrity checks. Pass verifySize=false to skip them.");
     }
+    if (sshArgs) {
+      const missing = await ensureRemoteRsync(sshArgs);
+      if (missing) return text(missing);
+    }
 
     // ── Step 1: local size measurement ──
     let localBytes: number | null = null;
@@ -1120,6 +1157,12 @@ server.tool(
     const args = c.getRsyncArgs(pod, localPath, remotePath, "download");
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):\n${args.join(" ")}`);
+
+    const sshArgs = c.getSshArgs(pod);
+    if (sshArgs) {
+      const missing = await ensureRemoteRsync(sshArgs);
+      if (missing) return text(missing);
+    }
 
     const result = await spawnAsync(args[0], args.slice(1), { timeout: 600_000 });
 
