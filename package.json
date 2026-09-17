@@ -24,7 +24,7 @@
     "!dist/runpod-mcp.mjs"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run bundle",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "test": "vitest run",

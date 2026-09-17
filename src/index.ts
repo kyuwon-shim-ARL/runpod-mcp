@@ -13,6 +13,7 @@ import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, inject
 import { classifyTrainingSmoke, planMonitoringCadence, renderMonitoringCadenceSection } from "./monitoring-utils.js";
 import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
 import { CPU_FLAVORS, CPU_FLAVOR_IDS, defaultFlavorOrder } from "./cpu-catalog.js";
+import { loadIdleState, saveIdleState, pruneState, judgeIdle, parseWorkProbe, renderWorkLine, WORK_PROBE_CMD, type IdleState } from "./idle-utils.js";
 
 const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
 const COST_GATE_HOURLY_USD = 1.0;    // ondemandPrice * gpuCount >= this triggers gate
@@ -43,7 +44,7 @@ function requireClient(): RunPodClient {
   return client;
 }
 
-const server = new McpServer({
+export const server = new McpServer({
   name: "runpod-tools",
   version: "0.2.0",
 });
@@ -157,11 +158,88 @@ export async function ensureRemoteRsync(sshArgs: string[]): Promise<string | nul
 // ══════════════════════════════════════════
 
 // ── list_pods ──
-server.tool("list_pods", "List all RunPod pods with status and SSH info", {}, safeTool(async () => {
-  const pods = await requireClient().listPods();
-  if (!pods.length) return text("No pods found.");
-  return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
-}));
+server.tool(
+  "list_pods",
+  "List all RunPod pods with status and SSH info. Also probes RUNNING pods over SSH for a work/idle signal (GPU util, VRAM, compute processes) so silently-idle pods are surfaced.",
+  {
+    probe: z.boolean().default(true).describe("SSH-probe RUNNING pods for a work/idle signal"),
+    idleThresholdMinutes: z.number().default(10).describe("Minutes of continuous idle before flagging as sustained"),
+    probeTimeoutSeconds: z.number().default(15).describe("Per-pod SSH probe timeout"),
+  },
+  safeTool(async ({ probe, idleThresholdMinutes, probeTimeoutSeconds }) => {
+    const c = requireClient();
+    const pods = await c.listPods();
+    if (!pods.length) return text("No pods found.");
+
+    if (!probe) return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
+
+    let state: IdleState = {};
+    try {
+      state = await loadIdleState();
+    } catch {
+      // fail-soft — state I/O errors must not fail the tool
+    }
+    const now = new Date();
+
+    const probeTargets = pods.filter((p) => p.desiredStatus === "RUNNING" && c.getSshArgs(p));
+
+    const probeResults = await Promise.allSettled(
+      probeTargets.map(async (p) => {
+        const sshArgs = c.getSshArgs(p)!;
+        const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", WORK_PROBE_CMD], {
+          timeout: probeTimeoutSeconds * 1000,
+        });
+        if (result.error) throw new Error(result.error.message);
+        if (result.status !== 0) throw new Error(`exit ${result.status}`);
+        return { podId: p.id, stdout: result.stdout ?? "" };
+      })
+    );
+
+    const workLines = new Map<string, string>();
+    const sustainedIds: string[] = [];
+
+    probeResults.forEach((res, i) => {
+      const podId = probeTargets[i].id;
+      const pod = probeTargets[i];
+      if (res.status === "rejected") {
+        workLines.set(podId, renderWorkLine(null, null, pod.costPerHr, idleThresholdMinutes, "ssh failed"));
+        return;
+      }
+      try {
+        const sample = parseWorkProbe(res.value.stdout);
+        const verdict = judgeIdle(podId, sample, state[podId], now, idleThresholdMinutes);
+        state[podId] = verdict.record;
+        workLines.set(podId, renderWorkLine(verdict, sample, pod.costPerHr, idleThresholdMinutes));
+        if (verdict.sustained) sustainedIds.push(podId);
+      } catch (e) {
+        workLines.set(podId, renderWorkLine(null, null, pod.costPerHr, idleThresholdMinutes, "ssh failed"));
+      }
+    });
+
+    // Persist state (fail-soft — state I/O errors must not fail the tool)
+    try {
+      state = pruneState(state, pods.map((p) => p.id));
+      await saveIdleState(state);
+    } catch {
+      // ignore persistence failures
+    }
+
+    const blocks = pods.map((p) => {
+      const summary = podSummary(p);
+      const workLine = workLines.get(p.id);
+      return workLine ? `${summary}\n${workLine}` : summary;
+    });
+
+    const sections = [blocks.join("\n\n---\n\n")];
+    if (sustainedIds.length) {
+      sections.push(
+        `\n⚠️ ${sustainedIds.length} pod(s) idle ≥ ${idleThresholdMinutes}m — consider delete_pod (stop keeps billing).`
+      );
+    }
+
+    return text(sections.join("\n"));
+  })
+);
 
 // ── get_pod ──
 server.tool(

@@ -20986,9 +20986,9 @@ var StdioServerTransport = class {
 };
 
 // src/index.ts
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdir as mkdir2, writeFile as writeFile2, readFile as readFile2 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname as dirname2, isAbsolute, resolve } from "node:path";
 
 // src/api.ts
 import { createConnection } from "node:net";
@@ -22051,6 +22051,125 @@ function defaultFlavorOrder(family) {
   return [...pool].sort((a, b) => a.generation < b.generation ? 1 : a.generation > b.generation ? -1 : 0).map((f) => f.id);
 }
 
+// src/idle-utils.ts
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { dirname } from "node:path";
+var VRAM_FLOOR_MB_DEFAULT = 100;
+function isWorking(s, vramFloorMb = VRAM_FLOOR_MB_DEFAULT) {
+  if (s.gpuUtil != null && s.gpuUtil > 0) return true;
+  if (s.usedMb != null && s.usedMb > vramFloorMb) return true;
+  if (s.computeProcs > 0) return true;
+  return false;
+}
+function judgeIdle(podId, s, prev, now, thresholdMinutes) {
+  const nowIso = now.toISOString();
+  const working = isWorking(s);
+  if (working) {
+    return {
+      working: true,
+      idleMinutes: 0,
+      sustained: false,
+      firstObservation: !prev,
+      record: { lastNonIdleAt: nowIso, lastSampleAt: nowIso }
+    };
+  }
+  if (!prev) {
+    return {
+      working: false,
+      idleMinutes: 0,
+      sustained: false,
+      firstObservation: true,
+      record: { lastNonIdleAt: nowIso, lastSampleAt: nowIso }
+    };
+  }
+  const idleMs = now.getTime() - new Date(prev.lastNonIdleAt).getTime();
+  const idleMinutes = Math.round(idleMs / 6e4);
+  const sustained = idleMinutes >= thresholdMinutes;
+  return {
+    working: false,
+    idleMinutes,
+    sustained,
+    firstObservation: false,
+    record: { lastNonIdleAt: prev.lastNonIdleAt, lastSampleAt: nowIso }
+  };
+}
+function formatDuration(minutes) {
+  if (minutes < 60) return `${minutes}m`;
+  const totalHours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  if (totalHours < 24) return `${totalHours}h${remMinutes}m`;
+  const days = Math.floor(totalHours / 24);
+  const remHours = totalHours % 24;
+  return `${days}d${remHours}h${remMinutes}m`;
+}
+function idleCostUsd(idleMinutes, costPerHr) {
+  const usd = idleMinutes / 60 * costPerHr;
+  return Math.round(usd * 100) / 100;
+}
+function pruneState(state, livePodIds) {
+  const live = new Set(livePodIds);
+  const pruned = {};
+  for (const [podId, record2] of Object.entries(state)) {
+    if (live.has(podId)) pruned[podId] = record2;
+  }
+  return pruned;
+}
+function parseWorkProbe(stdout) {
+  const marker = "---PROCS---";
+  const idx = stdout.indexOf(marker);
+  const smiPart = idx >= 0 ? stdout.slice(0, idx) : stdout;
+  const procsPart = idx >= 0 ? stdout.slice(idx + marker.length) : "";
+  let gpuUtil = null;
+  let usedMb = null;
+  let totalMb = null;
+  if (!smiPart.includes("NO_NVIDIA_SMI")) {
+    const gpus = parseNvidiaSmiOutput(smiPart);
+    if (gpus.length) {
+      gpuUtil = gpus[0].gpuUtil;
+      usedMb = gpus[0].usedMb;
+      totalMb = gpus[0].totalMb;
+    }
+  }
+  const procMatch = procsPart.match(/-?\d+/);
+  let computeProcs = procMatch ? parseInt(procMatch[0], 10) : 0;
+  if (isNaN(computeProcs) || computeProcs < 0) computeProcs = 0;
+  return { gpuUtil, usedMb, totalMb, computeProcs };
+}
+var IDLE_STATE_PATH = ".omc/gpu-exec/idle-state.json";
+async function loadIdleState(path = IDLE_STATE_PATH) {
+  try {
+    const raw = await readFile(path, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed;
+    return {};
+  } catch {
+    return {};
+  }
+}
+async function saveIdleState(state, path = IDLE_STATE_PATH) {
+  await mkdir(dirname(path), { recursive: true });
+  const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tmpPath, JSON.stringify(state, null, 2), "utf8");
+  await rename(tmpPath, path);
+}
+var WORK_PROBE_CMD = `nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || echo NO_NVIDIA_SMI; echo "---PROCS---"; (pgrep -c -f 'python|torchrun|accelerate' 2>/dev/null || echo 0)`;
+function renderWorkLine(verdict, sample, costPerHr, thresholdMinutes, probeError) {
+  if (probeError) return `Work: signal unavailable (${probeError})`;
+  if (!verdict || !sample) return "Work: signal unavailable";
+  const gpuPart = sample.gpuUtil == null || sample.usedMb == null || sample.totalMb == null ? "no nvidia-smi" : `GPU ${sample.gpuUtil}% \xB7 ${sample.usedMb}/${sample.totalMb} MiB \xB7 procs ${sample.computeProcs}`;
+  if (verdict.working) {
+    return `Work: ACTIVE \xB7 ${gpuPart}`;
+  }
+  if (verdict.firstObservation) {
+    return `Work: quiet (first observation \u2014 clock started) \xB7 ${gpuPart}`;
+  }
+  if (verdict.sustained) {
+    const costSuffix = costPerHr != null ? ` \xB7 idle cost so far ~$${idleCostUsd(verdict.idleMinutes, costPerHr).toFixed(2)}` : "";
+    return `Work: \u26A0\uFE0F IDLE ${formatDuration(verdict.idleMinutes)} \xB7 ${gpuPart}${costSuffix}`;
+  }
+  return `Work: quiet ${formatDuration(verdict.idleMinutes)} (below ${thresholdMinutes}m threshold) \xB7 ${gpuPart}`;
+}
+
 // src/index.ts
 var COST_GATE_GPU_COUNT = 2;
 var API_KEY = process.env.RUNPOD_API_KEY;
@@ -22109,17 +22228,95 @@ async function readSshPubKey() {
   if (!keyPath) return void 0;
   const pubPath = keyPath.endsWith(".pub") ? keyPath : keyPath + ".pub";
   try {
-    const content = await readFile(pubPath, "utf8");
+    const content = await readFile2(pubPath, "utf8");
     return content.trim();
   } catch {
     return void 0;
   }
 }
-server.tool("list_pods", "List all RunPod pods with status and SSH info", {}, safeTool(async () => {
-  const pods = await requireClient().listPods();
-  if (!pods.length) return text("No pods found.");
-  return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
-}));
+async function ensureRemoteRsync(sshArgs) {
+  const probe = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", "command -v rsync"], {
+    timeout: 3e4
+  });
+  if (probe.status === 0 && probe.stdout.trim()) return null;
+  const install = "(apt-get update -qq && apt-get install -y -qq rsync) >/dev/null 2>&1 || (yum install -y -q rsync) >/dev/null 2>&1 || (apk add --no-progress rsync) >/dev/null 2>&1; command -v rsync";
+  const attempt = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", install], {
+    timeout: 3e5
+  });
+  if (attempt.status === 0 && attempt.stdout.trim()) return null;
+  return "rsync is missing on the pod and could not be installed automatically" + (attempt.stderr ? `: ${attempt.stderr.trim().slice(0, 300)}` : ".") + " Install it manually (apt-get install -y rsync) and retry.";
+}
+server.tool(
+  "list_pods",
+  "List all RunPod pods with status and SSH info. Also probes RUNNING pods over SSH for a work/idle signal (GPU util, VRAM, compute processes) so silently-idle pods are surfaced.",
+  {
+    probe: external_exports.boolean().default(true).describe("SSH-probe RUNNING pods for a work/idle signal"),
+    idleThresholdMinutes: external_exports.number().default(10).describe("Minutes of continuous idle before flagging as sustained"),
+    probeTimeoutSeconds: external_exports.number().default(15).describe("Per-pod SSH probe timeout")
+  },
+  safeTool(async ({ probe, idleThresholdMinutes, probeTimeoutSeconds }) => {
+    const c = requireClient();
+    const pods = await c.listPods();
+    if (!pods.length) return text("No pods found.");
+    if (!probe) return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
+    let state = {};
+    try {
+      state = await loadIdleState();
+    } catch {
+    }
+    const now = /* @__PURE__ */ new Date();
+    const probeTargets = pods.filter((p) => p.desiredStatus === "RUNNING" && c.getSshArgs(p));
+    const probeResults = await Promise.allSettled(
+      probeTargets.map(async (p) => {
+        const sshArgs = c.getSshArgs(p);
+        const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", WORK_PROBE_CMD], {
+          timeout: probeTimeoutSeconds * 1e3
+        });
+        if (result.error) throw new Error(result.error.message);
+        if (result.status !== 0) throw new Error(`exit ${result.status}`);
+        return { podId: p.id, stdout: result.stdout ?? "" };
+      })
+    );
+    const workLines = /* @__PURE__ */ new Map();
+    const sustainedIds = [];
+    probeResults.forEach((res, i) => {
+      const podId = probeTargets[i].id;
+      const pod = probeTargets[i];
+      if (res.status === "rejected") {
+        workLines.set(podId, renderWorkLine(null, null, pod.costPerHr, idleThresholdMinutes, "ssh failed"));
+        return;
+      }
+      try {
+        const sample = parseWorkProbe(res.value.stdout);
+        const verdict = judgeIdle(podId, sample, state[podId], now, idleThresholdMinutes);
+        state[podId] = verdict.record;
+        workLines.set(podId, renderWorkLine(verdict, sample, pod.costPerHr, idleThresholdMinutes));
+        if (verdict.sustained) sustainedIds.push(podId);
+      } catch (e) {
+        workLines.set(podId, renderWorkLine(null, null, pod.costPerHr, idleThresholdMinutes, "ssh failed"));
+      }
+    });
+    try {
+      state = pruneState(state, pods.map((p) => p.id));
+      await saveIdleState(state);
+    } catch {
+    }
+    const blocks = pods.map((p) => {
+      const summary = podSummary(p);
+      const workLine = workLines.get(p.id);
+      return workLine ? `${summary}
+${workLine}` : summary;
+    });
+    const sections = [blocks.join("\n\n---\n\n")];
+    if (sustainedIds.length) {
+      sections.push(
+        `
+\u26A0\uFE0F ${sustainedIds.length} pod(s) idle \u2265 ${idleThresholdMinutes}m \u2014 consider delete_pod (stop keeps billing).`
+      );
+    }
+    return text(sections.join("\n"));
+  })
+);
 server.tool(
   "get_pod",
   "Get detailed info about a specific pod",
@@ -22350,7 +22547,7 @@ Try overriding dcPriority or widening cpuFlavorIds. Run list_cpu_types for optio
       }
       try {
         const tokenPath = `${NV_READY_DIR}/nv_ready_${args.networkVolumeId}.json`;
-        const tokenRaw = await readFile(tokenPath, "utf-8");
+        const tokenRaw = await readFile2(tokenPath, "utf-8");
         const tokenData = JSON.parse(tokenRaw);
         if (tokenData.token !== args.nvReadinessToken) {
           return text(`\u274C NV readiness token mismatch for volume ${args.networkVolumeId}. Re-run verify_data_on_nv to get a fresh token.`);
@@ -22747,8 +22944,8 @@ server.tool(
     const relPath = buildPodMetadataPath(metadata, basePath);
     const absPath = isAbsolute(relPath) ? relPath : resolve(process.cwd(), relPath);
     try {
-      await mkdir(dirname(absPath), { recursive: true });
-      await writeFile(absPath, toYaml(metadata), "utf8");
+      await mkdir2(dirname2(absPath), { recursive: true });
+      await writeFile2(absPath, toYaml(metadata), "utf8");
     } catch (e) {
       return text(`Failed to save pod metadata to ${absPath}: ${e.message}`);
     }
@@ -22919,6 +23116,10 @@ ${args.join(" ")}`);
     if (!sshArgs && verifySize) {
       return text("Pod has no SSH endpoint; cannot run integrity checks. Pass verifySize=false to skip them.");
     }
+    if (sshArgs) {
+      const missing = await ensureRemoteRsync(sshArgs);
+      if (missing) return text(missing);
+    }
     let localBytes = null;
     if (verifySize) {
       const duLocal = await spawnAsync("du", ["-sb", localPath], { timeout: 6e4 });
@@ -23001,6 +23202,11 @@ server.tool(
     if (!args) return text("Pod is not ready for file transfer.");
     if (dryRun) return text(`Command (dry run):
 ${args.join(" ")}`);
+    const sshArgs = c.getSshArgs(pod);
+    if (sshArgs) {
+      const missing = await ensureRemoteRsync(sshArgs);
+      if (missing) return text(missing);
+    }
     const result = await spawnAsync(args[0], args.slice(1), { timeout: 6e5 });
     if (result.error) return text(`Download error: ${result.error.message}`);
     if (result.status !== 0) return text(`Download failed (exit ${result.status}):
@@ -23587,8 +23793,8 @@ server.tool(
         ]
       };
       try {
-        await mkdir(dirname(specPath), { recursive: true });
-        await writeFile(specPath, JSON.stringify(stub, null, 2), "utf-8");
+        await mkdir2(dirname2(specPath), { recursive: true });
+        await writeFile2(specPath, JSON.stringify(stub, null, 2), "utf-8");
         lines.push(`
 \u2705 pipeline_spec.json stub \uC0DD\uC131\uB428: \`${specPath}\``);
       } catch (e) {
@@ -23651,8 +23857,8 @@ server.tool(
     }
     const token = randomUUID();
     const tokenData = { token, nvId, podId, verifiedAt: (/* @__PURE__ */ new Date()).toISOString(), totalGb: parseFloat(totalGb.toFixed(3)), paths: requiredPaths };
-    await mkdir(NV_READY_DIR, { recursive: true });
-    await writeFile(`${NV_READY_DIR}/nv_ready_${nvId}.json`, JSON.stringify(tokenData, null, 2), "utf-8");
+    await mkdir2(NV_READY_DIR, { recursive: true });
+    await writeFile2(`${NV_READY_DIR}/nv_ready_${nvId}.json`, JSON.stringify(tokenData, null, 2), "utf-8");
     lines.push(...pathResults);
     lines.push(`
 \u2705 NV ${nvId} verified: ${totalGb.toFixed(2)}GB across ${requiredPaths.length} paths.`);
@@ -23833,7 +24039,7 @@ server.tool(
     }
     if (requirementsPath) {
       try {
-        const content = await readFile(requirementsPath, "utf-8");
+        const content = await readFile2(requirementsPath, "utf-8");
         const lines2 = content.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#"));
         const issues = [];
         for (const line of lines2) {
@@ -24045,14 +24251,14 @@ server.tool(
   safeTool(async ({ podIds, intervalMinutes, idleThresholdPct, idleConsecutiveChecks, mode, expectedCompletionAt }) => {
     const pidFile = `${NV_READY_DIR}/watcher.pid`;
     try {
-      const existingPid = (await readFile(pidFile, "utf-8")).trim();
+      const existingPid = (await readFile2(pidFile, "utf-8")).trim();
       const checkResult = await spawnAsync("kill", ["-0", existingPid], { timeout: 5e3 });
       if (checkResult.status === 0) {
         return text(`\u274C Watcher already running (PID ${existingPid}). Call stop_watching_pods() first.`);
       }
     } catch {
     }
-    await mkdir(NV_READY_DIR, { recursive: true });
+    await mkdir2(NV_READY_DIR, { recursive: true });
     const scriptPath = `${process.cwd()}/scripts/pod_watcher.sh`;
     const args = [
       "--pods",
@@ -24077,7 +24283,7 @@ server.tool(
       return text(`\u274C Failed to start watcher: ${spawn2.stderr}`);
     }
     const pid = spawn2.stdout.trim();
-    await writeFile(pidFile, pid, "utf-8");
+    await writeFile2(pidFile, pid, "utf-8");
     const completionNote = expectedCompletionAt ? ` Expected completion: ${expectedCompletionAt}.` : "";
     return text(
       `\u2705 Watcher started (PID ${pid}) for pods: [${podIds.join(", ")}]. Mode: ${mode}.${completionNote}
@@ -24094,7 +24300,7 @@ server.tool(
     const pidFile = `${NV_READY_DIR}/watcher.pid`;
     let pid;
     try {
-      pid = (await readFile(pidFile, "utf-8")).trim();
+      pid = (await readFile2(pidFile, "utf-8")).trim();
     } catch {
       return text("No watcher running (PID file not found).");
     }
@@ -24112,7 +24318,7 @@ server.tool(
       await spawnAsync("kill", ["-9", pid], { timeout: 5e3 });
     }
     try {
-      await writeFile(pidFile, "", "utf-8");
+      await writeFile2(pidFile, "", "utf-8");
     } catch {
     }
     await spawnAsync("rm", ["-f", pidFile], { timeout: 5e3 });
@@ -24130,7 +24336,7 @@ server.tool(
     const eventsFile = `${NV_READY_DIR}/events.jsonl`;
     let raw;
     try {
-      raw = await readFile(eventsFile, "utf-8");
+      raw = await readFile2(eventsFile, "utf-8");
     } catch {
       return text("No events file found. Start a watcher with watch_running_pods() first.");
     }
@@ -24177,3 +24383,7 @@ server.tool(
 );
 var transport = new StdioServerTransport();
 await server.connect(transport);
+export {
+  ensureRemoteRsync,
+  server
+};
