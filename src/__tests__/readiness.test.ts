@@ -12,6 +12,7 @@ import {
   loadReadinessState,
   saveReadinessState,
   importStatementLabel,
+  unmetImports,
   type ReadinessState,
 } from "../readiness.js";
 
@@ -133,8 +134,11 @@ describe("state persistence", () => {
   });
 
   it("writes atomically, leaving no temp file behind", async () => {
+    const { readdir } = await import("node:fs/promises");
     const path = join(dir, "readiness.json");
     await saveReadinessState(recordGate({}, "p1", ["torch"], new Date()), path);
+
+    expect((await readdir(dir)).filter((f) => f.includes(".tmp-"))).toEqual([]);
     const raw = await readFile(path, "utf8");
     expect(JSON.parse(raw).p1.verifiedAt).toBeNull();
   });
@@ -161,5 +165,26 @@ describe("importStatementLabel", () => {
 
   it("tolerates surrounding whitespace", () => {
     expect(importStatementLabel("  import kornia  ")).toBe("kornia");
+  });
+});
+
+describe("unmetImports", () => {
+  const gate = (imports: string[]) => recordGate({}, "p", imports, new Date()).p;
+
+  it("reports the gated imports that were not among the passing set", () => {
+    expect(unmetImports(gate(["torch", "kornia"]), ["os"])).toEqual(["torch", "kornia"]);
+  });
+
+  it("is empty when the passing set covers the gate", () => {
+    expect(unmetImports(gate(["torch"]), ["torch", "pandas"])).toEqual([]);
+  });
+
+  it("compares by module, so statement and bare forms match", () => {
+    expect(unmetImports(gate(["import torch"]), ["torch"])).toEqual([]);
+    expect(unmetImports(gate(["torch"]), ["import torch"])).toEqual([]);
+  });
+
+  it("reports only the missing subset", () => {
+    expect(unmetImports(gate(["torch", "kornia"]), ["torch"])).toEqual(["kornia"]);
   });
 });

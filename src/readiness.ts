@@ -135,3 +135,14 @@ export function importStatementLabel(statement: string): string {
   if (words[0] === "import" || words[0] === "from") return words[1];
   return statement.trim();
 }
+
+/**
+ * Which of a pod's gated imports are still unverified, given the set that just passed.
+ * A gate must only open for the imports it actually demanded — verifying `["os"]` must not
+ * release a gate recorded for `["torch","kornia"]`, or the gate would certify a check that
+ * never happened, which is the incident it exists to prevent.
+ */
+export function unmetImports(gate: ReadinessGate, passed: string[]): string[] {
+  const passedLabels = new Set(passed.map(importStatementLabel));
+  return gate.imports.filter((required) => !passedLabels.has(importStatementLabel(required)));
+}

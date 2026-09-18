@@ -25,6 +25,7 @@ import {
   renderGateBlock,
   renderPendingRefusal,
   importStatementLabel,
+  unmetImports,
 } from "./readiness.js";
 
 const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
@@ -375,6 +376,21 @@ server.tool(
 // is refused until run_preflight confirms those imports. The pod is always created and
 // its id always returned — the gate never hides a billing pod.
 
+/**
+ * Serializes gate-check → create → record so two concurrent create_pod_auto calls cannot both
+ * pass the check before either has recorded its gate — which is the exact double-pod scenario
+ * the gate exists to prevent. In-process only, and the queue is never allowed to stay rejected.
+ */
+let readinessQueue: Promise<unknown> = Promise.resolve();
+function withReadinessLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = readinessQueue.then(fn, fn);
+  readinessQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
 /** Refusal text when unverified sibling pods exist, or null when creation may proceed. */
 async function checkReadinessGate(c: RunPodClient): Promise<string | null> {
   try {
@@ -405,19 +421,32 @@ async function openReadinessGate(podId: string, imports: string[] | undefined): 
   return renderGateBlock(podId, imports);
 }
 
-/** Clear a pod's gate after its imports were verified. */
-async function closeReadinessGate(podId: string): Promise<void> {
+/**
+ * Clear a pod's gate, but only when the imports that just passed cover everything the gate
+ * demanded. Returns a note for the caller when the gate stays shut, so a partial verification
+ * is visible rather than silently ineffective.
+ */
+async function closeReadinessGate(podId: string, passedImports: string[]): Promise<string> {
   try {
     const state = await loadReadinessState();
-    if (!state[podId]) return;
+    const gate = state[podId];
+    if (!gate || gate.verifiedAt != null) return "";
+    const unmet = unmetImports(gate, passedImports);
+    if (unmet.length > 0) {
+      return (
+        `\n⚠️ import-readiness 게이트 유지 — 이 팟이 요구한 import 중 아직 검증되지 않은 것: ${unmet.join(", ")}. ` +
+        `게이트가 열리려면 importSmokes에 이것들을 포함해 다시 호출해야 한다.`
+      );
+    }
     await saveReadinessState(markVerified(state, podId, new Date()));
+    return `\n✅ import-readiness 게이트 해제 — ${gate.imports.join(", ")} 검증됨. 다음 create_pod_auto 호출이 허용된다.`;
   } catch {
     // fail-soft
+    return "";
   }
 }
 
 server.tool(
-
   "create_pod_auto",
   "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.\n⚠️ costSafetyConfirmed는 사용자가 직접 확인한 경우에만 true로 설정하세요. Claude가 자동으로 true를 설정하는 것은 엄격히 금지됩니다.",
   {
@@ -470,8 +499,13 @@ server.tool(
     imports: z.array(z.string()).optional().describe("Python imports this pod must be able to run (e.g. [\"torch\",\"pandas\",\"kornia\"]). The pod is created and its id returned as usual, but marked NOT READY: the next create_pod_auto is refused until run_preflight(importSmokes=[...]) passes on it. Prevents creating sibling pods that all share an undiscovered missing module."),
     skipReadinessGate: z.boolean().default(false).describe("Bypass the pending import-readiness refusal. Set only when the user explicitly asks to create a pod while another is still unverified."),
   },
-  safeTool(async (args) => {
-    if (!args.dryRun && !args.skipReadinessGate) {
+  safeTool(async (args) =>
+    withReadinessLock(async () => {
+    // CPU pods are exempt: CLAUDE.md's Staging Pod Pattern prescribes a cheap CPU/transfer pod
+    // alongside an in-flight GPU pod. The incident this gate prevents is sibling *GPU* pods
+    // sharing an undiscovered missing module — refusing staging pods would only train the
+    // habit of passing skipReadinessGate, and a habitually-bypassed gate is a dead gate.
+    if (!args.dryRun && !args.cpuOnly && !args.skipReadinessGate) {
       const refusal = await checkReadinessGate(requireClient());
       if (refusal) return text(refusal);
     }
@@ -813,7 +847,8 @@ server.tool(
         matrixBlock +
         selectionErrors
     );
-  })
+    })
+  )
 );
 
 // ── stop_pod ──
@@ -2149,6 +2184,7 @@ server.tool(
 
     const CRITICAL_ML = ["peft", "transformers", "torch", "torchaudio", "torchvision", "bitsandbytes", "accelerate", "datasets"];
     const results: Array<{ label: string; status: "✅" | "⚠️" | "❌"; detail: string }> = [];
+    let gateNote = "";
     let hasFail = false;
     let hasWarn = false;
 
@@ -2411,8 +2447,9 @@ server.tool(
           allImportsPassed = false;
         }
       }
-      // Satisfies the create_pod_auto(imports=[...]) readiness gate for this pod.
-      if (allImportsPassed) await closeReadinessGate(podId);
+      // Satisfies the create_pod_auto(imports=[...]) readiness gate for this pod — but only
+      // if these imports cover what the gate demanded (see unmetImports).
+      if (allImportsPassed) gateNote = await closeReadinessGate(podId, importSmokes);
     }
 
     // 6. Training smoke — HALT on skeleton scripts (NotImplementedError, ImportError, SyntaxError, ModuleNotFoundError, AttributeError)
@@ -2481,7 +2518,7 @@ server.tool(
 
     const overallFail = hasFail || (strict && hasWarn);
     lines.push(`RESULT: ${overallFail ? "❌ FAIL" : "✅ PASS"} (${passed}/${totalChecks} checks passed${warned > 0 ? `, ${warned} warning(s)` : ""}, ${failed} failure(s))`);
-    return text(lines.join("\n"));
+    return text(lines.join("\n") + gateNote);
   })
 );
 

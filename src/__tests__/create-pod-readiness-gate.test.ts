@@ -146,6 +146,18 @@ describe("create_pod_auto import-readiness gate", () => {
     await callCreatePodAuto({ skipReadinessGate: true });
 
     expect(createPod).toHaveBeenCalled();
+    // Bypassing the refusal must not silently release the other pod's gate.
+    expect(await loadReadinessState()).toHaveProperty("pod-first");
+  });
+
+  it("does not gate a CPU staging pod (Staging Pod Pattern stays usable)", async () => {
+    await saveReadinessState(recordGate({}, "pod-first", ["torch"], new Date()));
+    listPods.mockResolvedValue([{ ...CREATED_POD, id: "pod-first" }]);
+
+    const output = await callCreatePodAuto({ cpuOnly: true, cpuFlavorIds: undefined });
+
+    expect(output).not.toContain("팟 생성 거부");
+    expect(await loadReadinessState()).toHaveProperty("pod-first");
   });
 
   it("does not gate a dryRun", async () => {
@@ -177,5 +189,26 @@ describe("create_pod_auto import-readiness gate", () => {
 
     expect(output).not.toContain("NOT READY");
     expect(await loadReadinessState()).toEqual({});
+  });
+
+  it("serializes concurrent calls so the second one sees the first one's gate", async () => {
+    // Without the lock both calls pass the check before either records a gate — the exact
+    // double-pod shape this feature exists to prevent.
+    const created: string[] = [];
+    createPod.mockImplementation(async () => {
+      const id = `pod-${created.length + 1}`;
+      created.push(id);
+      return { ...CREATED_POD, id };
+    });
+    listPods.mockImplementation(async () => created.map((id) => ({ ...CREATED_POD, id })));
+
+    const [first, second] = await Promise.all([
+      callCreatePodAuto({ imports: ["torch"] }),
+      callCreatePodAuto({ imports: ["torch"] }),
+    ]);
+
+    const refusals = [first, second].filter((o) => o.includes("팟 생성 거부"));
+    expect(refusals).toHaveLength(1);
+    expect(createPod).toHaveBeenCalledTimes(1);
   });
 });

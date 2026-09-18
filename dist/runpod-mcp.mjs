@@ -22297,6 +22297,10 @@ function importStatementLabel(statement) {
   if (words[0] === "import" || words[0] === "from") return words[1];
   return statement.trim();
 }
+function unmetImports(gate, passed) {
+  const passedLabels = new Set(passed.map(importStatementLabel));
+  return gate.imports.filter((required2) => !passedLabels.has(importStatementLabel(required2)));
+}
 
 // src/index.ts
 var COST_GATE_GPU_COUNT = 2;
@@ -22551,6 +22555,15 @@ ${stub}
     );
   })
 );
+var readinessQueue = Promise.resolve();
+function withReadinessLock(fn) {
+  const run = readinessQueue.then(fn, fn);
+  readinessQueue = run.then(
+    () => void 0,
+    () => void 0
+  );
+  return run;
+}
 async function checkReadinessGate(c) {
   try {
     const state = await loadReadinessState();
@@ -22575,12 +22588,21 @@ async function openReadinessGate(podId, imports) {
   }
   return renderGateBlock(podId, imports);
 }
-async function closeReadinessGate(podId) {
+async function closeReadinessGate(podId, passedImports) {
   try {
     const state = await loadReadinessState();
-    if (!state[podId]) return;
+    const gate = state[podId];
+    if (!gate || gate.verifiedAt != null) return "";
+    const unmet = unmetImports(gate, passedImports);
+    if (unmet.length > 0) {
+      return `
+\u26A0\uFE0F import-readiness \uAC8C\uC774\uD2B8 \uC720\uC9C0 \u2014 \uC774 \uD31F\uC774 \uC694\uAD6C\uD55C import \uC911 \uC544\uC9C1 \uAC80\uC99D\uB418\uC9C0 \uC54A\uC740 \uAC83: ${unmet.join(", ")}. \uAC8C\uC774\uD2B8\uAC00 \uC5F4\uB9AC\uB824\uBA74 importSmokes\uC5D0 \uC774\uAC83\uB4E4\uC744 \uD3EC\uD568\uD574 \uB2E4\uC2DC \uD638\uCD9C\uD574\uC57C \uD55C\uB2E4.`;
+    }
     await saveReadinessState(markVerified(state, podId, /* @__PURE__ */ new Date()));
+    return `
+\u2705 import-readiness \uAC8C\uC774\uD2B8 \uD574\uC81C \u2014 ${gate.imports.join(", ")} \uAC80\uC99D\uB428. \uB2E4\uC74C create_pod_auto \uD638\uCD9C\uC774 \uD5C8\uC6A9\uB41C\uB2E4.`;
   } catch {
+    return "";
   }
 }
 server.tool(
@@ -22615,24 +22637,25 @@ server.tool(
     imports: external_exports.array(external_exports.string()).optional().describe('Python imports this pod must be able to run (e.g. ["torch","pandas","kornia"]). The pod is created and its id returned as usual, but marked NOT READY: the next create_pod_auto is refused until run_preflight(importSmokes=[...]) passes on it. Prevents creating sibling pods that all share an undiscovered missing module.'),
     skipReadinessGate: external_exports.boolean().default(false).describe("Bypass the pending import-readiness refusal. Set only when the user explicitly asks to create a pod while another is still unverified.")
   },
-  safeTool(async (args) => {
-    if (!args.dryRun && !args.skipReadinessGate) {
-      const refusal = await checkReadinessGate(requireClient());
-      if (refusal) return text(refusal);
-    }
-    if (args.cpuOnly) {
-      const c2 = requireClient();
-      const autoSshKey2 = await readSshPubKey();
-      const resolvedSshPublicKey2 = args.sshPublicKey ?? autoSshKey2;
-      const nv = await resolveDcAndNv(c2, args.networkVolumeId, args.dcPriority);
-      if ("error" in nv) return text(nv.error);
-      const { dcsToTry: dcsToTry2, volumeNote: volumeNote2 } = nv;
-      const hasExplicitFlavors = !!(args.cpuFlavorIds && args.cpuFlavorIds.length > 0);
-      const flavorIds = hasExplicitFlavors ? args.cpuFlavorIds : defaultFlavorOrder(args.cpuFamily);
-      const flavorPriority = hasExplicitFlavors ? "custom" : "availability";
-      if (args.dryRun) {
-        return text(
-          `## Dry Run \u2014 CPU Pod Preview (no pod created)
+  safeTool(
+    async (args) => withReadinessLock(async () => {
+      if (!args.dryRun && !args.cpuOnly && !args.skipReadinessGate) {
+        const refusal = await checkReadinessGate(requireClient());
+        if (refusal) return text(refusal);
+      }
+      if (args.cpuOnly) {
+        const c2 = requireClient();
+        const autoSshKey2 = await readSshPubKey();
+        const resolvedSshPublicKey2 = args.sshPublicKey ?? autoSshKey2;
+        const nv = await resolveDcAndNv(c2, args.networkVolumeId, args.dcPriority);
+        if ("error" in nv) return text(nv.error);
+        const { dcsToTry: dcsToTry2, volumeNote: volumeNote2 } = nv;
+        const hasExplicitFlavors = !!(args.cpuFlavorIds && args.cpuFlavorIds.length > 0);
+        const flavorIds = hasExplicitFlavors ? args.cpuFlavorIds : defaultFlavorOrder(args.cpuFamily);
+        const flavorPriority = hasExplicitFlavors ? "custom" : "availability";
+        if (args.dryRun) {
+          return text(
+            `## Dry Run \u2014 CPU Pod Preview (no pod created)
 
 Compute type: CPU
 vCPU: ${args.vcpuCount}
@@ -22645,49 +22668,49 @@ Note: RunPod does not expose CPU pricing via API. Verify on console.runpod.io/po
 
 ## Next Steps
 \u2192 create_pod_auto with same parameters and dryRun: false`
-        );
-      }
-      const cpuFailures = [];
-      for (const dc of dcsToTry2) {
-        try {
-          const opts = {
-            name: args.name,
-            imageName: args.imageName,
-            computeType: "CPU",
-            vcpuCount: args.vcpuCount,
-            cpuFlavorIds: flavorIds,
-            cpuFlavorPriority: flavorPriority,
-            containerDiskInGb: args.containerDiskInGb,
-            volumeInGb: args.volumeInGb,
-            volumeMountPath: "/workspace",
-            ...resolvedSshPublicKey2 ? { sshPublicKey: resolvedSshPublicKey2 } : {},
-            ports: ["22/tcp"],
-            env: args.env,
-            networkVolumeId: args.networkVolumeId,
-            dataCenterIds: [dc],
-            cloudType: args.cloudType
-          };
-          const pod = await c2.createPod(opts);
-          const assignedFlavor = pod.cpuFlavorId ?? null;
-          const stub = buildPodMetadataStub({
-            pod_id: pod.id,
-            name: args.name,
-            created_at: (/* @__PURE__ */ new Date()).toISOString(),
-            datacenter: dc,
-            compute_type: "CPU",
-            vcpu_count: args.vcpuCount,
-            cpu_flavor_ids: flavorIds,
-            cost_per_hr: pod.costPerHr ?? null,
-            // RunPod returns this on pod creation
-            image: args.imageName,
-            container_disk_gb: args.containerDiskInGb,
-            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
-            job_group: args.jobGroup ?? null
-          });
-          const assignedNote = assignedFlavor && !flavorIds.includes(assignedFlavor) ? ` (RunPod picked ${assignedFlavor}, not in requested list \u2014 verify if intentional)` : assignedFlavor ? ` (RunPod assigned ${assignedFlavor})` : "";
-          const cpuGateBlock = await openReadinessGate(pod.id, args.imports);
-          return text(
-            `Auto-selected CPU pod in ${dc} (requested: ${flavorIds.join(", ")} [${flavorPriority}], ${args.vcpuCount} vCPU)${assignedNote}${volumeNote2}
+          );
+        }
+        const cpuFailures = [];
+        for (const dc of dcsToTry2) {
+          try {
+            const opts = {
+              name: args.name,
+              imageName: args.imageName,
+              computeType: "CPU",
+              vcpuCount: args.vcpuCount,
+              cpuFlavorIds: flavorIds,
+              cpuFlavorPriority: flavorPriority,
+              containerDiskInGb: args.containerDiskInGb,
+              volumeInGb: args.volumeInGb,
+              volumeMountPath: "/workspace",
+              ...resolvedSshPublicKey2 ? { sshPublicKey: resolvedSshPublicKey2 } : {},
+              ports: ["22/tcp"],
+              env: args.env,
+              networkVolumeId: args.networkVolumeId,
+              dataCenterIds: [dc],
+              cloudType: args.cloudType
+            };
+            const pod = await c2.createPod(opts);
+            const assignedFlavor = pod.cpuFlavorId ?? null;
+            const stub = buildPodMetadataStub({
+              pod_id: pod.id,
+              name: args.name,
+              created_at: (/* @__PURE__ */ new Date()).toISOString(),
+              datacenter: dc,
+              compute_type: "CPU",
+              vcpu_count: args.vcpuCount,
+              cpu_flavor_ids: flavorIds,
+              cost_per_hr: pod.costPerHr ?? null,
+              // RunPod returns this on pod creation
+              image: args.imageName,
+              container_disk_gb: args.containerDiskInGb,
+              network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
+              job_group: args.jobGroup ?? null
+            });
+            const assignedNote = assignedFlavor && !flavorIds.includes(assignedFlavor) ? ` (RunPod picked ${assignedFlavor}, not in requested list \u2014 verify if intentional)` : assignedFlavor ? ` (RunPod assigned ${assignedFlavor})` : "";
+            const cpuGateBlock = await openReadinessGate(pod.id, args.imports);
+            return text(
+              `Auto-selected CPU pod in ${dc} (requested: ${flavorIds.join(", ")} [${flavorPriority}], ${args.vcpuCount} vCPU)${assignedNote}${volumeNote2}
 ${podSummary(pod)}
 
 ## Pod Metadata Stub (pass to save_pod_metadata after enriching)
@@ -22698,15 +22721,15 @@ ${stub}
 ## Next Steps
 \u2192 wait_for_pod(podId: "${pod.id}")
 \u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})${cpuGateBlock}`
-          );
-        } catch (e) {
-          if (isAuthError(e)) return errorResult(e);
-          cpuFailures.push({ dc, error: e.message });
-          continue;
+            );
+          } catch (e) {
+            if (isAuthError(e)) return errorResult(e);
+            cpuFailures.push({ dc, error: e.message });
+            continue;
+          }
         }
-      }
-      return text(
-        `No CPU pod could be created across ${dcsToTry2.length} DC.
+        return text(
+          `No CPU pod could be created across ${dcsToTry2.length} DC.
 
 Attempted: ${dcsToTry2.join(" \u2192 ")}
 Flavor priority: ${flavorIds.join(", ")} [${flavorPriority}]
@@ -22715,104 +22738,104 @@ Failures:
 ${cpuFailures.map((f) => `  ${f.dc}: ${f.error}`).join("\n")}
 
 Try overriding dcPriority or widening cpuFlavorIds. Run list_cpu_types for options.`
-      );
-    }
-    if (args.gpuCount >= COST_GATE_GPU_COUNT && args.networkVolumeId && !args.dryRun) {
-      if (!args.nvReadinessToken) {
-        return text(
-          `\u26A0\uFE0F NV READINESS TOKEN REQUIRED (gpuCount=${args.gpuCount}, networkVolumeId=${args.networkVolumeId})
+        );
+      }
+      if (args.gpuCount >= COST_GATE_GPU_COUNT && args.networkVolumeId && !args.dryRun) {
+        if (!args.nvReadinessToken) {
+          return text(
+            `\u26A0\uFE0F NV READINESS TOKEN REQUIRED (gpuCount=${args.gpuCount}, networkVolumeId=${args.networkVolumeId})
 \uACE0\uBE44\uC6A9 \uB2E4\uC911-GPU \uD31F \uC0DD\uC131 \uC804 \uB370\uC774\uD130 \uAC80\uC99D\uC774 \uD544\uC694\uD569\uB2C8\uB2E4:
 1. \uC2A4\uD14C\uC774\uC9D5 \uD31F\uC5D0\uC11C \uB370\uC774\uD130 \uC804\uC1A1 \uC644\uB8CC
 2. verify_data_on_nv(podId, requiredPaths) \uD638\uCD9C \u2192 \uD1A0\uD070 \uBC1C\uAE09
 3. \uBC1C\uAE09\uB41C \uD1A0\uD070\uC744 nvReadinessToken \uD30C\uB77C\uBBF8\uD130\uC5D0 \uC804\uB2EC\uD574 \uC7AC\uD638\uCD9C\uD558\uC138\uC694.`
-        );
-      }
-      try {
-        const tokenPath = `${NV_READY_DIR}/nv_ready_${args.networkVolumeId}.json`;
-        const tokenRaw = await readFile4(tokenPath, "utf-8");
-        const tokenData = JSON.parse(tokenRaw);
-        if (tokenData.token !== args.nvReadinessToken) {
-          return text(`\u274C NV readiness token mismatch for volume ${args.networkVolumeId}. Re-run verify_data_on_nv to get a fresh token.`);
+          );
         }
-        const ageHours = (Date.now() - new Date(tokenData.verifiedAt).getTime()) / 36e5;
-        if (ageHours > TOKEN_TTL_HOURS) {
-          return text(`\u274C NV readiness token expired (${ageHours.toFixed(1)}h old, TTL=${TOKEN_TTL_HOURS}h). Re-run verify_data_on_nv.`);
+        try {
+          const tokenPath = `${NV_READY_DIR}/nv_ready_${args.networkVolumeId}.json`;
+          const tokenRaw = await readFile4(tokenPath, "utf-8");
+          const tokenData = JSON.parse(tokenRaw);
+          if (tokenData.token !== args.nvReadinessToken) {
+            return text(`\u274C NV readiness token mismatch for volume ${args.networkVolumeId}. Re-run verify_data_on_nv to get a fresh token.`);
+          }
+          const ageHours = (Date.now() - new Date(tokenData.verifiedAt).getTime()) / 36e5;
+          if (ageHours > TOKEN_TTL_HOURS) {
+            return text(`\u274C NV readiness token expired (${ageHours.toFixed(1)}h old, TTL=${TOKEN_TTL_HOURS}h). Re-run verify_data_on_nv.`);
+          }
+        } catch {
+          return text(`\u274C NV readiness token file not found for volume ${args.networkVolumeId}. Run verify_data_on_nv first.`);
         }
-      } catch {
-        return text(`\u274C NV readiness token file not found for volume ${args.networkVolumeId}. Run verify_data_on_nv first.`);
       }
-    }
-    if (args.gpuCount >= COST_GATE_GPU_COUNT && !args.dryRun) {
-      const mcpServer = server.server;
-      const hasElicitation = mcpServer?._clientCapabilities?.elicitation !== void 0;
-      const booleanFallback = () => !args.costSafetyConfirmed ? text(
-        `\u26A0\uFE0F COST SAFETY CHECK (gpuCount=${args.gpuCount})
+      if (args.gpuCount >= COST_GATE_GPU_COUNT && !args.dryRun) {
+        const mcpServer = server.server;
+        const hasElicitation = mcpServer?._clientCapabilities?.elicitation !== void 0;
+        const booleanFallback = () => !args.costSafetyConfirmed ? text(
+          `\u26A0\uFE0F COST SAFETY CHECK (gpuCount=${args.gpuCount})
 \uACE0\uBE44\uC6A9 \uD31F \uC0DD\uC131 \uC804 \uD655\uC778\uD558\uC138\uC694:
 [ ] 1. \uB370\uC774\uD130/\uCF54\uB4DC\uAC00 \uC774\uBBF8 \uC900\uBE44\uB428 (\uB85C\uCEEC \uC804\uCC98\uB9AC or \uC804\uC1A1 \uD31F \uC644\uB8CC)
 [ ] 2. 1-GPU\uB85C \uAC80\uC99D \uD14C\uC2A4\uD2B8 \uC644\uB8CC\uB428 (VRAM\xB7\uC18D\uB3C4\xB7\uCF54\uB4DC \uC815\uC0C1 \uB3D9\uC791)
 
 \uD655\uC778 \uC644\uB8CC \uD6C4 \uB3D9\uC77C \uD30C\uB77C\uBBF8\uD130\uC5D0 costSafetyConfirmed: true\uB97C \uCD94\uAC00\uD574 \uC7AC\uD638\uCD9C\uD558\uC138\uC694.`
-      ) : null;
-      if (hasElicitation) {
-        try {
-          const elicitResult = await mcpServer.elicitInput({
-            message: `\u26A0\uFE0F COST SAFETY CHECK (gpuCount=${args.gpuCount})
+        ) : null;
+        if (hasElicitation) {
+          try {
+            const elicitResult = await mcpServer.elicitInput({
+              message: `\u26A0\uFE0F COST SAFETY CHECK (gpuCount=${args.gpuCount})
 \uACE0\uBE44\uC6A9 \uD31F \uC0DD\uC131 \uC804 \uD655\uC778\uD558\uC138\uC694:
 [ ] 1. \uB370\uC774\uD130/\uCF54\uB4DC\uAC00 \uC774\uBBF8 \uC900\uBE44\uB428 (\uB85C\uCEEC \uC804\uCC98\uB9AC or \uC804\uC1A1 \uD31F \uC644\uB8CC)
 [ ] 2. 1-GPU\uB85C \uAC80\uC99D \uD14C\uC2A4\uD2B8 \uC644\uB8CC\uB428 (VRAM\xB7\uC18D\uB3C4\xB7\uCF54\uB4DC \uC815\uC0C1 \uB3D9\uC791)
 
 \uC704 \uD56D\uBAA9\uC744 \uD655\uC778\uD588\uC73C\uBA74 \uC2B9\uC778\uD558\uC138\uC694.`,
-            requestedSchema: {
-              type: "object",
-              properties: {
-                confirmed: {
-                  type: "boolean",
-                  title: "\uBE44\uC6A9 \uC548\uC804 \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uD655\uC778 \uC644\uB8CC",
-                  description: "\uC704 \uD56D\uBAA9\uC744 \uBAA8\uB450 \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4",
-                  default: false
-                }
-              },
-              required: ["confirmed"]
-            }
-          });
-          const approved = elicitResult?.action === "accept" && elicitResult?.content?.confirmed === true;
-          if (!approved) {
-            return text(`\u{1F6AB} \uCDE8\uC18C\uB428. \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uD655\uC778 \uD6C4 \uC7AC\uC2DC\uB3C4\uD558\uC138\uC694.
+              requestedSchema: {
+                type: "object",
+                properties: {
+                  confirmed: {
+                    type: "boolean",
+                    title: "\uBE44\uC6A9 \uC548\uC804 \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uD655\uC778 \uC644\uB8CC",
+                    description: "\uC704 \uD56D\uBAA9\uC744 \uBAA8\uB450 \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4",
+                    default: false
+                  }
+                },
+                required: ["confirmed"]
+              }
+            });
+            const approved = elicitResult?.action === "accept" && elicitResult?.content?.confirmed === true;
+            if (!approved) {
+              return text(`\u{1F6AB} \uCDE8\uC18C\uB428. \uCCB4\uD06C\uB9AC\uC2A4\uD2B8 \uD655\uC778 \uD6C4 \uC7AC\uC2DC\uB3C4\uD558\uC138\uC694.
 (elicitation action: ${elicitResult?.action ?? "null"})`);
+            }
+          } catch {
+            const blocked = booleanFallback();
+            if (blocked) return blocked;
           }
-        } catch {
+        } else {
           const blocked = booleanFallback();
           if (blocked) return blocked;
         }
-      } else {
-        const blocked = booleanFallback();
-        if (blocked) return blocked;
       }
-    }
-    const c = requireClient();
-    const autoSshKey = await readSshPubKey();
-    const sshWarnText = process.env.SSH_KEY_PATH && !autoSshKey ? "\n\u26A0\uFE0F SSH_KEY_PATH \uC124\uC815\uB428 but \uACF5\uAC1C\uD0A4 \uC77D\uAE30 \uC2E4\uD328 \u2014 \uC9C1\uC811 SSH/SCP \uBD88\uAC00, execute_ssh_command(\uD504\uB85D\uC2DC) \uC0AC\uC6A9" : "";
-    const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
-    const gpuTypes = await c.listGpuTypes();
-    const nvRes = await resolveDcAndNv(c, args.networkVolumeId, args.dcPriority);
-    if ("error" in nvRes) return text(nvRes.error);
-    const { dcsToTry, nvDataCenterId, volumeNote } = nvRes;
-    const { candidates, errors } = selectGpuCandidates(gpuTypes, {
-      gpuPreference: args.gpuPreference,
-      minVram: args.minVram,
-      gpuCount: args.gpuCount,
-      spot: args.spot,
-      maxBidPerGpu: args.maxBidPerGpu
-    });
-    if (args.dryRun && candidates.length > 0) {
-      const { gpu, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning } = candidates[0];
-      const priceInfo = args.spot && bidPrice ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)` : `On-demand: $${ondemandPrice}/hr`;
-      const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
-      const dcNote = nvDataCenterId ? `
+      const c = requireClient();
+      const autoSshKey = await readSshPubKey();
+      const sshWarnText = process.env.SSH_KEY_PATH && !autoSshKey ? "\n\u26A0\uFE0F SSH_KEY_PATH \uC124\uC815\uB428 but \uACF5\uAC1C\uD0A4 \uC77D\uAE30 \uC2E4\uD328 \u2014 \uC9C1\uC811 SSH/SCP \uBD88\uAC00, execute_ssh_command(\uD504\uB85D\uC2DC) \uC0AC\uC6A9" : "";
+      const resolvedSshPublicKey = args.sshPublicKey ?? autoSshKey;
+      const gpuTypes = await c.listGpuTypes();
+      const nvRes = await resolveDcAndNv(c, args.networkVolumeId, args.dcPriority);
+      if ("error" in nvRes) return text(nvRes.error);
+      const { dcsToTry, nvDataCenterId, volumeNote } = nvRes;
+      const { candidates, errors } = selectGpuCandidates(gpuTypes, {
+        gpuPreference: args.gpuPreference,
+        minVram: args.minVram,
+        gpuCount: args.gpuCount,
+        spot: args.spot,
+        maxBidPerGpu: args.maxBidPerGpu
+      });
+      if (args.dryRun && candidates.length > 0) {
+        const { gpu, stock, ondemandPrice, bidPrice, minBid, overprovisionWarning } = candidates[0];
+        const priceInfo = args.spot && bidPrice ? `Spot bid: $${bidPrice}/hr (min: $${minBid}/hr)` : `On-demand: $${ondemandPrice}/hr`;
+        const monthlyCost = (args.spot && bidPrice ? bidPrice : ondemandPrice) * 24 * 30;
+        const dcNote = nvDataCenterId ? `
 Datacenter: ${nvDataCenterId} (forced by network volume)` : `
 DC fallback order: ${dcsToTry.join(" \u2192 ")}`;
-      return text(
-        (args.gpuCount >= 2 ? `\u26A0\uFE0F COST SAFETY REMINDER: \uC2E4\uC81C \uC0DD\uC131(dryRun: false) \uC2DC \uC0AC\uC804 \uCC28\uB2E8\uC774 \uBC1C\uB3D9\uB429\uB2C8\uB2E4.
+        return text(
+          (args.gpuCount >= 2 ? `\u26A0\uFE0F COST SAFETY REMINDER: \uC2E4\uC81C \uC0DD\uC131(dryRun: false) \uC2DC \uC0AC\uC804 \uCC28\uB2E8\uC774 \uBC1C\uB3D9\uB429\uB2C8\uB2E4.
 
 ` : ``) + `## Dry Run \u2014 Preview Only (no pod created)
 
@@ -22826,47 +22849,47 @@ Note: per-DC stock cannot be probed without creating a pod. Real run will iterat
 
 ## Next Steps
 \u2192 create_pod_auto with same parameters and dryRun: false`
-      );
-    }
-    const failureMatrix = [];
-    for (const dc of dcsToTry) {
-      for (const { gpu, gpuId, stock, ondemandPrice, bidPrice, overprovisionWarning } of candidates) {
-        try {
-          const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
-          const opts = {
-            name: args.name,
-            imageName: args.imageName,
-            gpuTypeIds: [gpuId],
-            gpuCount: args.gpuCount,
-            interruptible: args.spot,
-            containerDiskInGb: args.containerDiskInGb,
-            volumeInGb: args.volumeInGb,
-            volumeMountPath: "/workspace",
-            ...resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {},
-            ports: ["22/tcp"],
-            env: podEnv,
-            networkVolumeId: args.networkVolumeId,
-            dataCenterIds: [dc],
-            cloudType: args.cloudType
-          };
-          if (args.spot && bidPrice) {
-            const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
-            const stub2 = buildPodMetadataStub({
-              pod_id: result.id,
+        );
+      }
+      const failureMatrix = [];
+      for (const dc of dcsToTry) {
+        for (const { gpu, gpuId, stock, ondemandPrice, bidPrice, overprovisionWarning } of candidates) {
+          try {
+            const podEnv = injectPytorchEnv(args.env, args.optimizePytorch);
+            const opts = {
               name: args.name,
-              created_at: (/* @__PURE__ */ new Date()).toISOString(),
-              datacenter: dc,
-              gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
-              gpu_count: args.gpuCount,
-              cost_per_hr: bidPrice,
-              image: args.imageName,
-              container_disk_gb: args.containerDiskInGb,
-              network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
-              job_group: args.jobGroup ?? null
-            });
-            const spotGateBlock = await openReadinessGate(result.id, args.imports);
-            return text(
-              `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})
+              imageName: args.imageName,
+              gpuTypeIds: [gpuId],
+              gpuCount: args.gpuCount,
+              interruptible: args.spot,
+              containerDiskInGb: args.containerDiskInGb,
+              volumeInGb: args.volumeInGb,
+              volumeMountPath: "/workspace",
+              ...resolvedSshPublicKey ? { sshPublicKey: resolvedSshPublicKey } : {},
+              ports: ["22/tcp"],
+              env: podEnv,
+              networkVolumeId: args.networkVolumeId,
+              dataCenterIds: [dc],
+              cloudType: args.cloudType
+            };
+            if (args.spot && bidPrice) {
+              const result = await c.createSpotPod({ ...opts, bidPerGpu: bidPrice });
+              const stub2 = buildPodMetadataStub({
+                pod_id: result.id,
+                name: args.name,
+                created_at: (/* @__PURE__ */ new Date()).toISOString(),
+                datacenter: dc,
+                gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
+                gpu_count: args.gpuCount,
+                cost_per_hr: bidPrice,
+                image: args.imageName,
+                container_disk_gb: args.containerDiskInGb,
+                network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
+                job_group: args.jobGroup ?? null
+              });
+              const spotGateBlock = await openReadinessGate(result.id, args.imports);
+              return text(
+                `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})
 Spot bid: $${bidPrice}/hr
 Pod ID: ${result.id}${overprovisionWarning}${volumeNote}${sshWarnText}
 
@@ -22878,26 +22901,26 @@ ${stub2}
 ## Next Steps
 \u2192 wait_for_pod(podId: "${result.id}")
 \u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})${spotGateBlock}`
-            );
-          }
-          const pod = await c.createPod(opts);
-          const dcLabel = nvDataCenterId ? dc : `${dc} (price: $${ondemandPrice}/hr)`;
-          const stub = buildPodMetadataStub({
-            pod_id: pod.id,
-            name: args.name,
-            created_at: (/* @__PURE__ */ new Date()).toISOString(),
-            datacenter: dc,
-            gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
-            gpu_count: args.gpuCount,
-            cost_per_hr: ondemandPrice,
-            image: args.imageName,
-            container_disk_gb: args.containerDiskInGb,
-            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
-            job_group: args.jobGroup ?? null
-          });
-          const gpuGateBlock = await openReadinessGate(pod.id, args.imports);
-          return text(
-            `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}
+              );
+            }
+            const pod = await c.createPod(opts);
+            const dcLabel = nvDataCenterId ? dc : `${dc} (price: $${ondemandPrice}/hr)`;
+            const stub = buildPodMetadataStub({
+              pod_id: pod.id,
+              name: args.name,
+              created_at: (/* @__PURE__ */ new Date()).toISOString(),
+              datacenter: dc,
+              gpu: `${gpu.displayName} (${gpu.memoryInGb}GB)`,
+              gpu_count: args.gpuCount,
+              cost_per_hr: ondemandPrice,
+              image: args.imageName,
+              container_disk_gb: args.containerDiskInGb,
+              network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
+              job_group: args.jobGroup ?? null
+            });
+            const gpuGateBlock = await openReadinessGate(pod.id, args.imports);
+            return text(
+              `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}
 ${podSummary(pod)}
 
 ## Pod Metadata Stub (pass to save_pod_metadata after enriching)
@@ -22908,29 +22931,29 @@ ${stub}
 ## Next Steps
 \u2192 wait_for_pod(podId: "${pod.id}")
 \u2192 save_pod_metadata({metadata: <stub above with purpose filled in>})${gpuGateBlock}`
-          );
-        } catch (e) {
-          if (isAuthError(e)) return errorResult(e);
-          failureMatrix.push({ dc, gpu: gpu.displayName, error: e.message });
-          continue;
+            );
+          } catch (e) {
+            if (isAuthError(e)) return errorResult(e);
+            failureMatrix.push({ dc, gpu: gpu.displayName, error: e.message });
+            continue;
+          }
         }
       }
-    }
-    const available = gpuTypes.filter((g) => g.memoryInGb >= args.minVram && getStockStatus(g) !== "Out of Stock").sort((a, b) => {
-      const ap = getSpotPrice(a) ?? Infinity;
-      const bp = getSpotPrice(b) ?? Infinity;
-      return ap - bp;
-    }).slice(0, 10);
-    const matrixText = formatDcGpuFailureMatrix(failureMatrix);
-    const matrixBlock = matrixText ? `
+      const available = gpuTypes.filter((g) => g.memoryInGb >= args.minVram && getStockStatus(g) !== "Out of Stock").sort((a, b) => {
+        const ap = getSpotPrice(a) ?? Infinity;
+        const bp = getSpotPrice(b) ?? Infinity;
+        return ap - bp;
+      }).slice(0, 10);
+      const matrixText = formatDcGpuFailureMatrix(failureMatrix);
+      const matrixBlock = matrixText ? `
 
 Failure matrix (${failureMatrix.length} attempts across ${dcsToTry.length} DC \xD7 ${candidates.length} GPU):
 ${matrixText}` : "";
-    const selectionErrors = errors.length ? `
+      const selectionErrors = errors.length ? `
 
 Selection errors:
 ${errors.join("\n")}` : "";
-    const nvHint = nvDataCenterId ? `
+      const nvHint = nvDataCenterId ? `
 
 \u26A0 Network volume ${args.networkVolumeId} constrains pods to ${nvDataCenterId}.${volumeNote}
 If this DC is dry, options:
@@ -22940,18 +22963,19 @@ If this DC is dry, options:
 
 DC fallback order tried: ${dcsToTry.join(" \u2192 ")}
 All combinations exhausted. Try again later or override dcPriority with a different list.`;
-    return text(
-      `No pod could be created.${nvHint}
+      return text(
+        `No pod could be created.${nvHint}
 
 Cheapest alternatives (global stock \u2014 NOT guaranteed in any specific DC):
 
 ` + available.map((g) => {
-        const price = getSpotPrice(g);
-        const st = getStockStatus(g);
-        return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
-      }).join("\n") + matrixBlock + selectionErrors
-    );
-  })
+          const price = getSpotPrice(g);
+          const st = getStockStatus(g);
+          return `${g.displayName} (${g.memoryInGb}GB) - ${price != null ? `$${price}/hr` : "n/a"} [${st}]`;
+        }).join("\n") + matrixBlock + selectionErrors
+      );
+    })
+  )
 );
 server.tool(
   "stop_pod",
@@ -24079,6 +24103,7 @@ server.tool(
     if (!sshArgs) return text(`\u274C Pod ${podId} not ready for SSH. Run wait_for_pod first.`);
     const CRITICAL_ML = ["peft", "transformers", "torch", "torchaudio", "torchvision", "bitsandbytes", "accelerate", "datasets"];
     const results = [];
+    let gateNote = "";
     let hasFail = false;
     let hasWarn = false;
     {
@@ -24291,7 +24316,7 @@ server.tool(
           allImportsPassed = false;
         }
       }
-      if (allImportsPassed) await closeReadinessGate(podId);
+      if (allImportsPassed) gateNote = await closeReadinessGate(podId, importSmokes);
     }
     if (trainingSmokeCmd || trainingEntryModule) {
       let sshCmd;
@@ -24351,7 +24376,7 @@ server.tool(
     const warned = results.filter((r) => r.status === "\u26A0\uFE0F").length;
     const overallFail = hasFail || strict && hasWarn;
     lines.push(`RESULT: ${overallFail ? "\u274C FAIL" : "\u2705 PASS"} (${passed}/${totalChecks} checks passed${warned > 0 ? `, ${warned} warning(s)` : ""}, ${failed} failure(s))`);
-    return text(lines.join("\n"));
+    return text(lines.join("\n") + gateNote);
   })
 );
 server.tool(
