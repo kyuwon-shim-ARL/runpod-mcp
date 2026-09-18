@@ -14,6 +14,7 @@ import { classifyTrainingSmoke, planMonitoringCadence, renderMonitoringCadenceSe
 import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
 import { CPU_FLAVORS, CPU_FLAVOR_IDS, defaultFlavorOrder } from "./cpu-catalog.js";
 import { readPodGroups, groupSiblings, renderGroupLine } from "./job-group.js";
+import { buildSupervisedScript } from "./supervised-launch.js";
 import { loadIdleState, saveIdleState, pruneState, judgeIdle, parseWorkProbe, renderWorkLine, WORK_PROBE_CMD, type IdleState } from "./idle-utils.js";
 import {
   loadReadinessState,
@@ -1228,6 +1229,82 @@ server.tool(
       ? `\n\n[Setup step detected] This command looks like provisioning. Append it to post_create_steps in your pod metadata yaml (Read .omc/pods/<pod>.yaml → modify → save_pod_metadata).`
       : "";
     return text((result.stdout || "(no output)") + setupHint);
+  })
+);
+
+// ── launch_supervised_training ──
+//
+// A pod that is "running" tells you nothing about the job on it. On 2026-09-17 a training run
+// died when its tmux session was reused and nobody noticed for 14.5 billed hours. This launches
+// the job under a watchdog that keeps one status file, so the next question — "is it alive?" —
+// is a single read instead of a round of SSH.
+server.tool(
+  "launch_supervised_training",
+  "Launch a long-running training command on a pod under a watchdog. The job runs detached and a single STATUS file on the pod answers RUNNING/ALERT/DONE/FAILED with progress, GPU util and log-stall minutes — one read replaces polling several things over SSH. Prefer this over a bare `nohup ...` launch via execute_ssh_command: a bare launch leaves no way to tell a finished job from a dead one.",
+  {
+    podId: z.string(),
+    command: z.string().describe("The training command, run from workingDir (e.g. 'python3 train.py --epochs 30'). Must be a single line with no single quote — a newline would make the watchdog supervise the wrong process. Put multi-line or quoted work in a script file on the pod and call that."),
+    label: z.string().default("run").describe("Short name for this run, shown in every STATUS line so one file is attributable. Also names the script file on the pod, so it must match [A-Za-z0-9._-]+."),
+    statusPath: z.string().default("/root/outputs/STATUS").describe("Absolute path on the pod for the status file"),
+    logPath: z.string().default("/root/outputs/train.log").describe("Absolute path on the pod for the training log"),
+    workingDir: z.string().default("/workspace").describe("Directory to run the command from"),
+    idleAlertMinutes: z.number().int().positive().default(25).describe("Minutes without log growth before STATUS flips to ALERT. Set above your per-epoch time — an epoch that takes 16 min makes 25 a real stall, 10 a false alarm."),
+    totalSteps: z.number().int().positive().optional().describe("Total epochs/steps, rendered as the denominator in the status line"),
+    progressPattern: z.string().default("Epoch [0-9]+").describe("grep -oE pattern whose last match's number becomes the progress figure"),
+    skipIfExists: z.string().optional().describe("If this path already exists on the pod, report DONE and skip — makes a relaunch idempotent"),
+  },
+  safeTool(async ({ podId, command, label, statusPath, logPath, workingDir, idleAlertMinutes, totalSteps, progressPattern, skipIfExists }) => {
+    const c = requireClient();
+    const pod = await c.getPod(podId);
+    if (!pod) return text(`❌ Pod ${podId} not found.`);
+    const sshArgs = c.getSshArgs(pod);
+    if (!sshArgs) return text(`❌ Pod ${podId} not ready for SSH. Run wait_for_pod first.`);
+
+    let script: string;
+    try {
+      script = buildSupervisedScript({
+        command, statusPath, logPath, label, idleAlertMinutes, workingDir, skipIfExists, progressPattern, totalSteps,
+      });
+    } catch (e) {
+      return text(`❌ ${(e as Error).message}`);
+    }
+
+    // base64 the script so nothing in it is reinterpreted by the outer shell.
+    //
+    // The `{ ...; } &` braces matter: `A && B && nohup C & echo LAUNCHED` would background the
+    // WHOLE && list, so the echo ran unconditionally and the tool reported a successful launch
+    // even when the script was never written — the same silent-success failure this feature
+    // exists to eliminate. Confining `&` to the launch keeps the && chain gating the echo.
+    const scriptPath = `/root/.runpod-mcp/${label}.sh`;
+    const b64 = Buffer.from(script).toString("base64");
+    const install =
+      `if [ -f '${statusPath}' ] && grep -q '^RUNNING' '${statusPath}' 2>/dev/null; then echo ALREADY_RUNNING; exit 1; fi && ` +
+      `mkdir -p /root/.runpod-mcp && echo ${b64} | base64 -d > '${scriptPath}' && chmod +x '${scriptPath}' && ` +
+      `test -s '${scriptPath}' && { nohup setsid bash '${scriptPath}' > /dev/null 2>&1 & } && echo LAUNCHED`;
+
+    const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", install], { timeout: 60_000 });
+    if (result.error) return text(`❌ SSH error: ${result.error.message}`);
+    if ((result.stdout ?? "").includes("ALREADY_RUNNING")) {
+      return text(
+        `❌ ${statusPath} already reads RUNNING — a job with this label looks alive on ${podId}.\n` +
+          `Relaunching would overwrite its script and its status, leaving the running job unattributable.\n\n` +
+          `→ execute_ssh_command(podId: "${podId}", command: "cat ${statusPath}")  ← check what is running\n` +
+          `→ then either use a different label, or remove ${statusPath} if the job is known dead.`
+      );
+    }
+    if (!(result.stdout ?? "").includes("LAUNCHED")) {
+      return text(`❌ Launch failed (exit ${result.status}).\n\nStderr:\n${result.stderr}\n\nStdout:\n${result.stdout}`);
+    }
+
+    return text(
+      `✅ Launched ${label} under a watchdog on ${podId}.\n` +
+        `Script: ${scriptPath}\nStatus: ${statusPath}\nLog: ${logPath}\n` +
+        `Stall alert: no log growth for ${idleAlertMinutes}m → ALERT\n\n` +
+        `## Next Steps\n` +
+        `→ execute_ssh_command(podId: "${podId}", command: "cat ${statusPath}")  ← the whole state, one read\n` +
+        `→ plan_monitoring_cadence(...) once the first epoch time is known — do not poll on a fixed interval\n\n` +
+        `STATUS lines: RUNNING <label> epoch=N/${totalSteps ?? "?"} gpu=NN% idle=Nmin · ALERT idle Nmin · DONE rc=0 · FAILED rc=N`
+    );
   })
 );
 

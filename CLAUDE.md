@@ -61,7 +61,9 @@ plan_gpu_job(randomAccessTrainingGb=N) → containerDiskInGb 권장값 출력
    → **`run_preflight(trainDataPath="/root/data/<dataset>", expectedRandomAccessGb=N, trainingSmokeCmd="python3 train.py --smoke-test")`** ← CUDA + NV→rootfs + 사이즈 + **훈련 스크립트 실행 가능성** 검증 (필수)
      - `trainingSmokeCmd`는 처음 실행하는 스크립트(또는 e215/e219처럼 새로 작성된 것)에 **반드시** 포함. NotImplementedError/skeleton script을 launch 전에 잡음.
      - smokeCmd가 어려우면 fallback: `trainingEntryModule="src.train"` (import-time 오류만 잡음)
-   → `execute_ssh_command` (training launch — 스크립트가 `/root/data/<dataset>` 읽도록 설정)
+   → **`launch_supervised_training`** (training launch — 스크립트가 `/root/data/<dataset>` 읽도록 설정)
+     - 맨 `nohup`으로 띄우지 말 것. 감시견 없이 띄우면 훈련이 죽어도 팟은 RUNNING이라 구분이 안 된다 (2026-09-17 사고: 14.5시간 과금)
+     - `idleAlertMinutes`는 **epoch 1회 시간보다 크게**. 16분/epoch이면 25가 적정, 10이면 오경보
 2. **Step A: cache-warm 검증 (T+0~5min) — `gpu_sample_burst`** 호출 (필수)
    - OMC 환경: `ScheduleWakeup(delaySeconds=120)` 설정 → wakeup 시 `gpu_sample_burst` 호출
    - 직접(OMC 없는 환경): `execute_ssh_command("sleep 120")` 완료 후 `gpu_sample_burst` 호출
@@ -171,6 +173,35 @@ User requests GPU work
 6. Training starts immediately — data is already there, zero idle time
 
 **When to use:** datasets > 500MB, or any preprocessing (tokenization, feature extraction) that doesn't need GPU.
+
+### Supervised Training Launch (`launch_supervised_training`)
+
+`create_pod`가 "컨테이너가 떴다"를 성공으로 보고하듯, 팟이 RUNNING이라는 사실은 **그 위의 작업이 살아 있다는 뜻이 아니다.** 2026-09-17에 훈련이 tmux 세션 재사용으로 죽었는데 아무도 14.5시간 동안 몰랐다. 큐는 멀쩡했고, 없었던 건 "이거 살아 있나?"를 SSH 6번 없이 묻는 방법이었다.
+
+`launch_supervised_training`은 작업을 감시견과 함께 띄우고 **상태 파일 하나**를 유지한다. 그 한 줄이 전체 답이다:
+
+```
+RUNNING run1 epoch=7/30 gpu=100% idle=0min 2026-09-18T10:00:00+09:00
+ALERT   idle 47min - log has not moved | run1 epoch=7/30 gpu=0% <ts>
+DONE    run1 rc=0 elapsed=29449s <ts>
+FAILED  run1 rc=1 elapsed=12s - tail /root/outputs/train.log <ts>
+```
+
+```
+launch_supervised_training(podId, command="python3 train.py --epochs 30",
+                           label="run1", totalSteps=30, idleAlertMinutes=25,
+                           skipIfExists="/root/outputs/predictions.json")
+→ execute_ssh_command(podId, "cat /root/outputs/STATUS")   ← 이후 상태 확인은 이 한 줄
+```
+
+**규칙:**
+- 장기 훈련을 **맨 `nohup ...`으로 띄우지 않는다.** 끝난 작업과 죽은 작업을 구분할 방법이 남지 않는다.
+- `idleAlertMinutes`는 **epoch 1회 소요 시간보다 크게** 잡는다. 로그가 안 자라는 시간으로 정체를 판정하므로, 임계가 epoch보다 짧으면 매 epoch마다 오경보가 난다.
+- `command`에 작은따옴표를 쓸 수 없다(도구가 거부한다). 따옴표가 필요하면 팟에 스크립트 파일을 두고 그걸 호출한다.
+- `skipIfExists`로 재실행을 멱등하게 만든다 — 이미 산출물이 있으면 DONE으로 건너뛴다.
+- 상태 확인 빈도는 여전히 `plan_monitoring_cadence`를 따른다. 상태 파일이 싸다고 고정 간격 polling을 하지 않는다.
+
+**좀비 함정 (이 도구가 이미 막고 있음 — 직접 스크립트를 쓸 때 주의):** 메인 셸에서 `kill -0 $PID`로 생존을 판정하면 안 된다. `kill -0`은 **종료됐으나 회수되지 않은 좀비** 자식에도 성공하고, 그 루프가 끝날 때 잡히는 종료코드는 훈련이 아니라 **루프의 것**이다. 실측: `exit 3`으로 죽은 훈련이 `DONE rc=0`으로 보고된다 — 멈추는 게 아니라 **실패를 성공으로 둔갑**시킨다. 감시견이 존재 이유 그 상황에서 조용히 실패한다. 감시견은 별도 프로세스로 두고 메인 셸은 `wait`로 회수한다(`wait`는 회수와 동시에 자식의 진짜 종료코드를 준다). 회귀 테스트로 고정되어 있다(`src/__tests__/supervised-launch.test.ts` — `wait`를 `kill -0` 폴링으로 되돌리면 실패한다).
 
 ### Background GPU Monitoring
 

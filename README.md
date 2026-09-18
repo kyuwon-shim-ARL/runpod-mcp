@@ -60,6 +60,7 @@ claude mcp add runpod --scope user \
 | `list_cpu_types` | CPU pod flavors (cpu3/cpu5 × compute/general/highmem) from static catalog |
 | `get_ssh_command` | Get SSH connection command |
 | `execute_ssh_command` | Run command on pod via SSH |
+| `launch_supervised_training` | Launch training under a watchdog; one STATUS file reports RUNNING/ALERT/DONE/FAILED |
 | `upload_files` | Upload files via rsync |
 | `download_files` | Download files via rsync |
 | `gpu_health_check` | Check GPU utilization with batch size advisor |
