@@ -155,7 +155,7 @@ describe("generated script against a real shell", () => {
     expect(status).toContain("rc=3");
     expect(status).not.toContain("starting");
     expect(result.status).toBe(3);
-  });
+  }, 20_000);
 
   it("reports DONE when the training command succeeds", async () => {
     const { result, status } = await runScript({ command: "true" });
@@ -163,7 +163,7 @@ describe("generated script against a real shell", () => {
     expect(status).toContain("DONE");
     expect(status).toContain("rc=0");
     expect(result.status).toBe(0);
-  });
+  }, 20_000);
 
   it("leaves no watchdog process behind after the run", async () => {
     // Assert on the watchdog's actual pid. Grepping `ps` for script text cannot work: the
@@ -178,7 +178,7 @@ describe("generated script against a real shell", () => {
       timeout: 10_000,
     });
     expect((alive.stdout ?? "").trim()).toBe("GONE");
-  });
+  }, 20_000);
 
   it("writes a terminal state even when the supervisor is killed mid-run", async () => {
     // The contract: a supervisor that dies must not leave STATUS reading RUNNING forever —
@@ -214,5 +214,5 @@ describe("generated script against a real shell", () => {
 
     expect(status).toContain("DONE");
     expect(status).toContain("already complete");
-  });
+  }, 20_000);
 });

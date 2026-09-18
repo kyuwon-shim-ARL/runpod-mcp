@@ -133,6 +133,9 @@ echo "RUNNING ${label} starting $(date -Is)" > "$STATUS"
 ${command} > "$LOG" 2>&1 &
 TRAIN_PID=$!
 
+# The watchdog's output is the status file, not stdout, and its stdio is detached: a
+# subshell inherits the caller's pipes, and its \`sleep\` grandchild keeps holding them after
+# the subshell is killed — which hangs anything reading this script's output to completion.
 # The watchdog is its own process and the main shell waits on training directly.
 # An earlier version polled \`kill -0\` from the main shell. \`kill -0\` succeeds on a zombie
 # (exited but unreaped) child, and the loop that ends it exits with the status of the LOOP,
@@ -155,7 +158,7 @@ TRAIN_PID=$!
       echo "RUNNING ${label} epoch=\${STEP:-0}/${total} gpu=\${GPU:-?}% idle=\${IDLE_MIN}min $(date -Is)" > "$STATUS"
     fi
   done
-) &
+) > /dev/null 2>&1 &
 WATCHDOG_PID=$!
 echo "$WATCHDOG_PID" > "$STATUS.watchdog.pid"
 
