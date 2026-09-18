@@ -211,4 +211,19 @@ describe("create_pod_auto import-readiness gate", () => {
     expect(refusals).toHaveLength(1);
     expect(createPod).toHaveBeenCalledTimes(1);
   });
+
+  it("does not poison the lock when a call fails — later calls still work", async () => {
+    // withReadinessLock shares one promise chain across calls. If a rejection were left on it,
+    // every later create_pod_auto would be permanently blocked.
+    listPods.mockResolvedValue([]);
+    // listGpuTypes rejects outside the per-DC try/catch, so the rejection reaches the lock.
+    listGpuTypes.mockRejectedValueOnce(new Error("runpod api exploded"));
+
+    await callCreatePodAuto();
+
+    listGpuTypes.mockResolvedValue([GPU_TYPE]);
+    const output = await callCreatePodAuto();
+
+    expect(output).toContain("pod-new");
+  });
 });
