@@ -493,6 +493,8 @@ export interface PodMetadataStubInput {
   image?: string;
   container_disk_gb?: number;
   network_volume?: { id: string; name: string; size_gb: number; datacenter?: string } | null;
+  /** Ties sibling pods created for the same run together (issue #14). */
+  job_group?: string | null;
 }
 
 /**
@@ -510,6 +512,7 @@ export function buildPodMetadataStub(input: PodMetadataStubInput): string {
     purpose: "<fill in: what this pod is for>",
     created_at: input.created_at,
     deleted_at: null,
+    job_group: input.job_group ?? null,
     datacenter: input.datacenter ?? null,
     compute_type: input.compute_type ?? "GPU",
   };

@@ -13,6 +13,7 @@ import { parseNvidiaSmiOutput, calcSuggestedBatchSize, isOverprovisioned, inject
 import { classifyTrainingSmoke, planMonitoringCadence, renderMonitoringCadenceSection } from "./monitoring-utils.js";
 import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRIORITY, formatDcGpuFailureMatrix, buildPodMetadataPath, toYaml, buildPodMetadataStub, parseDuBytes, parseDfAvailBytes, checkFreeSpace, checkSizeMatch, looksLikeSetupCommand, estimatePodCost } from "./pod-ops.js";
 import { CPU_FLAVORS, CPU_FLAVOR_IDS, defaultFlavorOrder } from "./cpu-catalog.js";
+import { readPodGroups, groupSiblings, renderGroupLine } from "./job-group.js";
 import { loadIdleState, saveIdleState, pruneState, judgeIdle, parseWorkProbe, renderWorkLine, WORK_PROBE_CMD, type IdleState } from "./idle-utils.js";
 
 const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
@@ -171,7 +172,23 @@ server.tool(
     const pods = await c.listPods();
     if (!pods.length) return text("No pods found.");
 
-    if (!probe) return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
+    // job_group lives in the local .omc/pods/*.yaml records, not in the RunPod API.
+    // readPodGroups is fail-soft: no records means no group lines, never an error.
+    const groups = await readPodGroups();
+    const livePodIds = pods.map((p) => p.id);
+    const groupLineFor = (podId: string) =>
+      renderGroupLine(groups[podId], groupSiblings(podId, groups, livePodIds));
+
+    if (!probe) {
+      return text(
+        pods
+          .map((p) => {
+            const groupLine = groupLineFor(p.id);
+            return groupLine ? `${podSummary(p)}\n${groupLine}` : podSummary(p);
+          })
+          .join("\n\n---\n\n")
+      );
+    }
 
     let state: IdleState = {};
     try {
@@ -225,9 +242,12 @@ server.tool(
     }
 
     const blocks = pods.map((p) => {
-      const summary = podSummary(p);
+      const lines = [podSummary(p)];
+      const groupLine = groupLineFor(p.id);
+      if (groupLine) lines.push(groupLine);
       const workLine = workLines.get(p.id);
-      return workLine ? `${summary}\n${workLine}` : summary;
+      if (workLine) lines.push(workLine);
+      return lines.join("\n");
     });
 
     const sections = [blocks.join("\n\n---\n\n")];
@@ -387,6 +407,7 @@ server.tool(
     cpuFamily: z.enum(["compute", "general", "highmem"]).optional().describe("CPU flavor family preference (cpuOnly only). compute=2GB/vCPU, general=4GB/vCPU, highmem=8GB/vCPU. Ignored when cpuFlavorIds is provided."),
     cpuFlavorIds: z.array(z.enum(CPU_FLAVOR_IDS as [string, ...string[]])).optional().describe("CPU flavor IDs in priority order (cpuOnly only). When provided, cpuFlavorPriority is set to 'custom' (RunPod honors the order). Defaults to cpu5 then cpu3 in the chosen family. Run list_cpu_types for valid IDs."),
     vcpuCount: z.number().int().positive().max(128).default(2).describe("vCPU count for CPU pod (cpuOnly only). Default 2, max 128."),
+    jobGroup: z.string().optional().describe("Group label for pods created for the same run (e.g. 'lopo-s123'). Pass the SAME value for every sibling pod; it lands in the metadata stub and list_pods shows live siblings. Without it, a job with 3 pods and 1 record is unattributable later."),
   },
   safeTool(async (args) => {
     // CPU-only short-circuit. Skips GPU stock probing, cost gate, NV readiness — CPU pods
@@ -458,6 +479,7 @@ server.tool(
             network_volume: args.networkVolumeId
               ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc }
               : null,
+            job_group: args.jobGroup ?? null,
           });
           const assignedNote = assignedFlavor && !flavorIds.includes(assignedFlavor)
             ? ` (RunPod picked ${assignedFlavor}, not in requested list — verify if intentional)`
@@ -647,6 +669,7 @@ server.tool(
               network_volume: args.networkVolumeId
                 ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc }
                 : null,
+              job_group: args.jobGroup ?? null,
             });
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})\n` +
@@ -672,6 +695,7 @@ server.tool(
             network_volume: args.networkVolumeId
               ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc }
               : null,
+            job_group: args.jobGroup ?? null,
           });
           return text(
             `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}\n${podSummary(pod)}\n\n` +
@@ -878,6 +902,7 @@ const podMetadataSchema = z
     purpose: z.string().optional().describe("One-line description of what this pod is for"),
     created_at: z.string().optional().describe("ISO timestamp when the pod was created (drives the filename date stamp; defaults to today)"),
     deleted_at: z.string().nullable().optional().describe("ISO timestamp when the pod was deleted (null while still alive)"),
+    job_group: z.string().nullable().optional().describe("Groups sibling pods created for the same run (e.g. 'lopo-s123'). Set the SAME value on every pod of the job so the records say which pods belonged together — without it, 'delete the pods for this job' is guesswork."),
     datacenter: z.string().optional(),
     gpu: z.string().optional().describe("e.g. 'NVIDIA GeForce RTX 4090 (24GB)'"),
     gpu_count: z.number().optional(),
