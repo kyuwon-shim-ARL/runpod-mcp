@@ -95,6 +95,50 @@ describe("list_pods idle signal", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("shows the job_group line and live siblings from .omc/pods records", async () => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { toYaml } = await import("../pod-ops.js");
+    await mkdir(".omc/pods", { recursive: true });
+    await writeFile(
+      ".omc/pods/a.yaml",
+      toYaml({ pod_id: "pod-active", name: "a", job_group: "lopo-s123" }),
+      "utf8"
+    );
+    await writeFile(
+      ".omc/pods/b.yaml",
+      toYaml({ pod_id: "pod-idle", name: "b", job_group: "lopo-s123" }),
+      "utf8"
+    );
+    listPods.mockResolvedValueOnce([ACTIVE_POD, IDLE_POD]);
+    spawnAsync.mockResolvedValue(ok(activeOutput));
+
+    const result = await callListPods();
+    const output = result.content[0].text as string;
+    expect(output).toContain("Group: lopo-s123 (siblings live: pod-idle)");
+    expect(output).toContain("Group: lopo-s123 (siblings live: pod-active)");
+  });
+
+  it("omits the group line when there are no pod records", async () => {
+    listPods.mockResolvedValueOnce([ACTIVE_POD]);
+    spawnAsync.mockResolvedValueOnce(ok(activeOutput));
+
+    const result = await callListPods();
+    expect(result.content[0].text as string).not.toContain("Group:");
+  });
+
+  it("shows the group line even with probe disabled", async () => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { toYaml } = await import("../pod-ops.js");
+    await mkdir(".omc/pods", { recursive: true });
+    await writeFile(".omc/pods/a.yaml", toYaml({ pod_id: "pod-active", name: "a", job_group: "g1" }), "utf8");
+    listPods.mockResolvedValueOnce([ACTIVE_POD]);
+
+    const result = await callListPods({ probe: false });
+    const output = result.content[0].text as string;
+    expect(output).toContain("Group: g1 (no live siblings)");
+    expect(spawnAsync).not.toHaveBeenCalled();
+  });
+
   it("shows ACTIVE line for a working pod", async () => {
     listPods.mockResolvedValueOnce([ACTIVE_POD]);
     spawnAsync.mockResolvedValueOnce(ok(activeOutput));

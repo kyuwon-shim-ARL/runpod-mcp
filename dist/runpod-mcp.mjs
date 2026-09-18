@@ -20986,7 +20986,7 @@ var StdioServerTransport = class {
 };
 
 // src/index.ts
-import { mkdir as mkdir2, writeFile as writeFile2, readFile as readFile2 } from "node:fs/promises";
+import { mkdir as mkdir2, writeFile as writeFile2, readFile as readFile3 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname as dirname2, isAbsolute, resolve } from "node:path";
 
@@ -21947,6 +21947,7 @@ function buildPodMetadataStub(input) {
     purpose: "<fill in: what this pod is for>",
     created_at: input.created_at,
     deleted_at: null,
+    job_group: input.job_group ?? null,
     datacenter: input.datacenter ?? null,
     compute_type: input.compute_type ?? "GPU"
   };
@@ -22051,8 +22052,55 @@ function defaultFlavorOrder(family) {
   return [...pool].sort((a, b) => a.generation < b.generation ? 1 : a.generation > b.generation ? -1 : 0).map((f) => f.id);
 }
 
+// src/job-group.ts
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+var POD_METADATA_DIR = ".omc/pods";
+function topLevelScalar(content, key) {
+  for (const line of content.split("\n")) {
+    if (line.startsWith(" ") || line.startsWith("-") || line.startsWith("	")) continue;
+    const match = line.match(/^([A-Za-z_][\w-]*):\s*(.*)$/);
+    if (!match || match[1] !== key) continue;
+    const raw = match[2].trim();
+    if (raw === "" || raw === "null" || raw === "~") return void 0;
+    return raw.replace(/^["'](.*)["']$/, "$1");
+  }
+  return void 0;
+}
+async function readPodGroups(dir = POD_METADATA_DIR) {
+  let files;
+  try {
+    files = await readdir(dir);
+  } catch {
+    return {};
+  }
+  const groups = {};
+  for (const file of files) {
+    if (!file.endsWith(".yaml") && !file.endsWith(".yml")) continue;
+    try {
+      const content = await readFile(join(dir, file), "utf8");
+      const podId = topLevelScalar(content, "pod_id");
+      const group = topLevelScalar(content, "job_group");
+      if (podId && group) groups[podId] = group;
+    } catch {
+      continue;
+    }
+  }
+  return groups;
+}
+function groupSiblings(podId, groups, livePodIds) {
+  const group = groups[podId];
+  if (!group) return [];
+  const live = new Set(livePodIds);
+  return Object.entries(groups).filter(([id, g]) => g === group && id !== podId && live.has(id)).map(([id]) => id);
+}
+function renderGroupLine(group, siblings) {
+  if (!group) return "";
+  return siblings.length > 0 ? `Group: ${group} (siblings live: ${siblings.join(", ")})` : `Group: ${group} (no live siblings)`;
+}
+
 // src/idle-utils.ts
-import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { mkdir, readFile as readFile2, writeFile, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 var VRAM_FLOOR_MB_DEFAULT = 100;
 function isWorking(s, vramFloorMb = VRAM_FLOOR_MB_DEFAULT) {
@@ -22138,7 +22186,7 @@ function parseWorkProbe(stdout) {
 var IDLE_STATE_PATH = ".omc/gpu-exec/idle-state.json";
 async function loadIdleState(path = IDLE_STATE_PATH) {
   try {
-    const raw = await readFile(path, "utf8");
+    const raw = await readFile2(path, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") return parsed;
     return {};
@@ -22228,7 +22276,7 @@ async function readSshPubKey() {
   if (!keyPath) return void 0;
   const pubPath = keyPath.endsWith(".pub") ? keyPath : keyPath + ".pub";
   try {
-    const content = await readFile2(pubPath, "utf8");
+    const content = await readFile3(pubPath, "utf8");
     return content.trim();
   } catch {
     return void 0;
@@ -22258,7 +22306,18 @@ server.tool(
     const c = requireClient();
     const pods = await c.listPods();
     if (!pods.length) return text("No pods found.");
-    if (!probe) return text(pods.map((p) => podSummary(p)).join("\n\n---\n\n"));
+    const groups = await readPodGroups();
+    const livePodIds = pods.map((p) => p.id);
+    const groupLineFor = (podId) => renderGroupLine(groups[podId], groupSiblings(podId, groups, livePodIds));
+    if (!probe) {
+      return text(
+        pods.map((p) => {
+          const groupLine = groupLineFor(p.id);
+          return groupLine ? `${podSummary(p)}
+${groupLine}` : podSummary(p);
+        }).join("\n\n---\n\n")
+      );
+    }
     let state = {};
     try {
       state = await loadIdleState();
@@ -22302,10 +22361,12 @@ server.tool(
     } catch {
     }
     const blocks = pods.map((p) => {
-      const summary = podSummary(p);
+      const lines = [podSummary(p)];
+      const groupLine = groupLineFor(p.id);
+      if (groupLine) lines.push(groupLine);
       const workLine = workLines.get(p.id);
-      return workLine ? `${summary}
-${workLine}` : summary;
+      if (workLine) lines.push(workLine);
+      return lines.join("\n");
     });
     const sections = [blocks.join("\n\n---\n\n")];
     if (sustainedIds.length) {
@@ -22437,7 +22498,8 @@ server.tool(
     cpuOnly: external_exports.boolean().default(false).describe("Create a CPU-only pod (no GPU). Skips GPU stock probing and cost safety gates. Use list_cpu_types to see flavor options."),
     cpuFamily: external_exports.enum(["compute", "general", "highmem"]).optional().describe("CPU flavor family preference (cpuOnly only). compute=2GB/vCPU, general=4GB/vCPU, highmem=8GB/vCPU. Ignored when cpuFlavorIds is provided."),
     cpuFlavorIds: external_exports.array(external_exports.enum(CPU_FLAVOR_IDS)).optional().describe("CPU flavor IDs in priority order (cpuOnly only). When provided, cpuFlavorPriority is set to 'custom' (RunPod honors the order). Defaults to cpu5 then cpu3 in the chosen family. Run list_cpu_types for valid IDs."),
-    vcpuCount: external_exports.number().int().positive().max(128).default(2).describe("vCPU count for CPU pod (cpuOnly only). Default 2, max 128.")
+    vcpuCount: external_exports.number().int().positive().max(128).default(2).describe("vCPU count for CPU pod (cpuOnly only). Default 2, max 128."),
+    jobGroup: external_exports.string().optional().describe("Group label for pods created for the same run (e.g. 'lopo-s123'). Pass the SAME value for every sibling pod; it lands in the metadata stub and list_pods shows live siblings. Without it, a job with 3 pods and 1 record is unattributable later.")
   },
   safeTool(async (args) => {
     if (args.cpuOnly) {
@@ -22501,7 +22563,8 @@ Note: RunPod does not expose CPU pricing via API. Verify on console.runpod.io/po
             // RunPod returns this on pod creation
             image: args.imageName,
             container_disk_gb: args.containerDiskInGb,
-            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
+            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
+            job_group: args.jobGroup ?? null
           });
           const assignedNote = assignedFlavor && !flavorIds.includes(assignedFlavor) ? ` (RunPod picked ${assignedFlavor}, not in requested list \u2014 verify if intentional)` : assignedFlavor ? ` (RunPod assigned ${assignedFlavor})` : "";
           return text(
@@ -22547,7 +22610,7 @@ Try overriding dcPriority or widening cpuFlavorIds. Run list_cpu_types for optio
       }
       try {
         const tokenPath = `${NV_READY_DIR}/nv_ready_${args.networkVolumeId}.json`;
-        const tokenRaw = await readFile2(tokenPath, "utf-8");
+        const tokenRaw = await readFile3(tokenPath, "utf-8");
         const tokenData = JSON.parse(tokenRaw);
         if (tokenData.token !== args.nvReadinessToken) {
           return text(`\u274C NV readiness token mismatch for volume ${args.networkVolumeId}. Re-run verify_data_on_nv to get a fresh token.`);
@@ -22679,7 +22742,8 @@ Note: per-DC stock cannot be probed without creating a pod. Real run will iterat
               cost_per_hr: bidPrice,
               image: args.imageName,
               container_disk_gb: args.containerDiskInGb,
-              network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
+              network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
+              job_group: args.jobGroup ?? null
             });
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})
@@ -22708,7 +22772,8 @@ ${stub2}
             cost_per_hr: ondemandPrice,
             image: args.imageName,
             container_disk_gb: args.containerDiskInGb,
-            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null
+            network_volume: args.networkVolumeId ? { id: args.networkVolumeId, name: "<lookup with get_network_volume>", size_gb: 0, datacenter: dc } : null,
+            job_group: args.jobGroup ?? null
           });
           return text(
             `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}
@@ -22899,6 +22964,7 @@ var podMetadataSchema = external_exports.object({
   purpose: external_exports.string().optional().describe("One-line description of what this pod is for"),
   created_at: external_exports.string().optional().describe("ISO timestamp when the pod was created (drives the filename date stamp; defaults to today)"),
   deleted_at: external_exports.string().nullable().optional().describe("ISO timestamp when the pod was deleted (null while still alive)"),
+  job_group: external_exports.string().nullable().optional().describe("Groups sibling pods created for the same run (e.g. 'lopo-s123'). Set the SAME value on every pod of the job so the records say which pods belonged together \u2014 without it, 'delete the pods for this job' is guesswork."),
   datacenter: external_exports.string().optional(),
   gpu: external_exports.string().optional().describe("e.g. 'NVIDIA GeForce RTX 4090 (24GB)'"),
   gpu_count: external_exports.number().optional(),
@@ -24039,7 +24105,7 @@ server.tool(
     }
     if (requirementsPath) {
       try {
-        const content = await readFile2(requirementsPath, "utf-8");
+        const content = await readFile3(requirementsPath, "utf-8");
         const lines2 = content.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#"));
         const issues = [];
         for (const line of lines2) {
@@ -24251,7 +24317,7 @@ server.tool(
   safeTool(async ({ podIds, intervalMinutes, idleThresholdPct, idleConsecutiveChecks, mode, expectedCompletionAt }) => {
     const pidFile = `${NV_READY_DIR}/watcher.pid`;
     try {
-      const existingPid = (await readFile2(pidFile, "utf-8")).trim();
+      const existingPid = (await readFile3(pidFile, "utf-8")).trim();
       const checkResult = await spawnAsync("kill", ["-0", existingPid], { timeout: 5e3 });
       if (checkResult.status === 0) {
         return text(`\u274C Watcher already running (PID ${existingPid}). Call stop_watching_pods() first.`);
@@ -24300,7 +24366,7 @@ server.tool(
     const pidFile = `${NV_READY_DIR}/watcher.pid`;
     let pid;
     try {
-      pid = (await readFile2(pidFile, "utf-8")).trim();
+      pid = (await readFile3(pidFile, "utf-8")).trim();
     } catch {
       return text("No watcher running (PID file not found).");
     }
@@ -24336,7 +24402,7 @@ server.tool(
     const eventsFile = `${NV_READY_DIR}/events.jsonl`;
     let raw;
     try {
-      raw = await readFile2(eventsFile, "utf-8");
+      raw = await readFile3(eventsFile, "utf-8");
     } catch {
       return text("No events file found. Start a watcher with watch_running_pods() first.");
     }
