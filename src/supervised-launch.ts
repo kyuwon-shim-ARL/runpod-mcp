@@ -101,6 +101,9 @@ export function buildSupervisedScript(options: SupervisedScriptOptions): string 
     assertNoNewline(value, field);
   }
 
+  // `[ "$X" -ge "$Y" ]` errors on a non-integer and falls to the else branch, which would
+  // silently disable the ALERT path — the one thing the watchdog is for.
+  const alertMinutes = Math.max(1, Math.round(idleAlertMinutes));
   const total = totalSteps ? String(totalSteps) : "?";
 
   const skipBlock = skipIfExists
@@ -119,7 +122,7 @@ set -u
 
 STATUS='${statusPath}'
 LOG='${logPath}'
-IDLE_ALERT_MIN=${idleAlertMinutes}
+IDLE_ALERT_MIN=${alertMinutes}
 
 mkdir -p "$(dirname "$STATUS")" "$(dirname "$LOG")"
 cd '${workingDir}' || { echo "FAILED ${label} rc=1 - no such directory ${workingDir} $(date -Is)" > "$STATUS"; exit 1; }
@@ -131,10 +134,11 @@ ${command} > "$LOG" 2>&1 &
 TRAIN_PID=$!
 
 # The watchdog is its own process and the main shell waits on training directly.
-# An earlier version polled \`kill -0\` from the main shell: that succeeds on a zombie
-# (exited but unreaped) child, so when training died the loop spun forever and STATUS
-# never left "starting" — the watchdog failed in exactly the case it existed for.
-# \`wait\` reaps, so the main shell learns the truth the moment the process ends.
+# An earlier version polled \`kill -0\` from the main shell. \`kill -0\` succeeds on a zombie
+# (exited but unreaped) child, and the loop that ends it exits with the status of the LOOP,
+# not of the training run — so a run that exited 3 was reported as "DONE rc=0". Measured:
+# the failure is a false success, not a hang. The watchdog failed in exactly the case it
+# existed for. \`wait\` reaps AND yields the child's real exit status.
 (
   while :; do
     sleep 60
@@ -144,7 +148,7 @@ TRAIN_PID=$!
     MTIME=$(stat -c %Y "$LOG" 2>/dev/null || echo "$NOW")
     IDLE_MIN=$(( (NOW - MTIME) / 60 ))
     GPU=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader 2>/dev/null | head -1 | tr -d ' %')
-    STEP=$(grep -oE '${progressPattern}' "$LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+')
+    STEP=$(grep -oE '${progressPattern}' "$LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+' | head -1)
     if [ "$IDLE_MIN" -ge "$IDLE_ALERT_MIN" ]; then
       echo "ALERT idle \${IDLE_MIN}min - log has not moved | ${label} epoch=\${STEP:-?}/${total} gpu=\${GPU:-?}% $(date -Is)" > "$STATUS"
     else
@@ -153,8 +157,21 @@ TRAIN_PID=$!
   done
 ) &
 WATCHDOG_PID=$!
+echo "$WATCHDOG_PID" > "$STATUS.watchdog.pid"
+
+# If the supervisor itself is killed (OOM killer is the realistic case), nothing would
+# otherwise write a terminal state and STATUS would read RUNNING forever — a status file
+# that lies is worse than none.
+cleanup() {
+  kill "$WATCHDOG_PID" 2>/dev/null
+  if [ "\${FINISHED:-0}" -eq 0 ]; then
+    echo "FAILED ${label} rc=143 - supervisor terminated before the run ended $(date -Is)" > "$STATUS"
+  fi
+}
+trap cleanup TERM INT HUP EXIT
 
 wait "$TRAIN_PID"; RC=$?
+FINISHED=1
 kill "$WATCHDOG_PID" 2>/dev/null
 wait "$WATCHDOG_PID" 2>/dev/null
 ELAPSED=$((SECONDS-T0))
@@ -162,7 +179,6 @@ if [ "$RC" -eq 0 ]; then
   echo "DONE ${label} rc=0 elapsed=\${ELAPSED}s $(date -Is)" > "$STATUS"
 else
   echo "FAILED ${label} rc=$RC elapsed=\${ELAPSED}s - tail $LOG $(date -Is)" > "$STATUS"
-  tail -30 "$LOG"
 fi
 exit "$RC"
 `;

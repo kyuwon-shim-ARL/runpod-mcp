@@ -166,13 +166,45 @@ describe("generated script against a real shell", () => {
   });
 
   it("leaves no watchdog process behind after the run", async () => {
+    // Assert on the watchdog's actual pid. Grepping `ps` for script text cannot work: the
+    // watchdog is a `( ... ) &` subshell, which inherits its parent's argv, so the script's
+    // own text never appears in any process's args and such a probe always reports zero.
     await runScript({ command: "true" });
 
-    const ps = await spawnAsync("bash", ["-c", "ps -eo args | grep -c '[I]DLE_ALERT_MIN' || true"], {
+    const pid = (await readFile(join(dir, "STATUS.watchdog.pid"), "utf8")).trim();
+    expect(pid).toMatch(/^\d+$/);
+
+    const alive = await spawnAsync("bash", ["-c", `kill -0 ${pid} 2>/dev/null && echo ALIVE || echo GONE`], {
       timeout: 10_000,
     });
-    expect((ps.stdout ?? "").trim()).toBe("0");
+    expect((alive.stdout ?? "").trim()).toBe("GONE");
   });
+
+  it("writes a terminal state even when the supervisor is killed mid-run", async () => {
+    // The contract: a supervisor that dies must not leave STATUS reading RUNNING forever —
+    // a status file that lies is worse than no status file. On SIGTERM bash's `wait` returns
+    // 143 and the normal FAILED path covers it; the EXIT trap covers a signal that arrives
+    // outside `wait`. Either way the terminal state must be written.
+    const statusPath = join(dir, "STATUS");
+    const script = buildSupervisedScript({
+      command: "sleep 5",
+      statusPath,
+      logPath: join(dir, "train.log"),
+      label: "killed",
+      workingDir: dir,
+    });
+    const scriptPath = join(dir, "run.sh");
+    await writeFile(scriptPath, script, "utf8");
+
+    // Redirect to /dev/null so the orphaned training child does not hold the stdout pipe
+    // open and keep spawnAsync waiting for it.
+    const killer = `bash '${scriptPath}' >/dev/null 2>&1 & SUP=$!; sleep 1; kill -TERM $SUP; wait $SUP 2>/dev/null; true`;
+    await spawnAsync("bash", ["-c", killer], { timeout: 20_000 });
+
+    const status = await readFile(statusPath, "utf8");
+    expect(status).toContain("FAILED");
+    expect(status).not.toContain("RUNNING");
+  }, 20_000);
 
   it("skips and reports DONE when skipIfExists already exists", async () => {
     const done = join(dir, "predictions.json");

@@ -1248,8 +1248,8 @@ server.tool(
     statusPath: z.string().default("/root/outputs/STATUS").describe("Absolute path on the pod for the status file"),
     logPath: z.string().default("/root/outputs/train.log").describe("Absolute path on the pod for the training log"),
     workingDir: z.string().default("/workspace").describe("Directory to run the command from"),
-    idleAlertMinutes: z.number().default(25).describe("Minutes without log growth before STATUS flips to ALERT. Set above your per-epoch time — an epoch that takes 16 min makes 25 a real stall, 10 a false alarm."),
-    totalSteps: z.number().optional().describe("Total epochs/steps, rendered as the denominator in the status line"),
+    idleAlertMinutes: z.number().int().positive().default(25).describe("Minutes without log growth before STATUS flips to ALERT. Set above your per-epoch time — an epoch that takes 16 min makes 25 a real stall, 10 a false alarm."),
+    totalSteps: z.number().int().positive().optional().describe("Total epochs/steps, rendered as the denominator in the status line"),
     progressPattern: z.string().default("Epoch [0-9]+").describe("grep -oE pattern whose last match's number becomes the progress figure"),
     skipIfExists: z.string().optional().describe("If this path already exists on the pod, report DONE and skip — makes a relaunch idempotent"),
   },
@@ -1270,13 +1270,28 @@ server.tool(
     }
 
     // base64 the script so nothing in it is reinterpreted by the outer shell.
+    //
+    // The `{ ...; } &` braces matter: `A && B && nohup C & echo LAUNCHED` would background the
+    // WHOLE && list, so the echo ran unconditionally and the tool reported a successful launch
+    // even when the script was never written — the same silent-success failure this feature
+    // exists to eliminate. Confining `&` to the launch keeps the && chain gating the echo.
     const scriptPath = `/root/.runpod-mcp/${label}.sh`;
     const b64 = Buffer.from(script).toString("base64");
-    const install = `mkdir -p /root/.runpod-mcp && echo ${b64} | base64 -d > '${scriptPath}' && chmod +x '${scriptPath}' && ` +
-      `nohup bash '${scriptPath}' > /dev/null 2>&1 & echo LAUNCHED $!`;
+    const install =
+      `if [ -f '${statusPath}' ] && grep -q '^RUNNING' '${statusPath}' 2>/dev/null; then echo ALREADY_RUNNING; exit 1; fi && ` +
+      `mkdir -p /root/.runpod-mcp && echo ${b64} | base64 -d > '${scriptPath}' && chmod +x '${scriptPath}' && ` +
+      `test -s '${scriptPath}' && { nohup setsid bash '${scriptPath}' > /dev/null 2>&1 & } && echo LAUNCHED`;
 
     const result = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", install], { timeout: 60_000 });
     if (result.error) return text(`❌ SSH error: ${result.error.message}`);
+    if ((result.stdout ?? "").includes("ALREADY_RUNNING")) {
+      return text(
+        `❌ ${statusPath} already reads RUNNING — a job with this label looks alive on ${podId}.\n` +
+          `Relaunching would overwrite its script and its status, leaving the running job unattributable.\n\n` +
+          `→ execute_ssh_command(podId: "${podId}", command: "cat ${statusPath}")  ← check what is running\n` +
+          `→ then either use a different label, or remove ${statusPath} if the job is known dead.`
+      );
+    }
     if (!(result.stdout ?? "").includes("LAUNCHED")) {
       return text(`❌ Launch failed (exit ${result.status}).\n\nStderr:\n${result.stderr}\n\nStdout:\n${result.stdout}`);
     }
