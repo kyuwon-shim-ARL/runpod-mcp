@@ -206,6 +206,44 @@ describe("generated script against a real shell", () => {
     expect(status).not.toContain("RUNNING");
   }, 20_000);
 
+  it("returns as soon as training ends, without waiting on the watchdog's sleep", async () => {
+    // The watchdog is a `( ... ) &` subshell: it inherits the caller's stdout pipe, and its
+    // `sleep` grandchild keeps holding that pipe after the subshell is killed. Anything
+    // reading this script's output to completion — the harness here, execute_ssh_command on
+    // a pod — would then hang for up to a full watchdog interval. Its stdio is detached;
+    // reverting that makes this test hang.
+    const statusPath = join(dir, "STATUS");
+    const script = buildSupervisedScript({
+      command: "sleep 2",
+      statusPath,
+      logPath: join(dir, "train.log"),
+      label: "piped",
+      workingDir: dir,
+    });
+    const scriptPath = join(dir, "run.sh");
+    await writeFile(scriptPath, script, "utf8");
+
+    const started = Date.now();
+    // `| cat` forces the output to be read to EOF, which is what exposes a held pipe.
+    await spawnAsync("bash", ["-c", `bash '${scriptPath}' | cat`], { timeout: 30_000 });
+    const elapsedMs = Date.now() - started;
+
+    expect(await readFile(statusPath, "utf8")).toContain("DONE");
+    // Training takes 2s; a held pipe would drag this out to the watchdog's 60s interval.
+    expect(elapsedMs).toBeLessThan(20_000);
+  }, 40_000);
+
+  it("captures output from every statement of a multi-statement command", async () => {
+    // Bash binds a redirection to the last simple command of a `;`-list, so an unbraced
+    // `a; b > "$LOG" &` loses a's output to the launcher's /dev/null.
+    const logPath = join(dir, "train.log");
+    await runScript({ command: "echo first_statement; echo second_statement", logPath });
+
+    const log = await readFile(logPath, "utf8");
+    expect(log).toContain("first_statement");
+    expect(log).toContain("second_statement");
+  }, 20_000);
+
   it("skips and reports DONE when skipIfExists already exists", async () => {
     const done = join(dir, "predictions.json");
     await writeFile(done, "{}", "utf8");

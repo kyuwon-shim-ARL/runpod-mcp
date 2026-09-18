@@ -112,6 +112,25 @@ describe("launch_supervised_training", () => {
     expect(output).not.toContain("✅");
   });
 
+  it("refuses to relaunch over a job whose STATUS still reads RUNNING", async () => {
+    // Relaunching with a live label would overwrite the running job's script and its status,
+    // leaving the job that is actually burning GPU time unattributable.
+    spawnAsync.mockResolvedValue(ok("ALREADY_RUNNING\n"));
+
+    const output = await callLaunch();
+
+    expect(output).toContain("already reads RUNNING");
+    expect(output).toContain("cat /root/outputs/STATUS");
+    expect(output).not.toContain("✅");
+  });
+
+  it("guards the relaunch with a STATUS check before writing anything", async () => {
+    await callLaunch();
+    const command = spawnAsync.mock.calls[0][1].at(-1) as string;
+    // The guard must come before the script is written, or the overwrite has already happened.
+    expect(command.indexOf("ALREADY_RUNNING")).toBeLessThan(command.indexOf("base64 -d"));
+  });
+
   it("refuses a pod that is not SSH-ready", async () => {
     getPod.mockResolvedValue({ ...POD, publicIp: undefined, portMappings: undefined });
 

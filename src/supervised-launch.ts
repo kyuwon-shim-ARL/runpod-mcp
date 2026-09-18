@@ -130,7 +130,10 @@ ${skipBlock}
 T0=$SECONDS
 echo "RUNNING ${label} starting $(date -Is)" > "$STATUS"
 
-${command} > "$LOG" 2>&1 &
+# Braces so the redirection covers the whole command. Bash binds a redirection to the LAST
+# simple command of a \`;\`-list, so \`a; b > "\$LOG" &\` would send a's output to the launcher's
+# /dev/null and lose it — the log would be missing exactly the setup lines you need.
+{ ${command} ; } > "$LOG" 2>&1 &
 TRAIN_PID=$!
 
 # The watchdog's output is the status file, not stdout, and its stdio is detached: a
