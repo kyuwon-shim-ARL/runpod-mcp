@@ -50,6 +50,39 @@ describe("buildSupervisedScript", () => {
   it("rejects a command containing a single quote, which would break the quoting", () => {
     expect(() => buildSupervisedScript({ ...base, command: "python3 -c 'x'" })).toThrow(/single quote/i);
   });
+
+  it("rejects a multi-line command — $! would capture the wrong process", () => {
+    // `cmd\nother > "$LOG" &` backgrounds only the last line, so TRAIN_PID points at
+    // something that is not the training run and the watchdog supervises the wrong thing.
+    expect(() => buildSupervisedScript({ ...base, command: "python3 a.py\npython3 b.py" })).toThrow(
+      /single line/i
+    );
+    expect(() => buildSupervisedScript({ ...base, command: "python3 a.py\r\npython3 b.py" })).toThrow(
+      /single line/i
+    );
+  });
+
+  it("rejects a newline in a path, which would split the generated script", () => {
+    expect(() => buildSupervisedScript({ ...base, statusPath: "/out/S\nid" })).toThrow(/single line/i);
+    expect(() => buildSupervisedScript({ ...base, logPath: "/out/L\nid" })).toThrow(/single line/i);
+    expect(() => buildSupervisedScript({ ...base, workingDir: "/w\nid" })).toThrow(/single line/i);
+    expect(() => buildSupervisedScript({ ...base, skipIfExists: "/d\nid" })).toThrow(/single line/i);
+  });
+
+  it("rejects a label that would escape the script directory", () => {
+    // label lands in /root/.runpod-mcp/<label>.sh on the pod, as root.
+    expect(() => buildSupervisedScript({ ...base, label: "../../etc/cron.d/x" })).toThrow(/label must match/i);
+    expect(() => buildSupervisedScript({ ...base, label: "a/b" })).toThrow(/label must match/i);
+    expect(() => buildSupervisedScript({ ...base, label: ".." })).toThrow(/label must match/i);
+    expect(() => buildSupervisedScript({ ...base, label: "a b" })).toThrow(/label must match/i);
+    expect(() => buildSupervisedScript({ ...base, label: "" })).toThrow(/label must match/i);
+  });
+
+  it("accepts ordinary labels", () => {
+    for (const label of ["run1", "clean-lopo_s123", "e219.arm-A"]) {
+      expect(() => buildSupervisedScript({ ...base, label })).not.toThrow();
+    }
+  });
 });
 
 describe("parseStatusLine", () => {

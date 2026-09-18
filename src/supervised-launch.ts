@@ -58,6 +58,28 @@ function assertNoSingleQuote(value: string, field: string): void {
   }
 }
 
+/**
+ * A newline would split the value across shell lines. In the command that is not cosmetic:
+ * `cmd\nother > "$LOG" &` backgrounds only the last line, so `$!` captures the wrong process
+ * and the watchdog supervises something that is not the training run.
+ */
+function assertNoNewline(value: string, field: string): void {
+  if (/[\r\n]/.test(value)) {
+    throw new Error(
+      `${field} must be a single line. A newline splits the generated script, and in the command it makes $! capture the wrong process — the watchdog would supervise the wrong thing. Put multi-line work in a script file on the pod and call that instead.`
+    );
+  }
+}
+
+/** label names a file on the pod, so it may not traverse paths or carry shell-significant text. */
+function assertSafeLabel(label: string): void {
+  if (!/^[A-Za-z0-9._-]+$/.test(label) || label === "." || label === "..") {
+    throw new Error(
+      `label must match [A-Za-z0-9._-]+ (got: ${label}). It names the script file on the pod, so a path separator would write outside the intended directory.`
+    );
+  }
+}
+
 export function buildSupervisedScript(options: SupervisedScriptOptions): string {
   const {
     command,
@@ -71,11 +93,13 @@ export function buildSupervisedScript(options: SupervisedScriptOptions): string 
     totalSteps,
   } = options;
 
-  assertNoSingleQuote(command, "command");
-  for (const [field, value] of Object.entries({ statusPath, logPath, label, workingDir, progressPattern })) {
-    assertNoSingleQuote(String(value), field);
+  assertSafeLabel(label);
+  const guarded: Record<string, string> = { command, statusPath, logPath, workingDir, progressPattern };
+  if (skipIfExists) guarded.skipIfExists = skipIfExists;
+  for (const [field, value] of Object.entries(guarded)) {
+    assertNoSingleQuote(value, field);
+    assertNoNewline(value, field);
   }
-  if (skipIfExists) assertNoSingleQuote(skipIfExists, "skipIfExists");
 
   const total = totalSteps ? String(totalSteps) : "?";
 

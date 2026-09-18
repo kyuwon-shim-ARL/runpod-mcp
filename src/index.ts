@@ -1243,8 +1243,8 @@ server.tool(
   "Launch a long-running training command on a pod under a watchdog. The job runs detached and a single STATUS file on the pod answers RUNNING/ALERT/DONE/FAILED with progress, GPU util and log-stall minutes — one read replaces polling several things over SSH. Prefer this over a bare `nohup ...` launch via execute_ssh_command: a bare launch leaves no way to tell a finished job from a dead one.",
   {
     podId: z.string(),
-    command: z.string().describe("The training command, run from workingDir (e.g. 'python3 train.py --epochs 30'). Must not contain a single quote — put quoted parts in a script file on the pod and call that."),
-    label: z.string().default("run").describe("Short name for this run, shown in every STATUS line so one file is attributable"),
+    command: z.string().describe("The training command, run from workingDir (e.g. 'python3 train.py --epochs 30'). Must be a single line with no single quote — a newline would make the watchdog supervise the wrong process. Put multi-line or quoted work in a script file on the pod and call that."),
+    label: z.string().default("run").describe("Short name for this run, shown in every STATUS line so one file is attributable. Also names the script file on the pod, so it must match [A-Za-z0-9._-]+."),
     statusPath: z.string().default("/root/outputs/STATUS").describe("Absolute path on the pod for the status file"),
     logPath: z.string().default("/root/outputs/train.log").describe("Absolute path on the pod for the training log"),
     workingDir: z.string().default("/workspace").describe("Directory to run the command from"),

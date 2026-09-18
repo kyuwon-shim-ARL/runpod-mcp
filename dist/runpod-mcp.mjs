@@ -22107,6 +22107,20 @@ function assertNoSingleQuote(value, field) {
     );
   }
 }
+function assertNoNewline(value, field) {
+  if (/[\r\n]/.test(value)) {
+    throw new Error(
+      `${field} must be a single line. A newline splits the generated script, and in the command it makes $! capture the wrong process \u2014 the watchdog would supervise the wrong thing. Put multi-line work in a script file on the pod and call that instead.`
+    );
+  }
+}
+function assertSafeLabel(label) {
+  if (!/^[A-Za-z0-9._-]+$/.test(label) || label === "." || label === "..") {
+    throw new Error(
+      `label must match [A-Za-z0-9._-]+ (got: ${label}). It names the script file on the pod, so a path separator would write outside the intended directory.`
+    );
+  }
+}
 function buildSupervisedScript(options) {
   const {
     command,
@@ -22119,11 +22133,13 @@ function buildSupervisedScript(options) {
     progressPattern = "Epoch [0-9]+",
     totalSteps
   } = options;
-  assertNoSingleQuote(command, "command");
-  for (const [field, value] of Object.entries({ statusPath, logPath, label, workingDir, progressPattern })) {
-    assertNoSingleQuote(String(value), field);
+  assertSafeLabel(label);
+  const guarded = { command, statusPath, logPath, workingDir, progressPattern };
+  if (skipIfExists) guarded.skipIfExists = skipIfExists;
+  for (const [field, value] of Object.entries(guarded)) {
+    assertNoSingleQuote(value, field);
+    assertNoNewline(value, field);
   }
-  if (skipIfExists) assertNoSingleQuote(skipIfExists, "skipIfExists");
   const total = totalSteps ? String(totalSteps) : "?";
   const skipBlock = skipIfExists ? `
 if [ -e '${skipIfExists}' ]; then
@@ -23398,8 +23414,8 @@ server.tool(
   "Launch a long-running training command on a pod under a watchdog. The job runs detached and a single STATUS file on the pod answers RUNNING/ALERT/DONE/FAILED with progress, GPU util and log-stall minutes \u2014 one read replaces polling several things over SSH. Prefer this over a bare `nohup ...` launch via execute_ssh_command: a bare launch leaves no way to tell a finished job from a dead one.",
   {
     podId: external_exports.string(),
-    command: external_exports.string().describe("The training command, run from workingDir (e.g. 'python3 train.py --epochs 30'). Must not contain a single quote \u2014 put quoted parts in a script file on the pod and call that."),
-    label: external_exports.string().default("run").describe("Short name for this run, shown in every STATUS line so one file is attributable"),
+    command: external_exports.string().describe("The training command, run from workingDir (e.g. 'python3 train.py --epochs 30'). Must be a single line with no single quote \u2014 a newline would make the watchdog supervise the wrong process. Put multi-line or quoted work in a script file on the pod and call that."),
+    label: external_exports.string().default("run").describe("Short name for this run, shown in every STATUS line so one file is attributable. Also names the script file on the pod, so it must match [A-Za-z0-9._-]+."),
     statusPath: external_exports.string().default("/root/outputs/STATUS").describe("Absolute path on the pod for the status file"),
     logPath: external_exports.string().default("/root/outputs/train.log").describe("Absolute path on the pod for the training log"),
     workingDir: external_exports.string().default("/workspace").describe("Directory to run the command from"),
