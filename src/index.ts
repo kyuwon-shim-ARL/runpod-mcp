@@ -15,6 +15,17 @@ import { filterStalePods, selectGpuCandidates, deletePodWithStop, DEFAULT_DC_PRI
 import { CPU_FLAVORS, CPU_FLAVOR_IDS, defaultFlavorOrder } from "./cpu-catalog.js";
 import { readPodGroups, groupSiblings, renderGroupLine } from "./job-group.js";
 import { loadIdleState, saveIdleState, pruneState, judgeIdle, parseWorkProbe, renderWorkLine, WORK_PROBE_CMD, type IdleState } from "./idle-utils.js";
+import {
+  loadReadinessState,
+  saveReadinessState,
+  pendingGates,
+  recordGate,
+  markVerified,
+  pruneGates,
+  renderGateBlock,
+  renderPendingRefusal,
+  importStatementLabel,
+} from "./readiness.js";
 
 const COST_GATE_GPU_COUNT = 2;       // gpuCount >= this triggers gate
 const COST_GATE_HOURLY_USD = 1.0;    // ondemandPrice * gpuCount >= this triggers gate
@@ -358,7 +369,55 @@ server.tool(
 );
 
 // ── create_pod_auto ──
+// ── import-readiness gate (issue #13) ───────────────────────────────────────────
+// A pod that is "up" is not a pod that can run your code. When create_pod_auto is
+// called with `imports`, the pod is recorded as unverified and the NEXT create_pod_auto
+// is refused until run_preflight confirms those imports. The pod is always created and
+// its id always returned — the gate never hides a billing pod.
+
+/** Refusal text when unverified sibling pods exist, or null when creation may proceed. */
+async function checkReadinessGate(c: RunPodClient): Promise<string | null> {
+  try {
+    const state = await loadReadinessState();
+    if (Object.keys(state).length === 0) return null;
+    const live = await c.listPods();
+    const pruned = pruneGates(state, live.map((p) => p.id));
+    if (Object.keys(pruned).length !== Object.keys(state).length) {
+      await saveReadinessState(pruned);
+    }
+    const pending = pendingGates(pruned);
+    return pending.length > 0 ? renderPendingRefusal(pending) : null;
+  } catch {
+    // fail-soft: a gate bookkeeping failure must never block pod creation
+    return null;
+  }
+}
+
+/** Record the gate for a freshly created pod; returns the NOT-READY block to append. */
+async function openReadinessGate(podId: string, imports: string[] | undefined): Promise<string> {
+  if (!imports || imports.length === 0) return "";
+  try {
+    const state = await loadReadinessState();
+    await saveReadinessState(recordGate(state, podId, imports, new Date()));
+  } catch {
+    // fail-soft: still warn the caller even if the gate could not be persisted
+  }
+  return renderGateBlock(podId, imports);
+}
+
+/** Clear a pod's gate after its imports were verified. */
+async function closeReadinessGate(podId: string): Promise<void> {
+  try {
+    const state = await loadReadinessState();
+    if (!state[podId]) return;
+    await saveReadinessState(markVerified(state, podId, new Date()));
+  } catch {
+    // fail-soft
+  }
+}
+
 server.tool(
+
   "create_pod_auto",
   "Create a pod with automatic GPU selection based on stock availability. Tries GPUs in order of preference, including Low stock (worth trying). Use dryRun=true to preview GPU selection and cost estimate without creating a pod.\n⚠️ costSafetyConfirmed는 사용자가 직접 확인한 경우에만 true로 설정하세요. Claude가 자동으로 true를 설정하는 것은 엄격히 금지됩니다.",
   {
@@ -408,8 +467,15 @@ server.tool(
     cpuFlavorIds: z.array(z.enum(CPU_FLAVOR_IDS as [string, ...string[]])).optional().describe("CPU flavor IDs in priority order (cpuOnly only). When provided, cpuFlavorPriority is set to 'custom' (RunPod honors the order). Defaults to cpu5 then cpu3 in the chosen family. Run list_cpu_types for valid IDs."),
     vcpuCount: z.number().int().positive().max(128).default(2).describe("vCPU count for CPU pod (cpuOnly only). Default 2, max 128."),
     jobGroup: z.string().optional().describe("Group label for pods created for the same run (e.g. 'lopo-s123'). Pass the SAME value for every sibling pod; it lands in the metadata stub and list_pods shows live siblings. Without it, a job with 3 pods and 1 record is unattributable later."),
+    imports: z.array(z.string()).optional().describe("Python imports this pod must be able to run (e.g. [\"torch\",\"pandas\",\"kornia\"]). The pod is created and its id returned as usual, but marked NOT READY: the next create_pod_auto is refused until run_preflight(importSmokes=[...]) passes on it. Prevents creating sibling pods that all share an undiscovered missing module."),
+    skipReadinessGate: z.boolean().default(false).describe("Bypass the pending import-readiness refusal. Set only when the user explicitly asks to create a pod while another is still unverified."),
   },
   safeTool(async (args) => {
+    if (!args.dryRun && !args.skipReadinessGate) {
+      const refusal = await checkReadinessGate(requireClient());
+      if (refusal) return text(refusal);
+    }
+
     // CPU-only short-circuit. Skips GPU stock probing, cost gate, NV readiness — CPU pods
     // are <$1/hr and don't have the multi-GPU runaway-cost shape that those gates exist for.
     if (args.cpuOnly) {
@@ -486,10 +552,11 @@ server.tool(
             : assignedFlavor
             ? ` (RunPod assigned ${assignedFlavor})`
             : "";
+          const cpuGateBlock = await openReadinessGate(pod.id, args.imports);
           return text(
             `Auto-selected CPU pod in ${dc} (requested: ${flavorIds.join(", ")} [${flavorPriority}], ${args.vcpuCount} vCPU)${assignedNote}${volumeNote}\n${podSummary(pod)}\n\n` +
               `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
-              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
+              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})${cpuGateBlock}`
           );
         } catch (e) {
           if (isAuthError(e)) return errorResult(e);
@@ -671,12 +738,13 @@ server.tool(
                 : null,
               job_group: args.jobGroup ?? null,
             });
+            const spotGateBlock = await openReadinessGate(result.id, args.imports);
             return text(
               `Auto-selected: ${gpu.displayName} in ${dc} (stock: ${stock ?? "unknown"})\n` +
                 `Spot bid: $${bidPrice}/hr\n` +
                 `Pod ID: ${result.id}${overprovisionWarning}${volumeNote}${sshWarnText}\n\n` +
                 `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
-                `## Next Steps\n→ wait_for_pod(podId: "${result.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
+                `## Next Steps\n→ wait_for_pod(podId: "${result.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})${spotGateBlock}`
             );
           }
 
@@ -697,10 +765,11 @@ server.tool(
               : null,
             job_group: args.jobGroup ?? null,
           });
+          const gpuGateBlock = await openReadinessGate(pod.id, args.imports);
           return text(
             `Auto-selected: ${gpu.displayName} in ${dcLabel} (stock: ${stock ?? "unknown"})${overprovisionWarning}${volumeNote}${sshWarnText}\n${podSummary(pod)}\n\n` +
               `## Pod Metadata Stub (pass to save_pod_metadata after enriching)\n\`\`\`json\n${stub}\n\`\`\`\n\n` +
-              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})`
+              `## Next Steps\n→ wait_for_pod(podId: "${pod.id}")\n→ save_pod_metadata({metadata: <stub above with purpose filled in>})${gpuGateBlock}`
           );
         } catch (e) {
           if (isAuthError(e)) return errorResult(e);
@@ -2325,17 +2394,25 @@ server.tool(
 
     // 5. Python import smoke tests
     if (importSmokes && importSmokes.length > 0) {
+      let allImportsPassed = true;
       for (const imp of importSmokes) {
+        // A bare module name ("torch") is a valid python expression statement, so it works as a
+        // smoke test — but `split(" ")[1]` would label it `undefined`. Label by the statement itself
+        // when it has no second word.
+        const label = importStatementLabel(imp);
         const smokeCmd = `python3 -c "${imp.replace(/"/g, '\\"')}" 2>&1 && echo "__IMPORT_OK__" || echo "__IMPORT_FAIL__"`;
         const smokeResult = await spawnAsync(sshArgs[0], [...sshArgs.slice(1), "--", smokeCmd], { timeout: 30_000 });
         if (smokeResult.stdout.includes("__IMPORT_OK__")) {
-          results.push({ label: `Import: ${imp.split(" ")[1]}`, status: "✅", detail: "OK" });
+          results.push({ label: `Import: ${label}`, status: "✅", detail: "OK" });
         } else {
           const errLine = smokeResult.stdout.split("\n").find(l => l.includes("Error") || l.includes("error")) ?? "import failed";
-          results.push({ label: `Import: ${imp.split(" ")[1]}`, status: "❌", detail: errLine.trim() });
+          results.push({ label: `Import: ${label}`, status: "❌", detail: errLine.trim() });
           hasFail = true;
+          allImportsPassed = false;
         }
       }
+      // Satisfies the create_pod_auto(imports=[...]) readiness gate for this pod.
+      if (allImportsPassed) await closeReadinessGate(podId);
     }
 
     // 6. Training smoke — HALT on skeleton scripts (NotImplementedError, ImportError, SyntaxError, ModuleNotFoundError, AttributeError)
